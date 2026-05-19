@@ -57,6 +57,7 @@ export class CopyTrader extends EventEmitter {
     const reason = this._rejectReason(ev);
     if (reason) {
       this.skipCount++;
+      this.emit('skip', { reason, ev, phase: 'filter' });
       logger.debug('copy.CopyTrader: skipping trade', { reason, ev: this._evSummary(ev) });
       return;
     }
@@ -65,6 +66,7 @@ export class CopyTrader extends EventEmitter {
     const ourUsdc = this._ourUsdc(ev);
     if (!ourUsdc || ourUsdc < 1) {
       this.skipCount++;
+      this.emit('skip', { reason: 'computed-size-too-small', ev, ourUsdc, phase: 'size' });
       logger.debug('copy.CopyTrader: computed size too small', { ourUsdc, ev: this._evSummary(ev) });
       return;
     }
@@ -96,7 +98,7 @@ export class CopyTrader extends EventEmitter {
 
     if (COPY_DRY_RUN) {
       this.copyCount++;
-      this.emit('copy', { ev, ourUsdc, shares, maxPrice, dryRun: true });
+      this.emit('copy', { ev, ourUsdc, shares, maxPrice, dryRun: true, assumedSpent: shares * maxPrice });
       return;
     }
 
@@ -122,7 +124,7 @@ export class CopyTrader extends EventEmitter {
         signalLatencyMs: fireAt - ev.timestamp * 1000,
         res,
       });
-      this.emit('copy', { ev, ourUsdc, shares, maxPrice, res });
+      this.emit('copy', { ev, ourUsdc, shares, maxPrice, res, dryRun: false, assumedSpent });
     } catch (err) {
       this.failCount++;
       logger.warn('copy.CopyTrader: order failed', {

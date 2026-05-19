@@ -1,3 +1,4 @@
+import { EventEmitter } from 'events';
 import logger from '../logger.js';
 import { waitForResolution } from '../market.js';
 import { PnlTracker } from '../pnl.js';
@@ -6,8 +7,9 @@ function normalizeOutcomeKey(value) {
   return typeof value === 'string' ? value.trim().toLowerCase() : '';
 }
 
-export class DryRunPnlTracker {
+export class DryRunPnlTracker extends EventEmitter {
   constructor() {
+    super();
     this.pnl = new PnlTracker();
     this._markets = new Map();
     this._settlementTasks = new Map();
@@ -41,6 +43,18 @@ export class DryRunPnlTracker {
       shares: shares.toFixed(4),
       maxPrice: maxPrice.toFixed(4),
       spent: spent.toFixed(2),
+    });
+    this.emit('recorded', {
+      slug,
+      conditionId: market.conditionId,
+      question: market.question,
+      outcome,
+      shares,
+      maxPrice,
+      spent,
+      requestedUsdc: ourUsdc,
+      targetPrice: ev.price,
+      timestamp: Date.now(),
     });
   }
 
@@ -76,6 +90,21 @@ export class DryRunPnlTracker {
   printSummary() {
     logger.info('copy.dryRun: session summary', this.stats());
     this.pnl.printSessionSummary();
+  }
+
+  snapshot() {
+    return {
+      stats: this.stats(),
+      markets: [...this._markets.entries()].map(([slug, market]) => ({
+        slug,
+        conditionId: market.conditionId,
+        question: market.question,
+        redeemed: market.redeemed,
+        settled: market.settled,
+        settledAt: market.settledAt,
+        copies: market.copies.map((copy) => ({ ...copy })),
+      })),
+    };
   }
 
   _getMarket(slug, meta = {}) {
@@ -144,6 +173,16 @@ export class DryRunPnlTracker {
       pnl: this.pnl.marketPnl(slug).toFixed(2),
       payouts,
       outcomes,
+    });
+    this.emit('settled', {
+      slug,
+      question: market.question || resolvedMarket.question || null,
+      redeemed,
+      pnl: this.pnl.marketPnl(slug),
+      payouts,
+      outcomes,
+      settledAt: market.settledAt,
+      copies: market.copies.map((copy) => ({ ...copy })),
     });
   }
 }

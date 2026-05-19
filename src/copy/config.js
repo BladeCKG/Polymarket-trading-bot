@@ -69,6 +69,9 @@ export const COPY_DEDUP_CACHE = num('COPY_DEDUP_CACHE', 5_000);
 // ── Misc ─────────────────────────────────────────────────────────────────────
 // If true, log everything but don't send real orders.
 export const COPY_DRY_RUN = bool('COPY_DRY_RUN', false);
+export const COPY_DASHBOARD_ENABLED = bool('COPY_DASHBOARD_ENABLED', true);
+export const COPY_DASHBOARD_HOST = opt('COPY_DASHBOARD_HOST', '127.0.0.1');
+export const COPY_DASHBOARD_PORT = num('COPY_DASHBOARD_PORT', 8787);
 
 // Optional: restrict to specific market condition IDs (comma-separated, 0x…).
 // Empty = copy any market the target trades.

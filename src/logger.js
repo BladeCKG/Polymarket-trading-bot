@@ -7,6 +7,7 @@ import winston from 'winston';
 import { LOG_LEVEL } from './config.js';
 
 const { combine, timestamp, colorize, printf, json } = winston.format;
+const logSubscribers = new Set();
 
 const consoleFormat = printf(({ level, message, timestamp: ts, market, ...meta }) => {
   const mkt = market ? ` [${market}]` : '';
@@ -31,7 +32,28 @@ const logger = winston.createLogger({
   ],
 });
 
+logger.on('data', (entry) => {
+  for (const subscriber of logSubscribers) {
+    try {
+      subscriber(entry);
+    } catch {
+      // Ignore subscriber failures so logging never breaks the bot.
+    }
+  }
+});
+
 export default logger;
+
+/**
+ * Subscribe to structured log entries emitted by the shared logger.
+ * Returns an unsubscribe function.
+ */
+export function subscribeLogs(listener) {
+  logSubscribers.add(listener);
+  return () => {
+    logSubscribers.delete(listener);
+  };
+}
 
 /**
  * Returns a child logger that automatically includes the market slug in every log line.

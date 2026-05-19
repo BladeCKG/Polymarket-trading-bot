@@ -1,0 +1,609 @@
+import http from 'http';
+import { WebSocketServer } from 'ws';
+import logger, { subscribeLogs } from '../logger.js';
+
+const MAX_LOGS = 250;
+const MAX_EVENTS = 100;
+
+function truncatePush(list, value, max = MAX_EVENTS) {
+  list.unshift(value);
+  if (list.length > max) list.length = max;
+}
+
+function htmlPage() {
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Copy Trader Dashboard</title>
+  <style>
+    :root {
+      --bg: #f4efe4;
+      --panel: rgba(255,255,255,0.74);
+      --panel-strong: rgba(255,255,255,0.9);
+      --text: #16211d;
+      --muted: #58645e;
+      --accent: #0f766e;
+      --accent-soft: #d7f3ee;
+      --danger: #b42318;
+      --warn: #9a6700;
+      --shadow: 0 18px 50px rgba(34, 54, 45, 0.14);
+      --radius: 20px;
+      --border: rgba(15, 118, 110, 0.12);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Aptos", "Segoe UI Variable", "Trebuchet MS", sans-serif;
+      color: var(--text);
+      background:
+        radial-gradient(circle at top left, rgba(15,118,110,0.18), transparent 32%),
+        radial-gradient(circle at top right, rgba(218,165,32,0.18), transparent 28%),
+        linear-gradient(180deg, #fbf7ef 0%, var(--bg) 100%);
+      min-height: 100vh;
+    }
+    .shell {
+      max-width: 1400px;
+      margin: 0 auto;
+      padding: 28px 20px 40px;
+    }
+    .hero {
+      display: grid;
+      gap: 16px;
+      margin-bottom: 20px;
+      padding: 22px;
+      border-radius: 28px;
+      background: linear-gradient(135deg, rgba(255,255,255,0.78), rgba(237,250,247,0.88));
+      box-shadow: var(--shadow);
+      border: 1px solid var(--border);
+      backdrop-filter: blur(8px);
+    }
+    .hero h1 {
+      margin: 0;
+      font-size: clamp(2rem, 4vw, 3.25rem);
+      line-height: 1;
+      letter-spacing: -0.04em;
+    }
+    .hero p {
+      margin: 0;
+      color: var(--muted);
+      max-width: 68ch;
+    }
+    .banner {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      align-items: center;
+      color: var(--muted);
+      font-size: 0.95rem;
+    }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 7px 12px;
+      border-radius: 999px;
+      background: var(--accent-soft);
+      color: var(--accent);
+      font-weight: 600;
+    }
+    .grid {
+      display: grid;
+      gap: 16px;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      margin-bottom: 18px;
+    }
+    .stat {
+      padding: 18px;
+      border-radius: var(--radius);
+      background: var(--panel-strong);
+      box-shadow: var(--shadow);
+      border: 1px solid var(--border);
+    }
+    .stat .label {
+      font-size: 0.82rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+    .stat .value {
+      font-size: 2rem;
+      font-weight: 700;
+      letter-spacing: -0.04em;
+    }
+    .sections {
+      display: grid;
+      gap: 14px;
+    }
+    details.panel {
+      border-radius: var(--radius);
+      background: var(--panel);
+      box-shadow: var(--shadow);
+      border: 1px solid var(--border);
+      overflow: hidden;
+      backdrop-filter: blur(8px);
+    }
+    details.panel[open] {
+      background: var(--panel-strong);
+    }
+    details.panel > summary {
+      list-style: none;
+      cursor: pointer;
+      padding: 18px 20px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      font-weight: 700;
+      font-size: 1rem;
+    }
+    details.panel > summary::-webkit-details-marker { display: none; }
+    .summary-meta {
+      color: var(--muted);
+      font-size: 0.85rem;
+      font-weight: 500;
+    }
+    .panel-body {
+      padding: 0 20px 20px;
+    }
+    .cards {
+      display: grid;
+      gap: 12px;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    }
+    .mini {
+      padding: 14px;
+      border-radius: 16px;
+      background: rgba(255,255,255,0.78);
+      border: 1px solid rgba(15,118,110,0.08);
+    }
+    .mini .k {
+      color: var(--muted);
+      font-size: 0.8rem;
+      margin-bottom: 4px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+    .mini .v {
+      font-weight: 700;
+      font-size: 1.15rem;
+      overflow-wrap: anywhere;
+    }
+    .list {
+      display: grid;
+      gap: 10px;
+    }
+    .item {
+      padding: 14px;
+      border-radius: 16px;
+      background: rgba(255,255,255,0.76);
+      border: 1px solid rgba(15,118,110,0.08);
+    }
+    .item header {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 8px;
+      font-weight: 700;
+    }
+    .item dl {
+      margin: 0;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+      gap: 8px 12px;
+    }
+    .item dt {
+      color: var(--muted);
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+    .item dd {
+      margin: 0;
+      font-family: "Consolas", "IBM Plex Mono", monospace;
+      font-size: 0.92rem;
+      overflow-wrap: anywhere;
+    }
+    pre.json {
+      margin: 0;
+      padding: 16px;
+      border-radius: 16px;
+      overflow: auto;
+      background: #11201c;
+      color: #e9fff8;
+      font-family: "Consolas", "IBM Plex Mono", monospace;
+      font-size: 0.84rem;
+      line-height: 1.45;
+    }
+    .log-line {
+      padding: 12px 14px;
+      border-radius: 14px;
+      background: rgba(255,255,255,0.7);
+      border: 1px solid rgba(15,118,110,0.08);
+      font-family: "Consolas", "IBM Plex Mono", monospace;
+      font-size: 0.84rem;
+    }
+    .log-line.info { border-left: 4px solid var(--accent); }
+    .log-line.warn { border-left: 4px solid var(--warn); }
+    .log-line.error { border-left: 4px solid var(--danger); }
+    .muted { color: var(--muted); }
+    .empty {
+      padding: 18px;
+      color: var(--muted);
+      border: 1px dashed rgba(15,118,110,0.18);
+      border-radius: 16px;
+      background: rgba(255,255,255,0.46);
+    }
+    @media (max-width: 720px) {
+      .shell { padding: 16px 12px 28px; }
+      details.panel > summary { padding: 16px; }
+      .panel-body { padding: 0 16px 16px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <section class="hero">
+      <div class="banner">
+        <span class="pill" id="connection">Connecting...</span>
+        <span id="runtimeLabel">Copy Runtime Dashboard</span>
+      </div>
+      <h1>Real-time Copy Trader Control Room</h1>
+      <p>Live runtime status, target trade flow, copy decisions, dry-run settlement tracking, and structured bot logs in one place.</p>
+    </section>
+    <section class="grid" id="topStats"></section>
+    <section class="sections" id="sections"></section>
+  </div>
+  <script>
+    const state = {
+      runtime: {},
+      config: {},
+      stats: {},
+      recentTrades: [],
+      recentCopies: [],
+      recentSkips: [],
+      recentFailures: [],
+      dryRun: { stats: {}, markets: [], recorded: [], settled: [] },
+      logs: [],
+    };
+
+    const topStatsEl = document.getElementById('topStats');
+    const sectionsEl = document.getElementById('sections');
+    const connectionEl = document.getElementById('connection');
+    const runtimeLabelEl = document.getElementById('runtimeLabel');
+
+    function money(v) {
+      const n = Number(v);
+      return Number.isFinite(n) ? '$' + n.toFixed(2) : String(v ?? '—');
+    }
+
+    function ts(v) {
+      if (!v) return '—';
+      const d = new Date(v);
+      if (Number.isNaN(d.getTime())) return String(v ?? '—');
+      return d.toLocaleTimeString();
+    }
+
+    function relSlug(item) {
+      return item.slug || item.question || item.conditionId || 'Unknown market';
+    }
+
+    function escapeHtml(value) {
+      return String(value)
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;');
+    }
+
+    function renderTopStats() {
+      const cards = [
+        ['Accepted Copies', state.stats.copies ?? 0],
+        ['Skipped Signals', state.stats.skips ?? 0],
+        ['Failures', state.stats.failures ?? 0],
+        ['Live Spend', money(state.stats.totalSpent ?? 0)],
+        ['Dry-run Open Cost', money(state.stats.dryRunOpenCost ?? 0)],
+        ['Dry-run Settled PnL', money(state.stats.dryRunSettledPnl ?? 0)],
+      ];
+      topStatsEl.innerHTML = cards.map(([label, value]) => \`
+        <article class="stat">
+          <div class="label">\${label}</div>
+          <div class="value">\${value}</div>
+        </article>
+      \`).join('');
+    }
+
+    function renderList(items, renderItem) {
+      if (!items.length) return '<div class="empty">No events yet.</div>';
+      return '<div class="list">' + items.map(renderItem).join('') + '</div>';
+    }
+
+    function panel(title, meta, body, open = true) {
+      return \`<details class="panel" \${open ? 'open' : ''}>
+        <summary><span>\${title}</span><span class="summary-meta">\${meta}</span></summary>
+        <div class="panel-body">\${body}</div>
+      </details>\`;
+    }
+
+    function renderSections() {
+      const runtime = panel('Runtime Snapshot', state.runtime.mode ? state.runtime.mode.toUpperCase() : 'Runtime', \`
+        <div class="cards">
+          <div class="mini"><div class="k">Mode</div><div class="v">\${state.runtime.mode || 'copy'}</div></div>
+          <div class="mini"><div class="k">Wallet</div><div class="v">\${state.runtime.wallet || '—'}</div></div>
+          <div class="mini"><div class="k">Dry Run</div><div class="v">\${String(state.runtime.dryRun ?? false)}</div></div>
+          <div class="mini"><div class="k">Started</div><div class="v">\${ts(state.runtime.startedAt)}</div></div>
+        </div>
+      \`);
+
+      const config = panel('Config', 'Current sizing, caps, and filters',
+        '<pre class="json">' + escapeHtml(JSON.stringify(state.config, null, 2)) + '</pre>', false);
+
+      const trades = panel('Recent Target Trades', state.recentTrades.length + ' tracked',
+        renderList(state.recentTrades, (item) => \`
+          <article class="item">
+            <header><span>\${relSlug(item)}</span><span>\${ts(item.seenAt)}</span></header>
+            <dl>
+              <div><dt>Outcome</dt><dd>\${item.outcome || '—'}</dd></div>
+              <div><dt>Price</dt><dd>\${item.price}</dd></div>
+              <div><dt>Size</dt><dd>\${item.size}</dd></div>
+              <div><dt>USDC</dt><dd>\${item.usdc}</dd></div>
+              <div><dt>Target</dt><dd>\${item.target}</dd></div>
+              <div><dt>Tx</dt><dd>\${item.txHash || '—'}</dd></div>
+            </dl>
+          </article>
+        \`));
+
+      const copies = panel('Recent Copy Decisions', state.recentCopies.length + ' events',
+        renderList(state.recentCopies, (item) => \`
+          <article class="item">
+            <header><span>\${relSlug(item)}</span><span>\${item.dryRun ? 'DRY RUN' : 'LIVE'}</span></header>
+            <dl>
+              <div><dt>Outcome</dt><dd>\${item.outcome || '—'}</dd></div>
+              <div><dt>Shares</dt><dd>\${item.shares}</dd></div>
+              <div><dt>Max Price</dt><dd>\${item.maxPrice}</dd></div>
+              <div><dt>Assumed Spend</dt><dd>\${money(item.assumedSpent)}</dd></div>
+              <div><dt>Target Price</dt><dd>\${item.targetPrice}</dd></div>
+              <div><dt>Seen</dt><dd>\${ts(item.timestamp)}</dd></div>
+            </dl>
+          </article>
+        \`));
+
+      const skips = panel('Skipped Signals', state.recentSkips.length + ' recent reasons',
+        renderList(state.recentSkips, (item) => \`
+          <article class="item">
+            <header><span>\${relSlug(item)}</span><span>\${item.reason}</span></header>
+            <dl>
+              <div><dt>Phase</dt><dd>\${item.phase || '—'}</dd></div>
+              <div><dt>Outcome</dt><dd>\${item.outcome || '—'}</dd></div>
+              <div><dt>Price</dt><dd>\${item.price ?? '—'}</dd></div>
+              <div><dt>USDC</dt><dd>\${item.usdc ?? '—'}</dd></div>
+              <div><dt>Seen</dt><dd>\${ts(item.timestamp)}</dd></div>
+            </dl>
+          </article>
+        \`), false);
+
+      const failures = panel('Order Failures', state.recentFailures.length + ' recent failures',
+        renderList(state.recentFailures, (item) => \`
+          <article class="item">
+            <header><span>\${relSlug(item)}</span><span>\${ts(item.timestamp)}</span></header>
+            <dl>
+              <div><dt>Token</dt><dd>\${item.tokenId || '—'}</dd></div>
+              <div><dt>Outcome</dt><dd>\${item.outcome || '—'}</dd></div>
+              <div><dt>Error</dt><dd>\${item.error}</dd></div>
+            </dl>
+          </article>
+        \`), false);
+
+      const dryRun = panel('Dry-run Markets', (state.dryRun.markets || []).length + ' tracked markets',
+        renderList(state.dryRun.markets || [], (item) => {
+          const spent = item.copies.reduce((sum, copy) => sum + Number(copy.spent || 0), 0);
+          return \`
+            <article class="item">
+              <header><span>\${item.slug}</span><span>\${item.settled ? 'Settled' : 'Open'}</span></header>
+              <dl>
+                <div><dt>Question</dt><dd>\${item.question || '—'}</dd></div>
+                <div><dt>Copies</dt><dd>\${item.copies.length}</dd></div>
+                <div><dt>Spent</dt><dd>\${money(spent)}</dd></div>
+                <div><dt>Redeemed</dt><dd>\${money(item.redeemed)}</dd></div>
+                <div><dt>Settled At</dt><dd>\${ts(item.settledAt)}</dd></div>
+              </dl>
+            </article>
+          \`;
+        }));
+
+      const logs = panel('Live Logs', state.logs.length + ' recent lines',
+        renderList(state.logs, (item) => \`
+          <div class="log-line \${item.level || 'info'}">
+            [\${item.timestamp || '—'}] \${item.level || 'info'}: \${escapeHtml(item.message || '')}
+            \${item.meta && Object.keys(item.meta).length ? '<div class="muted">' + escapeHtml(JSON.stringify(item.meta)) + '</div>' : ''}
+          </div>
+        \`));
+
+      sectionsEl.innerHTML = [runtime, config, trades, copies, skips, failures, dryRun, logs].join('');
+    }
+
+    function render() {
+      connectionEl.textContent = state.runtime.connected ? 'Live' : 'Waiting';
+      runtimeLabelEl.textContent = state.runtime.dashboardUrl || 'Copy Runtime Dashboard';
+      renderTopStats();
+      renderSections();
+    }
+
+    function applySnapshot(snapshot) {
+      Object.assign(state, snapshot);
+      render();
+    }
+
+    function handleEvent(payload) {
+      const { type, data } = payload;
+      if (type === 'runtime') state.runtime = { ...state.runtime, ...data };
+      else if (type === 'stats') state.stats = { ...state.stats, ...data };
+      else if (type === 'config') state.config = data;
+      else if (type === 'trade') state.recentTrades = [data, ...state.recentTrades].slice(0, 100);
+      else if (type === 'copy') state.recentCopies = [data, ...state.recentCopies].slice(0, 100);
+      else if (type === 'skip') state.recentSkips = [data, ...state.recentSkips].slice(0, 100);
+      else if (type === 'failure') state.recentFailures = [data, ...state.recentFailures].slice(0, 100);
+      else if (type === 'dryRunSnapshot') state.dryRun = data;
+      else if (type === 'dryRunRecorded') state.dryRun.recorded = [data, ...(state.dryRun.recorded || [])].slice(0, 100);
+      else if (type === 'dryRunSettled') state.dryRun.settled = [data, ...(state.dryRun.settled || [])].slice(0, 100);
+      else if (type === 'log') state.logs = [data, ...state.logs].slice(0, 250);
+      render();
+    }
+
+    const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
+    ws.addEventListener('open', () => {
+      state.runtime.connected = true;
+      render();
+    });
+    ws.addEventListener('close', () => {
+      state.runtime.connected = false;
+      render();
+    });
+    ws.addEventListener('message', (event) => {
+      const payload = JSON.parse(event.data);
+      if (payload.type === 'snapshot') applySnapshot(payload.data);
+      else handleEvent(payload);
+    });
+  </script>
+</body>
+</html>`;
+}
+
+export class CopyDashboardServer {
+  constructor({ host, port, runtime, config }) {
+    this.host = host;
+    this.port = port;
+    this.state = {
+      runtime: {
+        ...runtime,
+        connected: false,
+      },
+      config,
+      stats: {},
+      recentTrades: [],
+      recentCopies: [],
+      recentSkips: [],
+      recentFailures: [],
+      dryRun: { stats: {}, markets: [], recorded: [], settled: [] },
+      logs: [],
+    };
+    this._server = null;
+    this._wss = null;
+    this._unsubscribeLogs = null;
+  }
+
+  async start() {
+    this._server = http.createServer((req, res) => {
+      if (req.url === '/' || req.url?.startsWith('/?')) {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(htmlPage());
+        return;
+      }
+      res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end('Not found');
+    });
+
+    this._wss = new WebSocketServer({ server: this._server, path: '/ws' });
+    this._wss.on('connection', (socket) => {
+      socket.send(JSON.stringify({ type: 'snapshot', data: this.state }));
+    });
+
+    this._unsubscribeLogs = subscribeLogs((entry) => {
+      const logLine = {
+        timestamp: entry.timestamp,
+        level: entry.level,
+        message: entry.message,
+        meta: Object.fromEntries(Object.entries(entry).filter(([key]) =>
+          !['level', 'message', 'timestamp'].includes(key)
+        )),
+      };
+      truncatePush(this.state.logs, logLine, MAX_LOGS);
+      this.broadcast('log', logLine);
+    });
+
+    await new Promise((resolve, reject) => {
+      this._server.once('error', reject);
+      this._server.listen(this.port, this.host, () => {
+        this._server.off('error', reject);
+        resolve();
+      });
+    });
+
+    const url = `http://${this.host}:${this.port}`;
+    this.setRuntime({ dashboardUrl: url, startedAt: Date.now() });
+    logger.info('copy.dashboard: started', { url });
+    return url;
+  }
+
+  stop() {
+    this._unsubscribeLogs?.();
+    this._wss?.clients.forEach((client) => client.close());
+    this._wss?.close();
+    this._server?.close();
+  }
+
+  setRuntime(runtime) {
+    this.state.runtime = { ...this.state.runtime, ...runtime };
+    this.broadcast('runtime', this.state.runtime);
+  }
+
+  setStats(stats) {
+    this.state.stats = { ...stats };
+    this.broadcast('stats', this.state.stats);
+  }
+
+  setConfig(config) {
+    this.state.config = config;
+    this.broadcast('config', this.state.config);
+  }
+
+  setDryRunSnapshot(snapshot) {
+    this.state.dryRun = {
+      ...snapshot,
+      recorded: this.state.dryRun.recorded,
+      settled: this.state.dryRun.settled,
+    };
+    this.broadcast('dryRunSnapshot', this.state.dryRun);
+  }
+
+  recordTrade(trade) {
+    truncatePush(this.state.recentTrades, trade);
+    this.broadcast('trade', trade);
+  }
+
+  recordCopy(copy) {
+    truncatePush(this.state.recentCopies, copy);
+    this.broadcast('copy', copy);
+  }
+
+  recordSkip(skip) {
+    truncatePush(this.state.recentSkips, skip);
+    this.broadcast('skip', skip);
+  }
+
+  recordFailure(failure) {
+    truncatePush(this.state.recentFailures, failure);
+    this.broadcast('failure', failure);
+  }
+
+  recordDryRunRecorded(event) {
+    truncatePush(this.state.dryRun.recorded, event);
+    this.broadcast('dryRunRecorded', event);
+  }
+
+  recordDryRunSettled(event) {
+    truncatePush(this.state.dryRun.settled, event);
+    this.broadcast('dryRunSettled', event);
+  }
+
+  broadcast(type, data) {
+    if (!this._wss) return;
+    const payload = JSON.stringify({ type, data });
+    for (const client of this._wss.clients) {
+      if (client.readyState === client.OPEN) {
+        client.send(payload);
+      }
+    }
+  }
+}
