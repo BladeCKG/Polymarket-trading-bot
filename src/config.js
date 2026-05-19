@@ -20,6 +20,12 @@ function parseFloat_(key, fallback) {
   return v !== undefined ? parseFloat(v) : fallback;
 }
 
+function parseBool_(key, fallback) {
+  const v = process.env[key];
+  if (v === undefined || v === '') return fallback;
+  return /^(1|true|yes|on)$/i.test(v);
+}
+
 // ── Wallet ───────────────────────────────────────────────────────────────────
 export const PRIVATE_KEY    = required('PRIVATE_KEY');
 export const PROXY_WALLET   = required('PROXY_WALLET'); // Keep EIP-55 checksum as-is
@@ -83,6 +89,7 @@ export const REDEEM_DELAY_AFTER_CLOSE   = 320;  // poll for resolution starting 
 // ── Operational ─────────────────────────────────────────────────────────────
 export const BOOK_POLL_MS               = 1_500;  // fallback REST polling interval
 export const LOG_LEVEL                  = optional('LOG_LEVEL', 'info');
+export const COPY_DRY_RUN               = parseBool_('COPY_DRY_RUN', false);
 /** POST /heartbeats while GTC orders rest; server cancels all open orders if heartbeats stop. Min 10s. */
 export const HEARTBEAT_INTERVAL_MS      = Math.max(
   10_000,

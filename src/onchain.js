@@ -81,7 +81,10 @@ function negRiskAdapter() { return new ethers.Contract(NEG_RISK_ADAPTER_ADDRESS,
  * (needed for mergePositions).
  * Call once at startup.
  */
-export async function ensureApprovals() {
+export async function ensureApprovals(options = {}) {
+  const {
+    skipCtfExchangeUsdcApproval = false,
+  } = options;
   const signer = getSigner();
   const addr   = await signer.getAddress();
   logger.info('Onchain: checking approvals…', { wallet: addr });
@@ -108,10 +111,17 @@ export async function ensureApprovals() {
   }
 
   // 3. USDC approval for CTF_EXCHANGE (for standard CTF markets, if ever needed)
-  const allowance2 = await usdcContract.allowance(addr, CTF_EXCHANGE_ADDRESS);
-  if (allowance2 < maxUint256 / 2n) {
-    const tx = await usdcContract.approve(CTF_EXCHANGE_ADDRESS, maxUint256);
-    await tx.wait();
+  if (skipCtfExchangeUsdcApproval) {
+    logger.info('Onchain: skipping USDC approval for CTF_EXCHANGE', {
+      reason: 'dry-run',
+      spender: CTF_EXCHANGE_ADDRESS,
+    });
+  } else {
+    const allowance2 = await usdcContract.allowance(addr, CTF_EXCHANGE_ADDRESS);
+    if (allowance2 < maxUint256 / 2n) {
+      const tx = await usdcContract.approve(CTF_EXCHANGE_ADDRESS, maxUint256);
+      await tx.wait();
+    }
   }
 
   logger.info('Onchain: all approvals OK');

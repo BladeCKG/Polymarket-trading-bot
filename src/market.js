@@ -49,7 +49,82 @@ function normaliseWalletAddress(address) {
   return typeof address === 'string' ? address.toLowerCase() : '';
 }
 
+function parseArrayField(value) {
+  if (Array.isArray(value)) return value;
+  if (typeof value !== 'string' || value === '') return [];
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function isNear(value, target, tolerance = 1e-3) {
+  return Math.abs(value - target) <= tolerance;
+}
+
+export function resolvedPayoutsFromMarket(rawMarket) {
+  const payouts = parseArrayField(rawMarket?.outcomePrices).map(Number);
+  if (!payouts.length || payouts.some((value) => !Number.isFinite(value))) return null;
+
+  const total = payouts.reduce((sum, value) => sum + value, 0);
+  const valuesLookResolved = payouts.every((value) =>
+    isNear(value, 0) || isNear(value, 0.5) || isNear(value, 1),
+  );
+
+  if (!valuesLookResolved || !isNear(total, 1, 2e-3)) return null;
+  return payouts;
+}
+
 // ── Gamma API ─────────────────────────────────────────────────────────────────
+/**
+ * Normalise a Gamma market record into the shape the rest of the bot expects.
+ * Handles stringified array fields such as `clobTokenIds`, `outcomes`, and
+ * `outcomePrices`.
+ */
+function normalizeMarketRecord(m, fallbackSlug = null) {
+  const tokens = parseArrayField(m.tokens ?? m.clobTokenIds);
+  const outcomePrices = parseArrayField(m.outcomePrices).map(Number);
+  const outcomes = parseArrayField(m.outcomes);
+  const resolvedPayouts = resolvedPayoutsFromMarket(m);
+
+  const normTokens = tokens.map((t, i) => {
+    if (typeof t === 'string') {
+      return { tokenId: t, outcome: i === 0 ? 'Up' : 'Down', outcomeIndex: i };
+    }
+    return {
+      tokenId: t.token_id ?? t.tokenId,
+      outcome: t.outcome ?? (i === 0 ? 'Up' : 'Down'),
+      outcomeIndex: t.outcome_index ?? i,
+    };
+  });
+
+  const slug = m.slug ?? fallbackSlug;
+  const upToken = normTokens.find(t => t.outcome === 'Up' || t.outcomeIndex === 0);
+  const downToken = normTokens.find(t => t.outcome === 'Down' || t.outcomeIndex === 1);
+
+  if (!upToken || !downToken) {
+    throw new Error(`Cannot find Up/Down tokens for market: ${slug} -> ${JSON.stringify(tokens)}`);
+  }
+
+  const ts = slug ? parseInt(slug.split('-').at(-1), 10) : NaN;
+  return {
+    id: m.id ?? null,
+    conditionId: m.condition_id ?? m.conditionId,
+    slug,
+    windowTs: Number.isFinite(ts) ? ts : null,
+    upToken,
+    downToken,
+    active: m.active ?? !m.closed,
+    resolved: Boolean(m.resolved ?? m.is_resolved) || resolvedPayouts !== null,
+    question: m.question ?? m.title,
+    outcomes,
+    outcomePrices,
+    resolvedPayouts,
+  };
+}
+
 /**
  * Fetch market metadata for a given slug.
  *
@@ -59,7 +134,7 @@ function normaliseWalletAddress(address) {
  *   slug: 'btc-updown-5m-…',
  *   windowTs: <unix_ts>,     // window open unix timestamp
  *   upToken:   { tokenId: '123…', outcome: 'Up',   outcomeIndex: 0 },
- *   downToken: { tokenId: '456…', outcome: 'Down',  outcomeIndex: 1 },
+ *   downToken: { tokenId: '456…', outcome: 'Down', outcomeIndex: 1 },
  *   active: true|false,
  *   resolved: true|false,
  * }
@@ -67,48 +142,66 @@ function normaliseWalletAddress(address) {
  * Throws if the market does not exist yet (not yet created by Polymarket).
  */
 export async function fetchMarket(slug) {
-  const url = `${GAMMA_API_URL}/markets?slug=${encodeURIComponent(slug)}`;
-  const res = await axios.get(url, { timeout: 10_000 });
-  const markets = res.data;
+  try {
+    const pathRes = await axios.get(`${GAMMA_API_URL}/markets/slug/${encodeURIComponent(slug)}`, {
+      timeout: 10_000,
+    });
+    return normalizeMarketRecord(pathRes.data, slug);
+  } catch (err) {
+    if (err.response?.status !== 404) throw err;
+  }
+
+  const queryRes = await axios.get(`${GAMMA_API_URL}/markets`, {
+    timeout: 10_000,
+    params: { slug },
+  });
+  const markets = queryRes.data;
 
   if (!markets || !markets.length) {
     throw new Error(`Market not found: ${slug}`);
   }
 
-  const m = markets[0];
-  const tokens = m.tokens ?? m.clobTokenIds ?? [];
+  return normalizeMarketRecord(markets[0], slug);
+}
 
-  // Normalise token structure (Gamma API returns either objects or flat token ID strings)
-  const normTokens = tokens.map((t, i) => {
-    if (typeof t === 'string') {
-      return { tokenId: t, outcome: i === 0 ? 'Up' : 'Down', outcomeIndex: i };
+/**
+ * Best-effort fallback lookup when Gamma cannot find a market by slug.
+ * Gamma's public conditionId filtering is unreliable, so we scan the paginated
+ * market list and, if we find a numeric market id, fetch the full detail record.
+ */
+export async function fetchMarketByConditionId(conditionId, {
+  pageSize = 200,
+  maxPages = 40,
+} = {}) {
+  const target = String(conditionId ?? '').toLowerCase();
+  if (!target) throw new Error('fetchMarketByConditionId: conditionId is required');
+
+  for (let page = 0; page < maxPages; page++) {
+    const res = await axios.get(`${GAMMA_API_URL}/markets`, {
+      timeout: 10_000,
+      params: {
+        limit: pageSize,
+        offset: page * pageSize,
+      },
+    });
+    const markets = Array.isArray(res.data) ? res.data : [];
+    if (!markets.length) break;
+
+    const match = markets.find((market) =>
+      String(market.conditionId ?? market.condition_id ?? '').toLowerCase() === target,
+    );
+    if (match) {
+      if (match.id != null) {
+        const detail = await axios.get(`${GAMMA_API_URL}/markets/${match.id}`, { timeout: 10_000 });
+        return normalizeMarketRecord(detail.data, match.slug ?? null);
+      }
+      return normalizeMarketRecord(match, match.slug ?? null);
     }
-    return {
-      tokenId:      t.token_id ?? t.tokenId,
-      outcome:      t.outcome ?? (i === 0 ? 'Up' : 'Down'),
-      outcomeIndex: t.outcome_index ?? i,
-    };
-  });
 
-  const upToken   = normTokens.find(t => t.outcome === 'Up'   || t.outcomeIndex === 0);
-  const downToken = normTokens.find(t => t.outcome === 'Down'  || t.outcomeIndex === 1);
-
-  if (!upToken || !downToken) {
-    throw new Error(`Cannot find Up/Down tokens for market: ${slug} → ${JSON.stringify(tokens)}`);
+    if (markets.length < pageSize) break;
   }
 
-  const ts = parseInt(slug.split('-').at(-1), 10);
-
-  return {
-    conditionId:  m.condition_id ?? m.conditionId,
-    slug,
-    windowTs:     ts,
-    upToken,
-    downToken,
-    active:       m.active ?? !m.closed,
-    resolved:     !!(m.resolved ?? m.is_resolved),
-    question:     m.question ?? m.title,
-  };
+  throw new Error(`Market not found for conditionId: ${conditionId}`);
 }
 
 /**
@@ -191,7 +284,7 @@ export async function fetchMarketWithRetry(slug, maxAttempts = 20, delayMs = 3_0
       return market;
     } catch (err) {
       last = err;
-      logger.debug('market.js: market not ready yet, retrying…', {
+      logger.debug('market.js: market not ready yet, retrying...', {
         slug, attempt, err: err.message,
       });
       await new Promise(r => setTimeout(r, delayMs));
@@ -202,24 +295,51 @@ export async function fetchMarketWithRetry(slug, maxAttempts = 20, delayMs = 3_0
 
 /**
  * Poll until the market is resolved, then return.
+ * Accepts either a slug string or a lookup object with `{ slug, conditionId }`.
  * Used by Trader after the window close to know when to call redeemPositions.
  */
-export async function waitForResolution(slug, timeoutMs = 400_000, pollMs = 10_000) {
+export async function waitForResolution(target, timeoutMs = 400_000, pollMs = 10_000) {
+  const slug = typeof target === 'string' ? target : target?.slug;
+  const conditionId = typeof target === 'string' ? '' : (target?.conditionId ?? '');
   const start = Date.now();
-  logger.info('market.js: waiting for resolution…', { slug });
+  logger.info('market.js: waiting for resolution...', { slug: slug ?? null, conditionId: conditionId || null });
   while (Date.now() - start < timeoutMs) {
     try {
-      const m = await fetchMarket(slug);
-      if (m.resolved) {
-        logger.info('market.js: market resolved', { slug });
-        return m;
+      let market = null;
+      if (slug) {
+        try {
+          market = await fetchMarket(slug);
+        } catch (err) {
+          if (!conditionId || !String(err.message).startsWith('Market not found:')) {
+            throw err;
+          }
+        }
+      }
+      if (!market && conditionId) {
+        market = await fetchMarketByConditionId(conditionId);
+      }
+      if (market?.resolved) {
+        logger.info('market.js: market resolved', {
+          slug: market.slug ?? slug ?? null,
+          conditionId: market.conditionId ?? conditionId ?? null,
+        });
+        return market;
       }
     } catch (err) {
-      logger.warn('market.js: poll error', { slug, err: err.message });
+      const message = String(err.message ?? '');
+      const notFound =
+        message.startsWith('Market not found:') ||
+        message.startsWith('Market not found for conditionId:');
+      const log = notFound ? logger.debug.bind(logger) : logger.warn.bind(logger);
+      log('market.js: poll error', {
+        slug: slug ?? null,
+        conditionId: conditionId || null,
+        err: message,
+      });
     }
     await new Promise(r => setTimeout(r, pollMs));
   }
-  throw new Error(`Market ${slug} did not resolve within ${timeoutMs / 1000}s`);
+  throw new Error(`Market ${slug ?? conditionId ?? '[unknown]'} did not resolve within ${timeoutMs / 1000}s`);
 }
 
 /**

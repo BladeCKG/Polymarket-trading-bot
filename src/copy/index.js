@@ -12,6 +12,7 @@
  *   5. Print stats every 60s; graceful SIGINT/SIGTERM shutdown.
  */
 import 'dotenv/config';
+import { fileURLToPath } from 'url';
 import {
   API_KEY,
   API_SECRET,
@@ -22,6 +23,7 @@ import { ClobClient } from '../clob.js';
 import { getSigner, ensureApprovals } from '../onchain.js';
 import { ActivityFeed } from './activityFeed.js';
 import { CopyTrader }   from './copyTrader.js';
+import { DryRunPnlTracker } from './dryRunPnl.js';
 import {
   COPY_TARGETS,
   COPY_POLL_MS,
@@ -39,7 +41,7 @@ import {
   COPY_STALE_MS,
 } from './config.js';
 
-async function main() {
+export async function main() {
   const wallet = getSigner();
 
   logger.info('copy.main: starting BUY-only copy trader', {
@@ -80,6 +82,14 @@ async function main() {
   // ── Wire up feed → trader ───────────────────────────────────────────────
   const trader = new CopyTrader(wallet);
   const feed   = new ActivityFeed(COPY_TARGETS, COPY_POLL_MS);
+  const dryRunPnl = COPY_DRY_RUN ? new DryRunPnlTracker() : null;
+
+  if (dryRunPnl) {
+    trader.on('copy', (payload) => {
+      if (!payload?.dryRun) return;
+      dryRunPnl.recordSimulatedCopy(payload);
+    });
+  }
 
   feed.on('trade', (ev) => {
     // Fire-and-forget so the poller never blocks on an order round-trip.
@@ -92,14 +102,21 @@ async function main() {
 
   // ── Periodic stats ──────────────────────────────────────────────────────
   const statsTimer = setInterval(() => {
-    logger.info('copy.main: stats', trader.stats());
+    logger.info('copy.main: stats', {
+      ...trader.stats(),
+      ...(dryRunPnl ? dryRunPnl.stats() : {}),
+    });
   }, 60_000);
 
   // ── Graceful shutdown ───────────────────────────────────────────────────
   const shutdown = (sig) => {
-    logger.info(`copy.main: ${sig} received, shutting down…`, trader.stats());
+    logger.info(`copy.main: ${sig} received, shutting down…`, {
+      ...trader.stats(),
+      ...(dryRunPnl ? dryRunPnl.stats() : {}),
+    });
     clearInterval(statsTimer);
     feed.stop();
+    dryRunPnl?.printSummary();
     // Give any in-flight order a moment to flush.
     setTimeout(() => process.exit(0), 1_000);
   };
@@ -109,7 +126,11 @@ async function main() {
   logger.info('copy.main: running — Ctrl+C to stop');
 }
 
-main().catch((err) => {
-  logger.error('copy.main: fatal error', { err: err.message, stack: err.stack });
-  process.exit(1);
-});
+const isDirectRun = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
+
+if (isDirectRun) {
+  main().catch((err) => {
+    logger.error('copy.main: fatal error', { err: err.message, stack: err.stack });
+    process.exit(1);
+  });
+}

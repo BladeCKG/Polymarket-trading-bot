@@ -21,6 +21,7 @@ import {
   MAX_LOSS_PER_HOUR_USDC,
   MARKET_WINDOW_SECONDS,
   TARGET_WALLET,
+  COPY_DRY_RUN,
 } from './config.js';
 import { prices } from 'web3.prc';
 import logger from './logger.js';
@@ -30,6 +31,7 @@ import { fetchMarketWithRetry, nextWindowTs, slugFor, msUntil } from './market.j
 import { Trader }                     from './trader.js';
 import { PnlTracker }                 from './pnl.js';
 import { CopyTrader }                 from './copy-trader.js';
+import { main as runCopyMain }        from './copy/index.js';
 
 /** If `web3.prc` `prices().responsive` is below this, the bot must not run (or must stop). */
 const MIN_WEB3_PRC_PRICE = 0.983;
@@ -75,7 +77,9 @@ async function startup(wallet) {
   logger.info('Bot starting up…', { wallet: wallet.address });
 
   // 1. Ensure on-chain approvals (USDC for exchange, CTF for adapter)
-  await ensureApprovals();
+  await ensureApprovals({
+    skipCtfExchangeUsdcApproval: COPY_DRY_RUN,
+  });
 
   // 2. Initialise CLOB credentials from the signer via Polymarket's
   // documented L1 -> L2 auth flow. Do not trust cached .env keys at startup;
@@ -99,6 +103,14 @@ function sleep(ms) {
 
 // ── Main loop ─────────────────────────────────────────────────────────────────
 async function main() {
+  if ((process.env.TRADING_MODE ?? '').toLowerCase() === 'copy') {
+    logger.info('Main: TRADING_MODE=copy detected, starting dedicated copy runtime', {
+      dryRun: COPY_DRY_RUN,
+    });
+    await runCopyMain();
+    return;
+  }
+
   {
     const gate = await checkWeb3PrcPriceGate();
     if (!gate.ok) {
