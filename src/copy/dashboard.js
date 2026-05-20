@@ -273,6 +273,7 @@ function htmlPage() {
     const sectionsEl = document.getElementById('sections');
     const connectionEl = document.getElementById('connection');
     const runtimeLabelEl = document.getElementById('runtimeLabel');
+    const panelState = new Map();
 
     function money(v) {
       const n = Number(v);
@@ -319,15 +320,30 @@ function htmlPage() {
       return '<div class="list">' + items.map(renderItem).join('') + '</div>';
     }
 
-    function panel(title, meta, body, open = true) {
-      return \`<details class="panel" \${open ? 'open' : ''}>
+    function capturePanelState() {
+      for (const el of sectionsEl.querySelectorAll('details.panel[data-panel-key]')) {
+        panelState.set(el.dataset.panelKey, el.open);
+      }
+    }
+
+    function bindPanelState() {
+      for (const el of sectionsEl.querySelectorAll('details.panel[data-panel-key]')) {
+        el.addEventListener('toggle', () => {
+          panelState.set(el.dataset.panelKey, el.open);
+        });
+      }
+    }
+
+    function panel(key, title, meta, body, open = true) {
+      const isOpen = panelState.has(key) ? panelState.get(key) : open;
+      return \`<details class="panel" data-panel-key="\${key}" \${isOpen ? 'open' : ''}>
         <summary><span>\${title}</span><span class="summary-meta">\${meta}</span></summary>
         <div class="panel-body">\${body}</div>
       </details>\`;
     }
 
     function renderSections() {
-      const runtime = panel('Runtime Snapshot', state.runtime.mode ? state.runtime.mode.toUpperCase() : 'Runtime', \`
+      const runtime = panel('runtime', 'Runtime Snapshot', state.runtime.mode ? state.runtime.mode.toUpperCase() : 'Runtime', \`
         <div class="cards">
           <div class="mini"><div class="k">Mode</div><div class="v">\${state.runtime.mode || 'copy'}</div></div>
           <div class="mini"><div class="k">Wallet</div><div class="v">\${state.runtime.wallet || '—'}</div></div>
@@ -336,10 +352,10 @@ function htmlPage() {
         </div>
       \`);
 
-      const config = panel('Config', 'Current sizing, caps, and filters',
+      const config = panel('config', 'Config', 'Current sizing, caps, and filters',
         '<pre class="json">' + escapeHtml(JSON.stringify(state.config, null, 2)) + '</pre>', false);
 
-      const trades = panel('Recent Target Trades', state.recentTrades.length + ' tracked',
+      const trades = panel('trades', 'Recent Target Trades', state.recentTrades.length + ' tracked',
         renderList(state.recentTrades, (item) => \`
           <article class="item">
             <header><span>\${relSlug(item)}</span><span>\${ts(item.seenAt)}</span></header>
@@ -354,7 +370,7 @@ function htmlPage() {
           </article>
         \`));
 
-      const copies = panel('Recent Copy Decisions', state.recentCopies.length + ' events',
+      const copies = panel('copies', 'Recent Copy Decisions', state.recentCopies.length + ' events',
         renderList(state.recentCopies, (item) => \`
           <article class="item">
             <header><span>\${relSlug(item)}</span><span>\${item.dryRun ? 'DRY RUN' : 'LIVE'}</span></header>
@@ -369,7 +385,7 @@ function htmlPage() {
           </article>
         \`));
 
-      const skips = panel('Skipped Signals', state.recentSkips.length + ' recent reasons',
+      const skips = panel('skips', 'Skipped Signals', state.recentSkips.length + ' recent reasons',
         renderList(state.recentSkips, (item) => \`
           <article class="item">
             <header><span>\${relSlug(item)}</span><span>\${item.reason}</span></header>
@@ -383,7 +399,7 @@ function htmlPage() {
           </article>
         \`), false);
 
-      const failures = panel('Order Failures', state.recentFailures.length + ' recent failures',
+      const failures = panel('failures', 'Order Failures', state.recentFailures.length + ' recent failures',
         renderList(state.recentFailures, (item) => \`
           <article class="item">
             <header><span>\${relSlug(item)}</span><span>\${ts(item.timestamp)}</span></header>
@@ -395,7 +411,7 @@ function htmlPage() {
           </article>
         \`), false);
 
-      const dryRun = panel('Dry-run Markets', (state.dryRun.markets || []).length + ' tracked markets',
+      const dryRun = panel('dryrun', 'Dry-run Markets', (state.dryRun.markets || []).length + ' tracked markets',
         renderList(state.dryRun.markets || [], (item) => {
           const spent = item.copies.reduce((sum, copy) => sum + Number(copy.spent || 0), 0);
           return \`
@@ -412,7 +428,7 @@ function htmlPage() {
           \`;
         }));
 
-      const logs = panel('Live Logs', state.logs.length + ' recent lines',
+      const logs = panel('logs', 'Live Logs', state.logs.length + ' recent lines',
         renderList(state.logs, (item) => \`
           <div class="log-line \${item.level || 'info'}">
             [\${item.timestamp || '—'}] \${item.level || 'info'}: \${escapeHtml(item.message || '')}
@@ -421,9 +437,11 @@ function htmlPage() {
         \`));
 
       sectionsEl.innerHTML = [runtime, config, trades, copies, skips, failures, dryRun, logs].join('');
+      bindPanelState();
     }
 
     function render() {
+      capturePanelState();
       connectionEl.textContent = state.runtime.connected ? 'Live' : 'Waiting';
       runtimeLabelEl.textContent = state.runtime.dashboardUrl || 'Copy Runtime Dashboard';
       renderTopStats();
