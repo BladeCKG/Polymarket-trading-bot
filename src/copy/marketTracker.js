@@ -7,7 +7,7 @@ function normalizeOutcomeKey(value) {
   return typeof value === 'string' ? value.trim().toLowerCase() : '';
 }
 
-export class DryRunPnlTracker extends EventEmitter {
+export class CopyMarketTracker extends EventEmitter {
   constructor({ traderPnlSource = 'API' } = {}) {
     super();
     this.pnl = new PnlTracker();
@@ -94,6 +94,7 @@ export class DryRunPnlTracker extends EventEmitter {
       txHash: ev.txHash?.toLowerCase?.() ?? '',
       slug: ev.slug ?? null,
     });
+    this._ensureSettlementWatch(slug, market);
   }
 
   stats() {
@@ -140,6 +141,8 @@ export class DryRunPnlTracker extends EventEmitter {
         actualTraderPnl: market.actualTraderPnl ?? null,
         actualTraderPnlSource: market.actualTraderPnlSource ?? null,
         actualTraderTradeCount: market.actualTraderTradeCount ?? 0,
+        actualTraderSpent: market.actualTraderSpent ?? null,
+        actualTraderRedeemed: market.actualTraderRedeemed ?? null,
         redeemed: market.redeemed,
         settled: market.settled,
         settledAt: market.settledAt,
@@ -158,6 +161,8 @@ export class DryRunPnlTracker extends EventEmitter {
         actualTraderPnl: null,
         actualTraderPnlSource: null,
         actualTraderTradeCount: 0,
+        actualTraderSpent: null,
+        actualTraderRedeemed: null,
         redeemed: 0,
         settled: false,
         settledAt: null,
@@ -165,7 +170,10 @@ export class DryRunPnlTracker extends EventEmitter {
         targetTradeKeys: new Set(),
       });
     }
-    return this._markets.get(slug);
+    const market = this._markets.get(slug);
+    if (!market.conditionId && meta.conditionId) market.conditionId = meta.conditionId;
+    if (!market.question && meta.question) market.question = meta.question;
+    return market;
   }
 
   _ensureSettlementWatch(slug, marketMeta = null) {
@@ -216,6 +224,8 @@ export class DryRunPnlTracker extends EventEmitter {
     market.actualTraderPnl = actualTraderPnl?.pnl ?? null;
     market.actualTraderPnlSource = actualTraderPnl?.source ?? null;
     market.actualTraderTradeCount = actualTraderPnl?.tradeCount ?? 0;
+    market.actualTraderSpent = actualTraderPnl?.spent ?? null;
+    market.actualTraderRedeemed = actualTraderPnl?.redeemed ?? null;
     this.pnl.recordRedeem(slug, redeemed, 'dry-run');
 
     logger.info('copy.dryRun: simulated market settled', {
@@ -244,7 +254,10 @@ export class DryRunPnlTracker extends EventEmitter {
   }
 
   async _fetchActualTraderPnl(market) {
-    const targets = [...new Set(market.copies.map((copy) => copy.target).filter(Boolean))];
+    const targets = [...new Set([
+      ...market.copies.map((copy) => copy.target),
+      ...market.targetTrades.map((trade) => trade.target),
+    ].filter(Boolean))];
     if (!targets.length) return null;
 
     if (this._traderPnlSource === 'OBSERVED') {
@@ -291,9 +304,9 @@ export class DryRunPnlTracker extends EventEmitter {
 
     if (!foundAny) return null;
     if (Math.abs(realizedTotal) > 1e-9) {
-      return { pnl: realizedTotal, source: 'realizedPnl', tradeCount: 0 };
+      return { pnl: realizedTotal, source: 'realizedPnl', tradeCount: 0, spent: null, redeemed: null };
     }
-    return { pnl: cashTotal, source: 'cashPnl', tradeCount: 0 };
+    return { pnl: cashTotal, source: 'cashPnl', tradeCount: 0, spent: null, redeemed: null };
   }
 
   _fetchActualTraderPnlFromObservedTrades(market, targets) {
@@ -301,12 +314,14 @@ export class DryRunPnlTracker extends EventEmitter {
     const matches = market.targetTrades.filter((trade) => targetSet.has((trade.target ?? '').toLowerCase()));
     if (!matches.length) return null;
 
-    const pnl = this._marketPnlFromTradeHistory(market, matches);
-    if (pnl == null) return null;
+    const summary = this._marketTradeSummary(market, matches);
+    if (!summary) return null;
     return {
-      pnl,
+      pnl: summary.pnl,
       source: 'observedTargetTrades',
       tradeCount: matches.length,
+      spent: summary.spent,
+      redeemed: summary.redemption,
     };
   }
 
@@ -314,6 +329,8 @@ export class DryRunPnlTracker extends EventEmitter {
     let pnlTotal = 0;
     let foundAny = false;
     let tradeCount = 0;
+    let spentTotal = 0;
+    let redeemedTotal = 0;
 
     for (const target of targets) {
       try {
@@ -329,12 +346,14 @@ export class DryRunPnlTracker extends EventEmitter {
         );
         if (!matches.length) continue;
 
-        const pnl = this._marketPnlFromTradeHistory(market, matches);
-        if (pnl == null) continue;
+        const summary = this._marketTradeSummary(market, matches);
+        if (!summary) continue;
 
         foundAny = true;
-        pnlTotal += pnl;
+        pnlTotal += summary.pnl;
         tradeCount += matches.length;
+        spentTotal += summary.spent;
+        redeemedTotal += summary.redemption;
       } catch (err) {
         logger.debug('copy.dryRun: unable to rebuild target trader pnl from trade history', {
           target,
@@ -346,10 +365,21 @@ export class DryRunPnlTracker extends EventEmitter {
     }
 
     if (!foundAny) return null;
-    return { pnl: pnlTotal, source: 'tradeHistory', tradeCount };
+    return {
+      pnl: pnlTotal,
+      source: 'tradeHistory',
+      tradeCount,
+      spent: spentTotal,
+      redeemed: redeemedTotal,
+    };
   }
 
   _marketPnlFromTradeHistory(market, trades) {
+    const summary = this._marketTradeSummary(market, trades);
+    return summary?.pnl ?? null;
+  }
+
+  _marketTradeSummary(market, trades) {
     const payoutByOutcome = this._resolvedPayoutMap(market);
     if (!payoutByOutcome.size) return null;
 
@@ -381,7 +411,12 @@ export class DryRunPnlTracker extends EventEmitter {
       redemption += shares * (payoutByOutcome.get(outcomeKey) ?? 0);
     }
 
-    return proceeds + redemption - spent;
+    return {
+      spent,
+      proceeds,
+      redemption,
+      pnl: proceeds + redemption - spent,
+    };
   }
 
   _resolvedPayoutMap(market) {

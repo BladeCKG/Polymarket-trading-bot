@@ -22,7 +22,7 @@ import logger from '../logger.js';
 import { ClobClient } from '../clob.js';
 import { getSigner, ensureApprovals } from '../onchain.js';
 import { CopyTrader } from './copyTrader.js';
-import { DryRunPnlTracker } from './dryRunPnl.js';
+import { CopyMarketTracker } from './marketTracker.js';
 import { CopyDashboardServer } from './dashboard.js';
 import { createCopyFeed } from './feedFactory.js';
 import {
@@ -132,33 +132,33 @@ export async function main() {
     targets: COPY_TARGETS,
     pollMs: COPY_POLL_MS,
   });
-  const dryRunPnl = COPY_DRY_RUN
-    ? new DryRunPnlTracker({ traderPnlSource: COPY_SETTLED_TRADER_PNL_SOURCE })
-    : null;
+  const marketTracker = new CopyMarketTracker({ traderPnlSource: COPY_SETTLED_TRADER_PNL_SOURCE });
 
-  if (dryRunPnl) {
+  if (COPY_DRY_RUN) {
     trader.on('copy', (payload) => {
       if (!payload?.dryRun) return;
-      dryRunPnl.recordSimulatedCopy(payload);
+      marketTracker.recordSimulatedCopy(payload);
     });
-    dryRunPnl.on('recorded', (payload) => {
+    marketTracker.on('recorded', (payload) => {
       dashboard?.recordDryRunRecorded(payload);
-      dashboard?.setDryRunSnapshot(dryRunPnl.snapshot());
+      dashboard?.setDryRunSnapshot(marketTracker.snapshot());
       dashboard?.setStats({
         ...trader.stats(),
-        ...dryRunPnl.stats(),
+        ...marketTracker.stats(),
       });
     });
-    dryRunPnl.on('settled', (payload) => {
-      dashboard?.recordDryRunSettled(payload);
-      dashboard?.setDryRunSnapshot(dryRunPnl.snapshot());
-      dashboard?.setStats({
-        ...trader.stats(),
-        ...dryRunPnl.stats(),
-      });
-    });
-    dashboard?.setDryRunSnapshot(dryRunPnl.snapshot());
   }
+
+  marketTracker.on('settled', (payload) => {
+    dashboard?.recordDryRunSettled(payload);
+    dashboard?.setDryRunSnapshot(marketTracker.snapshot());
+    dashboard?.setStats({
+      ...trader.stats(),
+      ...(COPY_DRY_RUN ? marketTracker.stats() : {}),
+    });
+  });
+
+  dashboard?.setDryRunSnapshot(marketTracker.snapshot());
 
   trader.on('copy', (payload) => {
     dashboard?.recordCopy({
@@ -198,7 +198,8 @@ export async function main() {
   });
 
   feed.on('trade', (ev) => {
-    dryRunPnl?.recordObservedTargetTrade(ev);
+    marketTracker.recordObservedTargetTrade(ev);
+    dashboard?.setDryRunSnapshot(marketTracker.snapshot());
     dashboard?.recordTrade({
       source: ev.source ?? COPY_FEED_MODE.toLowerCase(),
       target: ev.target,
@@ -224,7 +225,7 @@ export async function main() {
   const statsTimer = setInterval(() => {
     const stats = {
       ...trader.stats(),
-      ...(dryRunPnl ? dryRunPnl.stats() : {}),
+      ...(COPY_DRY_RUN ? marketTracker.stats() : {}),
     };
     logger.info('copy.main: stats', stats);
     dashboard?.setStats(stats);
@@ -232,18 +233,18 @@ export async function main() {
 
   dashboard?.setStats({
     ...trader.stats(),
-    ...(dryRunPnl ? dryRunPnl.stats() : {}),
+    ...(COPY_DRY_RUN ? marketTracker.stats() : {}),
   });
 
   // ── Graceful shutdown ────────────────────────────────────────────────────
   const shutdown = (sig) => {
     logger.info(`copy.main: ${sig} received, shutting down…`, {
       ...trader.stats(),
-      ...(dryRunPnl ? dryRunPnl.stats() : {}),
+      ...(COPY_DRY_RUN ? marketTracker.stats() : {}),
     });
     clearInterval(statsTimer);
     feed.stop();
-    dryRunPnl?.printSummary();
+    if (COPY_DRY_RUN) marketTracker.printSummary();
     dashboard?.stop();
     // Give any in-flight order a moment to flush.
     setTimeout(() => process.exit(0), 1_000);

@@ -336,6 +336,20 @@ function htmlPage() {
       };
     }
 
+    function trackedMarketView(item) {
+      const copy = dryRunMarketPnl(item);
+      const hasCopies = (item.copies?.length ?? 0) > 0;
+      const traderSpent = Number(item.actualTraderSpent);
+      const traderRedeemed = Number(item.actualTraderRedeemed);
+      const traderPnl = Number(item.actualTraderPnl);
+      return {
+        hasCopies,
+        spent: hasCopies ? copy.spent : (Number.isFinite(traderSpent) ? traderSpent : 0),
+        redeemed: hasCopies ? copy.redeemed : (Number.isFinite(traderRedeemed) ? traderRedeemed : 0),
+        pnl: hasCopies ? copy.pnl : (Number.isFinite(traderPnl) ? traderPnl : 0),
+      };
+    }
+
     function escapeHtml(value) {
       return String(value)
         .replaceAll('&', '&amp;')
@@ -344,14 +358,23 @@ function htmlPage() {
     }
 
     function renderTopStats() {
-      const cards = [
-        ['Accepted Copies', state.stats.copies ?? 0],
-        ['Skipped Signals', state.stats.skips ?? 0],
-        ['Failures', state.stats.failures ?? 0],
-        ['Live Spend', money(state.stats.totalSpent ?? 0)],
-        ['Dry-run Open Cost', money(state.stats.dryRunOpenCost ?? 0)],
-        ['Dry-run Settled PnL', money(state.stats.dryRunSettledPnl ?? 0)],
-      ];
+      const cards = state.runtime.dryRun
+        ? [
+          ['Accepted Copies', state.stats.copies ?? 0],
+          ['Skipped Signals', state.stats.skips ?? 0],
+          ['Failures', state.stats.failures ?? 0],
+          ['Live Spend', money(state.stats.totalSpent ?? 0)],
+          ['Dry-run Open Cost', money(state.stats.dryRunOpenCost ?? 0)],
+          ['Dry-run Settled PnL', money(state.stats.dryRunSettledPnl ?? 0)],
+        ]
+        : [
+          ['Accepted Copies', state.stats.copies ?? 0],
+          ['Skipped Signals', state.stats.skips ?? 0],
+          ['Failures', state.stats.failures ?? 0],
+          ['Live Spend', money(state.stats.totalSpent ?? 0)],
+          ['Tracked Markets Open', state.dryRun?.markets?.filter((item) => !item.settled).length ?? 0],
+          ['Tracked Markets Settled', state.dryRun?.markets?.filter((item) => item.settled).length ?? 0],
+        ];
       topStatsEl.innerHTML = cards.map(([label, value]) => \`
         <article class="stat">
           <div class="label">\${label}</div>
@@ -456,9 +479,9 @@ function htmlPage() {
           </article>
         \`), false);
 
-      const dryRun = panel('dryrun', 'Dry-run Markets', (state.dryRun.markets || []).length + ' tracked markets',
+      const dryRun = panel('dryrun', state.runtime.dryRun ? 'Dry-run Markets' : 'Tracked Target Markets', (state.dryRun.markets || []).length + ' tracked markets',
         renderList(state.dryRun.markets || [], (item) => {
-          const market = dryRunMarketPnl(item);
+          const market = trackedMarketView(item);
           const statusClass = !item.settled
             ? ''
             : market.pnl > 0
@@ -491,6 +514,9 @@ function htmlPage() {
                 <div><dt>PnL</dt><dd>\${money(market.pnl)}</dd></div>
                 <div><dt>Trader PnL</dt><dd>\${item.actualTraderPnl == null ? '—' : money(item.actualTraderPnl)}</dd></div>
                 <div><dt>PnL Source</dt><dd>\${item.actualTraderPnlSource || '—'}</dd></div>
+                <div><dt>Trader Spend</dt><dd>\${item.actualTraderSpent == null ? 'â€”' : money(item.actualTraderSpent)}</dd></div>
+                <div><dt>Trader Redeemed</dt><dd>\${item.actualTraderRedeemed == null ? 'â€”' : money(item.actualTraderRedeemed)}</dd></div>
+                <div><dt>Trader Trades</dt><dd>\${item.actualTraderTradeCount ?? 0}</dd></div>
                 <div><dt>Settled At</dt><dd>\${ts(item.settledAt)}</dd></div>
               </dl>
             </article>
