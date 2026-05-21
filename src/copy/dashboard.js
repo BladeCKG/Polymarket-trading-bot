@@ -194,12 +194,22 @@ function htmlPage() {
       border-color: rgba(180,35,24,0.24);
       box-shadow: inset 0 0 0 1px rgba(180,35,24,0.08);
     }
+    .item.settled-mismatch {
+      border-color: rgba(154,103,0,0.34);
+      box-shadow: inset 0 0 0 2px rgba(154,103,0,0.16);
+    }
     .item header {
       display: flex;
       justify-content: space-between;
       gap: 10px;
       margin-bottom: 8px;
       font-weight: 700;
+    }
+    .header-badges {
+      display: inline-flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
     }
     .status-chip {
       display: inline-flex;
@@ -222,6 +232,10 @@ function htmlPage() {
     .status-chip.loss {
       background: rgba(180,35,24,0.12);
       color: var(--danger);
+    }
+    .status-chip.mismatch {
+      background: rgba(154,103,0,0.14);
+      color: var(--warn);
     }
     .item dl {
       margin: 0;
@@ -367,6 +381,7 @@ function htmlPage() {
           ['Dry-run Open Cost', money(state.stats.dryRunOpenCost ?? 0)],
           ['Dry-run Settled PnL', money(state.stats.dryRunSettledPnl ?? 0)],
           ['My Settled PnL', money(state.stats.ownSettledPnl ?? 0)],
+          ['Skipped Settled PnL', money(state.stats.skippedSettledPnl ?? 0)],
           ['Target Settled PnL', money(state.stats.targetSettledPnl ?? 0)],
         ]
         : [
@@ -377,6 +392,7 @@ function htmlPage() {
           ['Tracked Markets Open', state.dryRun?.markets?.filter((item) => !item.settled).length ?? 0],
           ['Tracked Markets Settled', state.dryRun?.markets?.filter((item) => item.settled).length ?? 0],
           ['My Settled PnL', money(state.stats.ownSettledPnl ?? 0)],
+          ['Skipped Settled PnL', money(state.stats.skippedSettledPnl ?? 0)],
           ['Target Settled PnL', money(state.stats.targetSettledPnl ?? 0)],
         ];
       topStatsEl.innerHTML = cards.map(([label, value]) => \`
@@ -486,6 +502,12 @@ function htmlPage() {
       const dryRun = panel('dryrun', state.runtime.dryRun ? 'Dry-run Markets' : 'Tracked Target Markets', (state.dryRun.markets || []).length + ' tracked markets',
         renderList(state.dryRun.markets || [], (item) => {
           const market = trackedMarketView(item);
+          const traderPnl = Number(item.actualTraderPnl);
+          const ownPnl = Number(item.ownTraderPnl);
+          const hasMismatch = item.settled &&
+            Number.isFinite(traderPnl) &&
+            Number.isFinite(ownPnl) &&
+            ((traderPnl > 0 && ownPnl < 0) || (traderPnl < 0 && ownPnl > 0));
           const statusClass = !item.settled
             ? ''
             : market.pnl > 0
@@ -493,6 +515,7 @@ function htmlPage() {
               : market.pnl < 0
                 ? 'settled-loss'
                 : '';
+          const cardClass = hasMismatch ? (statusClass + ' settled-mismatch').trim() : statusClass;
           const chipClass = !item.settled
             ? ''
             : market.pnl > 0
@@ -508,8 +531,8 @@ function htmlPage() {
                 ? 'Loss'
                 : 'Flat';
           return \`
-            <article class="item \${statusClass}">
-              <header><span>\${item.slug}</span><span class="status-chip \${chipClass}">\${chipLabel}</span></header>
+            <article class="item \${cardClass}">
+              <header><span>\${item.slug}</span><span class="header-badges"><span class="status-chip \${chipClass}">\${chipLabel}</span>\${hasMismatch ? '<span class="status-chip mismatch">Opposite Result</span>' : ''}</span></header>
               <dl>
                 <div><dt>Question</dt><dd>\${item.question || '—'}</dd></div>
                 <div><dt>Copies</dt><dd>\${item.copies.length}</dd></div>
@@ -526,6 +549,10 @@ function htmlPage() {
                 <div><dt>My Spend</dt><dd>\${item.ownTraderSpent == null ? 'â€”' : money(item.ownTraderSpent)}</dd></div>
                 <div><dt>My Redeemed</dt><dd>\${item.ownTraderRedeemed == null ? 'â€”' : money(item.ownTraderRedeemed)}</dd></div>
                 <div><dt>My Trades</dt><dd>\${item.ownTraderTradeCount ?? 0}</dd></div>
+                <div><dt>Skipped PnL</dt><dd>\${item.skippedPnl == null ? 'â€”' : money(item.skippedPnl)}</dd></div>
+                <div><dt>Skipped Spend</dt><dd>\${item.skippedSpent == null ? 'â€”' : money(item.skippedSpent)}</dd></div>
+                <div><dt>Skipped Redeemed</dt><dd>\${item.skippedRedeemed == null ? 'â€”' : money(item.skippedRedeemed)}</dd></div>
+                <div><dt>Skipped Trades</dt><dd>\${item.skippedTradeCount ?? 0}</dd></div>
                 <div><dt>Settled At</dt><dd>\${ts(item.settledAt)}</dd></div>
               </dl>
             </article>

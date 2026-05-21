@@ -53,11 +53,12 @@ export class CopyTrader extends EventEmitter {
 
   /** Handle a normalized trade event from ActivityFeed. */
   async onTrade(ev) {
+    const skipHypothetical = this._skipHypothetical(ev);
     // ── Pre-flight filters (O(1), no I/O) ──────────────────────────────────
     const reason = this._rejectReason(ev);
     if (reason) {
       this.skipCount++;
-      this.emit('skip', { reason, ev, phase: 'filter' });
+      this.emit('skip', { reason, ev, phase: 'filter', hypothetical: skipHypothetical });
       logger.debug('copy.CopyTrader: skipping trade', { reason, ev: this._evSummary(ev) });
       return;
     }
@@ -66,7 +67,7 @@ export class CopyTrader extends EventEmitter {
     const ourUsdc = this._ourUsdc(ev);
     if (!ourUsdc || ourUsdc < 1) {
       this.skipCount++;
-      this.emit('skip', { reason: 'computed-size-too-small', ev, ourUsdc, phase: 'size' });
+      this.emit('skip', { reason: 'computed-size-too-small', ev, ourUsdc, phase: 'size', hypothetical: skipHypothetical });
       logger.debug('copy.CopyTrader: computed size too small', { ourUsdc, ev: this._evSummary(ev) });
       return;
     }
@@ -161,13 +162,7 @@ export class CopyTrader extends EventEmitter {
   }
 
   _ourUsdc(ev) {
-    let raw;
-    switch (COPY_SIZE_MODE) {
-      case 'MIRROR': raw = ev.usdc;                 break;
-      case 'RATIO':  raw = ev.usdc * COPY_RATIO;    break;
-      case 'FIXED':
-      default:       raw = COPY_FIXED_USDC;         break;
-    }
+    const raw = this._baseUsdc(ev);
 
     // Apply every cap.
     const perTradeCap = COPY_MAX_USDC_PER_TRADE;
@@ -183,6 +178,33 @@ export class CopyTrader extends EventEmitter {
       remainingHourly,
       remainingTotal,
     ));
+  }
+
+  _baseUsdc(ev) {
+    switch (COPY_SIZE_MODE) {
+      case 'MIRROR': return ev.usdc;
+      case 'RATIO':  return ev.usdc * COPY_RATIO;
+      case 'FIXED':
+      default:       return COPY_FIXED_USDC;
+    }
+  }
+
+  _skipHypothetical(ev) {
+    const desiredUsdc = this._baseUsdc(ev);
+    const maxPrice = Math.min(
+      COPY_MAX_PRICE,
+      Number((ev.price + COPY_MAX_SLIPPAGE).toFixed(4)),
+    );
+    if (!Number.isFinite(desiredUsdc) || desiredUsdc <= 0 || !Number.isFinite(maxPrice) || maxPrice <= 0) {
+      return null;
+    }
+    const shares = Math.max(0, Math.floor(desiredUsdc / maxPrice));
+    return {
+      desiredUsdc,
+      maxPrice,
+      shares,
+      hypotheticalSpent: shares * maxPrice,
+    };
   }
 
   // ── Spend tracking ──────────────────────────────────────────────────────

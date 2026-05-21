@@ -179,6 +179,8 @@ export async function main() {
   });
 
   trader.on('skip', (payload) => {
+    marketTracker.recordSkippedTrade(payload);
+    dashboard?.setDryRunSnapshot(marketTracker.snapshot());
     dashboard?.recordSkip({
       slug: payload.ev?.slug ?? null,
       conditionId: payload.ev?.conditionId ?? null,
@@ -187,6 +189,8 @@ export async function main() {
       phase: payload.phase ?? null,
       price: payload.ev?.price ?? null,
       usdc: payload.ev?.usdc ?? null,
+      hypotheticalSpent: payload.hypothetical?.hypotheticalSpent ?? null,
+      hypotheticalShares: payload.hypothetical?.shares ?? null,
       timestamp: Date.now(),
     });
   });

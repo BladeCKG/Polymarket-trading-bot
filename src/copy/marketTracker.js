@@ -133,6 +133,45 @@ export class CopyMarketTracker extends EventEmitter {
     this._ensureSettlementWatch(slug, market);
   }
 
+  recordSkippedTrade({ ev, reason, phase, hypothetical }) {
+    const slug = ev?.slug ?? ev?.conditionId ?? ev?.tokenId;
+    if (!slug) return;
+
+    const market = this._getMarket(slug, {
+      conditionId: ev.conditionId,
+      question: ev.question,
+    });
+    const dedupeKey = [
+      ev.txHash ?? '',
+      ev.tokenId ?? '',
+      ev.outcome ?? '',
+      reason ?? '',
+      phase ?? '',
+      Number(hypothetical?.maxPrice ?? 0).toFixed(12),
+      Number(hypothetical?.shares ?? 0).toFixed(12),
+    ].join(':');
+
+    if (market.skippedTradeKeys.has(dedupeKey)) return;
+    market.skippedTradeKeys.add(dedupeKey);
+    market.skippedTrades.push({
+      reason: reason ?? '',
+      phase: phase ?? '',
+      outcome: ev.outcome ?? null,
+      target: ev.target ?? null,
+      tokenId: ev.tokenId ?? null,
+      conditionId: ev.conditionId?.toLowerCase?.() ?? '',
+      price: Number(ev.price ?? 0),
+      maxPrice: Number(hypothetical?.maxPrice ?? 0),
+      shares: Number(hypothetical?.shares ?? 0),
+      spent: Number(hypothetical?.hypotheticalSpent ?? 0),
+      desiredUsdc: Number(hypothetical?.desiredUsdc ?? 0),
+      timestamp: Date.now(),
+      txHash: ev.txHash?.toLowerCase?.() ?? '',
+      slug: ev.slug ?? null,
+    });
+    this._ensureSettlementWatch(slug, market);
+  }
+
   stats() {
     let openMarkets = 0;
     let settledMarkets = 0;
@@ -147,6 +186,10 @@ export class CopyMarketTracker extends EventEmitter {
     let ownSettledSpent = 0;
     let ownSettledRedeemed = 0;
     let ownSettledPnl = 0;
+    let skippedSettledTrades = 0;
+    let skippedSettledSpent = 0;
+    let skippedSettledRedeemed = 0;
+    let skippedSettledPnl = 0;
 
     for (const [slug, market] of this._markets) {
       const marketSpent = market.copies.reduce((sum, copy) => sum + copy.spent, 0);
@@ -174,6 +217,16 @@ export class CopyMarketTracker extends EventEmitter {
         if (Number.isFinite(market.ownTraderRedeemed)) {
           ownSettledRedeemed += market.ownTraderRedeemed;
         }
+        skippedSettledTrades += Number(market.skippedTradeCount ?? 0);
+        if (Number.isFinite(market.skippedSpent)) {
+          skippedSettledSpent += market.skippedSpent;
+        }
+        if (Number.isFinite(market.skippedRedeemed)) {
+          skippedSettledRedeemed += market.skippedRedeemed;
+        }
+        if (Number.isFinite(market.skippedPnl)) {
+          skippedSettledPnl += market.skippedPnl;
+        }
       } else {
         openMarkets++;
         openCost += marketSpent;
@@ -195,6 +248,10 @@ export class CopyMarketTracker extends EventEmitter {
       ownSettledSpent: ownSettledSpent.toFixed(2),
       ownSettledRedeemed: ownSettledRedeemed.toFixed(2),
       ownSettledPnl: ownSettledPnl.toFixed(2),
+      skippedSettledTrades,
+      skippedSettledSpent: skippedSettledSpent.toFixed(2),
+      skippedSettledRedeemed: skippedSettledRedeemed.toFixed(2),
+      skippedSettledPnl: skippedSettledPnl.toFixed(2),
     };
   }
 
@@ -220,6 +277,10 @@ export class CopyMarketTracker extends EventEmitter {
         ownTraderTradeCount: market.ownTraderTradeCount ?? 0,
         ownTraderSpent: market.ownTraderSpent ?? null,
         ownTraderRedeemed: market.ownTraderRedeemed ?? null,
+        skippedTradeCount: market.skippedTradeCount ?? 0,
+        skippedSpent: market.skippedSpent ?? null,
+        skippedRedeemed: market.skippedRedeemed ?? null,
+        skippedPnl: market.skippedPnl ?? null,
         redeemed: market.redeemed,
         settled: market.settled,
         settledAt: market.settledAt,
@@ -245,6 +306,10 @@ export class CopyMarketTracker extends EventEmitter {
         ownTraderTradeCount: 0,
         ownTraderSpent: null,
         ownTraderRedeemed: null,
+        skippedTradeCount: 0,
+        skippedSpent: null,
+        skippedRedeemed: null,
+        skippedPnl: null,
         redeemed: 0,
         settled: false,
         settledAt: null,
@@ -252,6 +317,8 @@ export class CopyMarketTracker extends EventEmitter {
         targetTradeKeys: new Set(),
         ownTrades: [],
         ownTradeKeys: new Set(),
+        skippedTrades: [],
+        skippedTradeKeys: new Set(),
       });
     }
     const market = this._markets.get(slug);
@@ -316,6 +383,11 @@ export class CopyMarketTracker extends EventEmitter {
     market.ownTraderTradeCount = ownTraderPnl?.tradeCount ?? 0;
     market.ownTraderSpent = ownTraderPnl?.spent ?? null;
     market.ownTraderRedeemed = ownTraderPnl?.redeemed ?? null;
+    const skippedSummary = this._summarizeSkippedTrades(market);
+    market.skippedTradeCount = skippedSummary?.tradeCount ?? 0;
+    market.skippedSpent = skippedSummary?.spent ?? null;
+    market.skippedRedeemed = skippedSummary?.redeemed ?? null;
+    market.skippedPnl = skippedSummary?.pnl ?? null;
     this.pnl.recordRedeem(slug, redeemed, 'dry-run');
 
     logger.info('copy.dryRun: simulated market settled', {
@@ -328,6 +400,8 @@ export class CopyMarketTracker extends EventEmitter {
       actualTraderPnlSource: market.actualTraderPnlSource,
       ownTraderPnl: market.ownTraderPnl,
       ownTraderPnlSource: market.ownTraderPnlSource,
+      skippedPnl: market.skippedPnl,
+      skippedTradeCount: market.skippedTradeCount,
       payouts,
       outcomes,
     });
@@ -340,6 +414,8 @@ export class CopyMarketTracker extends EventEmitter {
       actualTraderPnlSource: market.actualTraderPnlSource,
       ownTraderPnl: market.ownTraderPnl,
       ownTraderPnlSource: market.ownTraderPnlSource,
+      skippedPnl: market.skippedPnl,
+      skippedTradeCount: market.skippedTradeCount,
       payouts,
       outcomes,
       settledAt: market.settledAt,
@@ -563,6 +639,26 @@ export class CopyMarketTracker extends EventEmitter {
       proceeds,
       redemption,
       pnl: proceeds + redemption - spent,
+    };
+  }
+
+  _summarizeSkippedTrades(market) {
+    const payoutByOutcome = this._resolvedPayoutMap(market);
+    if (!payoutByOutcome.size || !market.skippedTrades.length) return null;
+
+    let spent = 0;
+    let redeemed = 0;
+    for (const trade of market.skippedTrades) {
+      if (!Number.isFinite(trade.shares) || trade.shares <= 0) continue;
+      spent += Number(trade.spent ?? 0);
+      redeemed += trade.shares * (payoutByOutcome.get(normalizeOutcomeKey(trade.outcome)) ?? 0);
+    }
+
+    return {
+      tradeCount: market.skippedTrades.length,
+      spent,
+      redeemed,
+      pnl: redeemed - spent,
     };
   }
 
