@@ -106,8 +106,13 @@
     .sections {
       display: grid;
       gap: 14px;
+      grid-template-columns: minmax(0, 1fr);
+    }
+    .sections > * {
+      min-width: 0;
     }
     details.panel {
+      width: 100%;
       border-radius: var(--radius);
       background: var(--panel);
       box-shadow: var(--shadow);
@@ -310,6 +315,10 @@
     const connectionEl = document.getElementById('connection');
     const runtimeLabelEl = document.getElementById('runtimeLabel');
     const panelState = new Map();
+    const sectionOrder = ['runtime', 'config', 'trades', 'copies', 'skips', 'failures', 'dryrun', 'logs'];
+    const sectionSlots = new Map();
+    const dirty = new Set(['chrome', 'topStats', ...sectionOrder]);
+    let renderScheduled = false;
 
     function money(v) {
       const n = Number(v);
@@ -399,19 +408,20 @@
       return '<div class="list">' + items.map(renderItem).join('') + '</div>';
     }
 
-    function capturePanelState() {
-      for (const el of sectionsEl.querySelectorAll('details.panel[data-panel-key]')) {
-        panelState.set(el.dataset.panelKey, el.open);
+    function initializeSections() {
+      sectionsEl.innerHTML = sectionOrder
+        .map((key) => `<div data-section-slot="${key}"></div>`)
+        .join('');
+      for (const key of sectionOrder) {
+        sectionSlots.set(key, sectionsEl.querySelector(`[data-section-slot="${key}"]`));
       }
     }
 
-    function bindPanelState() {
-      for (const el of sectionsEl.querySelectorAll('details.panel[data-panel-key]')) {
-        el.addEventListener('toggle', () => {
-          panelState.set(el.dataset.panelKey, el.open);
-        });
-      }
-    }
+    sectionsEl.addEventListener('toggle', (event) => {
+      const panelEl = event.target.closest('details.panel[data-panel-key]');
+      if (!panelEl) return;
+      panelState.set(panelEl.dataset.panelKey, panelEl.open);
+    }, true);
 
     function panel(key, title, meta, body, open = true) {
       const isOpen = panelState.has(key) ? panelState.get(key) : open;
@@ -421,8 +431,8 @@
       </details>`;
     }
 
-    function renderSections() {
-      const runtime = panel('runtime', 'Runtime Snapshot', state.runtime.mode ? state.runtime.mode.toUpperCase() : 'Runtime', `
+    function renderRuntimeSection() {
+      return panel('runtime', 'Runtime Snapshot', state.runtime.mode ? state.runtime.mode.toUpperCase() : 'Runtime', `
         <div class="cards">
           <div class="mini"><div class="k">Mode</div><div class="v">${state.runtime.mode || 'copy'}</div></div>
           <div class="mini"><div class="k">Wallet</div><div class="v">${dashIfEmpty(state.runtime.wallet)}</div></div>
@@ -430,11 +440,15 @@
           <div class="mini"><div class="k">Started</div><div class="v">${ts(state.runtime.startedAt)}</div></div>
         </div>
       `);
+    }
 
-      const config = panel('config', 'Config', 'Current sizing, caps, and filters',
+    function renderConfigSection() {
+      return panel('config', 'Config', 'Current sizing, caps, and filters',
         '<pre class="json">' + escapeHtml(JSON.stringify(state.config, null, 2)) + '</pre>', false);
+    }
 
-      const trades = panel('trades', 'Recent Target Trades', state.recentTrades.length + ' tracked',
+    function renderTradesSection() {
+      return panel('trades', 'Recent Target Trades', state.recentTrades.length + ' tracked',
         renderList(state.recentTrades, (item) => `
           <article class="item">
             <header><span>${relSlug(item)}</span><span>${ts(item.seenAt)}</span></header>
@@ -448,8 +462,10 @@
             </dl>
           </article>
         `));
+    }
 
-      const copies = panel('copies', 'Recent Copy Decisions', state.recentCopies.length + ' events',
+    function renderCopiesSection() {
+      return panel('copies', 'Recent Copy Decisions', state.recentCopies.length + ' events',
         renderList(state.recentCopies, (item) => `
           <article class="item">
             <header><span>${relSlug(item)}</span><span>${item.dryRun ? 'DRY RUN' : 'LIVE'}</span></header>
@@ -463,8 +479,10 @@
             </dl>
           </article>
         `));
+    }
 
-      const skips = panel('skips', 'Skipped Signals', state.recentSkips.length + ' recent reasons',
+    function renderSkipsSection() {
+      return panel('skips', 'Skipped Signals', state.recentSkips.length + ' recent reasons',
         renderList(state.recentSkips, (item) => `
           <article class="item">
             <header><span>${relSlug(item)}</span><span>${item.reason}</span></header>
@@ -477,8 +495,10 @@
             </dl>
           </article>
         `), false);
+    }
 
-      const failures = panel('failures', 'Order Failures', state.recentFailures.length + ' recent failures',
+    function renderFailuresSection() {
+      return panel('failures', 'Order Failures', state.recentFailures.length + ' recent failures',
         renderList(state.recentFailures, (item) => `
           <article class="item">
             <header><span>${relSlug(item)}</span><span>${ts(item.timestamp)}</span></header>
@@ -489,8 +509,10 @@
             </dl>
           </article>
         `), false);
+    }
 
-      const dryRun = panel('dryrun', state.runtime.dryRun ? 'Dry-run Markets' : 'Tracked Target Markets', (state.dryRun.markets || []).length + ' tracked markets',
+    function renderDryRunSection() {
+      return panel('dryrun', state.runtime.dryRun ? 'Dry-run Markets' : 'Tracked Target Markets', (state.dryRun.markets || []).length + ' tracked markets',
         renderList([...(state.dryRun.markets || [])].reverse(), (item) => {
           const market = trackedMarketView(item);
           const traderPnl = Number(item.actualTraderPnl);
@@ -549,62 +571,130 @@
             </article>
           `;
         }));
+    }
 
-      const logs = panel('logs', 'Live Logs', state.logs.length + ' recent lines',
+    function renderLogsSection() {
+      return panel('logs', 'Live Logs', state.logs.length + ' recent lines',
         renderList(state.logs, (item) => `
           <div class="log-line ${item.level || 'info'}">
             [${dashIfEmpty(item.timestamp)}] ${item.level || 'info'}: ${escapeHtml(item.message || '')}
             ${item.meta && Object.keys(item.meta).length ? '<div class="muted">' + escapeHtml(JSON.stringify(item.meta)) + '</div>' : ''}
           </div>
         `));
-
-      sectionsEl.innerHTML = [runtime, config, trades, copies, skips, failures, dryRun, logs].join('');
-      bindPanelState();
     }
 
-    function render() {
-      capturePanelState();
+    const sectionRenderers = {
+      runtime: renderRuntimeSection,
+      config: renderConfigSection,
+      trades: renderTradesSection,
+      copies: renderCopiesSection,
+      skips: renderSkipsSection,
+      failures: renderFailuresSection,
+      dryrun: renderDryRunSection,
+      logs: renderLogsSection,
+    };
+
+    function updateRuntimeChrome() {
       connectionEl.textContent = state.runtime.connected ? 'Live' : 'Waiting';
       runtimeLabelEl.textContent = state.runtime.dashboardUrl || 'Copy Runtime Dashboard';
-      renderTopStats();
-      renderSections();
+    }
+
+    function renderSection(key) {
+      const slot = sectionSlots.get(key);
+      if (!slot) return;
+      slot.innerHTML = sectionRenderers[key]();
+    }
+
+    function flushRender() {
+      renderScheduled = false;
+      if (dirty.has('chrome')) {
+        updateRuntimeChrome();
+        dirty.delete('chrome');
+      }
+      if (dirty.has('topStats')) {
+        renderTopStats();
+        dirty.delete('topStats');
+      }
+      for (const key of sectionOrder) {
+        if (!dirty.has(key)) continue;
+        renderSection(key);
+        dirty.delete(key);
+      }
+    }
+
+    function scheduleRender(...keys) {
+      if (!keys.length) {
+        dirty.add('chrome');
+        dirty.add('topStats');
+        for (const key of sectionOrder) dirty.add(key);
+      } else {
+        for (const key of keys) dirty.add(key);
+      }
+      if (renderScheduled) return;
+      renderScheduled = true;
+      requestAnimationFrame(flushRender);
     }
 
     function applySnapshot(snapshot) {
       Object.assign(state, snapshot);
-      render();
+      scheduleRender();
     }
 
     function handleEvent(payload) {
       const { type, data } = payload;
-      if (type === 'runtime') state.runtime = { ...state.runtime, ...data };
-      else if (type === 'stats') state.stats = { ...state.stats, ...data };
-      else if (type === 'config') state.config = data;
-      else if (type === 'trade') state.recentTrades = [data, ...state.recentTrades].slice(0, 100);
-      else if (type === 'copy') state.recentCopies = [data, ...state.recentCopies].slice(0, 100);
-      else if (type === 'skip') state.recentSkips = [data, ...state.recentSkips].slice(0, 100);
-      else if (type === 'failure') state.recentFailures = [data, ...state.recentFailures].slice(0, 100);
-      else if (type === 'dryRunSnapshot') state.dryRun = data;
-      else if (type === 'dryRunRecorded') state.dryRun.recorded = [data, ...(state.dryRun.recorded || [])].slice(0, 100);
-      else if (type === 'dryRunSettled') state.dryRun.settled = [data, ...(state.dryRun.settled || [])].slice(0, 100);
-      else if (type === 'log') state.logs = [data, ...state.logs].slice(0, 250);
-      render();
+      if (type === 'runtime') {
+        state.runtime = { ...state.runtime, ...data };
+        scheduleRender('chrome', 'runtime', 'topStats', 'dryrun');
+      } else if (type === 'stats') {
+        state.stats = { ...state.stats, ...data };
+        scheduleRender('topStats');
+      } else if (type === 'config') {
+        state.config = data;
+        scheduleRender('config');
+      } else if (type === 'trade') {
+        state.recentTrades = [data, ...state.recentTrades].slice(0, 100);
+        scheduleRender('trades');
+      } else if (type === 'copy') {
+        state.recentCopies = [data, ...state.recentCopies].slice(0, 100);
+        scheduleRender('copies');
+      } else if (type === 'skip') {
+        state.recentSkips = [data, ...state.recentSkips].slice(0, 100);
+        scheduleRender('skips');
+      } else if (type === 'failure') {
+        state.recentFailures = [data, ...state.recentFailures].slice(0, 100);
+        scheduleRender('failures');
+      } else if (type === 'dryRunSnapshot') {
+        state.dryRun = data;
+        scheduleRender('topStats', 'dryrun');
+      } else if (type === 'dryRunRecorded') {
+        state.dryRun.recorded = [data, ...(state.dryRun.recorded || [])].slice(0, 100);
+        scheduleRender('dryrun');
+      } else if (type === 'dryRunSettled') {
+        state.dryRun.settled = [data, ...(state.dryRun.settled || [])].slice(0, 100);
+        scheduleRender('dryrun');
+      } else if (type === 'log') {
+        state.logs = [data, ...state.logs].slice(0, 250);
+        scheduleRender('logs');
+      }
     }
 
     const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
     ws.addEventListener('open', () => {
       state.runtime.connected = true;
-      render();
+      scheduleRender('chrome');
     });
     ws.addEventListener('close', () => {
       state.runtime.connected = false;
-      render();
+      scheduleRender('chrome');
     });
     ws.addEventListener('message', (event) => {
       const payload = JSON.parse(event.data);
       if (payload.type === 'snapshot') applySnapshot(payload.data);
       else handleEvent(payload);
     });
+
+    initializeSections();
+    scheduleRender();
   </script>
 </body>
 </html>
