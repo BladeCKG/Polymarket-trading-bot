@@ -26,6 +26,9 @@ function htmlPage() {
       --muted: #58645e;
       --accent: #0f766e;
       --accent-soft: #d7f3ee;
+      --profit: #1d4ed8;
+      --profit-soft: rgba(59,130,246,0.14);
+      --loss-soft: rgba(180,35,24,0.12);
       --danger: #b42318;
       --warn: #9a6700;
       --shadow: 0 18px 50px rgba(34, 54, 45, 0.14);
@@ -181,12 +184,44 @@ function htmlPage() {
       background: rgba(255,255,255,0.76);
       border: 1px solid rgba(15,118,110,0.08);
     }
+    .item.settled-profit {
+      background: linear-gradient(135deg, rgba(255,255,255,0.94), var(--profit-soft));
+      border-color: rgba(29,78,216,0.28);
+      box-shadow: inset 0 0 0 1px rgba(29,78,216,0.08);
+    }
+    .item.settled-loss {
+      background: linear-gradient(135deg, rgba(255,255,255,0.94), var(--loss-soft));
+      border-color: rgba(180,35,24,0.24);
+      box-shadow: inset 0 0 0 1px rgba(180,35,24,0.08);
+    }
     .item header {
       display: flex;
       justify-content: space-between;
       gap: 10px;
       margin-bottom: 8px;
       font-weight: 700;
+    }
+    .status-chip {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 82px;
+      padding: 6px 10px;
+      border-radius: 999px;
+      font-size: 0.78rem;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      background: rgba(15,118,110,0.12);
+      color: var(--accent);
+    }
+    .status-chip.profit {
+      background: rgba(29,78,216,0.14);
+      color: var(--profit);
+    }
+    .status-chip.loss {
+      background: rgba(180,35,24,0.12);
+      color: var(--danger);
     }
     .item dl {
       margin: 0;
@@ -289,6 +324,16 @@ function htmlPage() {
 
     function relSlug(item) {
       return item.slug || item.question || item.conditionId || 'Unknown market';
+    }
+
+    function dryRunMarketPnl(item) {
+      const spent = item.copies.reduce((sum, copy) => sum + Number(copy.spent || 0), 0);
+      const redeemed = Number(item.redeemed || 0);
+      return {
+        spent,
+        redeemed,
+        pnl: redeemed - spent,
+      };
     }
 
     function escapeHtml(value) {
@@ -413,15 +458,37 @@ function htmlPage() {
 
       const dryRun = panel('dryrun', 'Dry-run Markets', (state.dryRun.markets || []).length + ' tracked markets',
         renderList(state.dryRun.markets || [], (item) => {
-          const spent = item.copies.reduce((sum, copy) => sum + Number(copy.spent || 0), 0);
+          const market = dryRunMarketPnl(item);
+          const statusClass = !item.settled
+            ? ''
+            : market.pnl > 0
+              ? 'settled-profit'
+              : market.pnl < 0
+                ? 'settled-loss'
+                : '';
+          const chipClass = !item.settled
+            ? ''
+            : market.pnl > 0
+              ? 'profit'
+              : market.pnl < 0
+                ? 'loss'
+                : '';
+          const chipLabel = !item.settled
+            ? 'Open'
+            : market.pnl > 0
+              ? 'Profit'
+              : market.pnl < 0
+                ? 'Loss'
+                : 'Flat';
           return \`
-            <article class="item">
-              <header><span>\${item.slug}</span><span>\${item.settled ? 'Settled' : 'Open'}</span></header>
+            <article class="item \${statusClass}">
+              <header><span>\${item.slug}</span><span class="status-chip \${chipClass}">\${chipLabel}</span></header>
               <dl>
                 <div><dt>Question</dt><dd>\${item.question || '—'}</dd></div>
                 <div><dt>Copies</dt><dd>\${item.copies.length}</dd></div>
-                <div><dt>Spent</dt><dd>\${money(spent)}</dd></div>
-                <div><dt>Redeemed</dt><dd>\${money(item.redeemed)}</dd></div>
+                <div><dt>Spent</dt><dd>\${money(market.spent)}</dd></div>
+                <div><dt>Redeemed</dt><dd>\${money(market.redeemed)}</dd></div>
+                <div><dt>PnL</dt><dd>\${money(market.pnl)}</dd></div>
                 <div><dt>Settled At</dt><dd>\${ts(item.settledAt)}</dd></div>
               </dl>
             </article>
