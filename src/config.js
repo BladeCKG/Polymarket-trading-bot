@@ -46,6 +46,7 @@ export const API_PASSPHRASE = optional('POLY_API_PASSPHRASE', '');
 
 // ── RPC ──────────────────────────────────────────────────────────────────────
 export const POLYGON_RPC    = optional('POLYGON_RPC', 'https://polygon-rpc.com');
+export const POLYGON_WS_RPC = optional('POLYGON_WS_RPC', '');
 export const CHAIN_ID       = 137;
 
 // ── Polymarket endpoints ─────────────────────────────────────────────────────
@@ -60,6 +61,10 @@ export const CTF_ADDRESS                 = '0x4D97DCd97eC945f40cF65F87097ACe5EA0
 export const NEG_RISK_ADAPTER_ADDRESS    = '0xD91e80cf2C1f8038c75b4f93Fd9c28C4aa01B6F8';
 export const NEG_RISK_CTF_EXCHANGE       = '0xC5d563A36AE78145C45a50134d48A1215220f80a';
 export const CTF_EXCHANGE_ADDRESS        = '0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E';
+// Polymarket's current production CTF Exchange V2 deployments, published in
+// the official ctf-exchange-v2 repository deployment table.
+export const NEG_RISK_CTF_EXCHANGE_V2    = '0xe2222d279d744050d28e00520010520000310F59';
+export const CTF_EXCHANGE_ADDRESS_V2     = '0xE111180000d2663C0091e4f400237545B87B996B';
 
 // ── Risk parameters ──────────────────────────────────────────────────────────
 export const MAX_SPEND_PER_MARKET        = parseFloat_('MAX_SPEND_PER_MARKET', 400);

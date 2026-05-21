@@ -62,6 +62,7 @@ export const COPY_STALE_MS = num('COPY_STALE_MS', 8_000);
 // How often to poll data-api for each target wallet's trades.
 // 250 ms is ~4 req/s per target; fast enough to catch trades within a block.
 export const COPY_POLL_MS = num('COPY_POLL_MS', 250);
+export const COPY_FEED_MODE = opt('COPY_FEED_MODE', 'REST').toUpperCase();
 
 // Size of the trade-id dedup cache. Keeps ~5k entries — plenty for hours of trades.
 export const COPY_DEDUP_CACHE = num('COPY_DEDUP_CACHE', 5_000);

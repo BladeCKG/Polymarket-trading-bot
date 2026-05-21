@@ -114,6 +114,7 @@ function normalizeMarketRecord(m, fallbackSlug = null) {
     conditionId: m.condition_id ?? m.conditionId,
     slug,
     windowTs: Number.isFinite(ts) ? ts : null,
+    tokens: normTokens,
     upToken,
     downToken,
     active: m.active ?? !m.closed,
@@ -162,6 +163,28 @@ export async function fetchMarket(slug) {
   }
 
   return normalizeMarketRecord(markets[0], slug);
+}
+
+/**
+ * Fetch market metadata for a given CLOB token id.
+ * Useful for event-driven ingestion paths that see raw on-chain token ids
+ * before they know the human-readable market slug or outcome label.
+ */
+export async function fetchMarketByTokenId(tokenId) {
+  const target = String(tokenId ?? '');
+  if (!target) throw new Error('fetchMarketByTokenId: tokenId is required');
+
+  const res = await axios.get(`${GAMMA_API_URL}/markets`, {
+    timeout: 10_000,
+    params: { clob_token_ids: target },
+  });
+  const markets = Array.isArray(res.data) ? res.data : [];
+
+  if (!markets.length) {
+    throw new Error(`Market not found for tokenId: ${tokenId}`);
+  }
+
+  return normalizeMarketRecord(markets[0], markets[0]?.slug ?? null);
 }
 
 /**

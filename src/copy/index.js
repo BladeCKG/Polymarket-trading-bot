@@ -7,7 +7,7 @@
  * Startup sequence:
  *   1. Load wallet & CLOB credentials (shared with the arb bot).
  *   2. Ensure on-chain USDC approvals (one-time per wallet).
- *   3. Start ActivityFeed (polls data-api for target wallet trades).
+ *   3. Start the configured trade feed (REST poller or direct chain logs).
  *   4. Wire every 'trade' event into CopyTrader.onTrade (non-blocking).
  *   5. Print stats every 60s; graceful SIGINT/SIGTERM shutdown.
  */
@@ -21,12 +21,13 @@ import {
 import logger from '../logger.js';
 import { ClobClient } from '../clob.js';
 import { getSigner, ensureApprovals } from '../onchain.js';
-import { ActivityFeed } from './activityFeed.js';
 import { CopyTrader } from './copyTrader.js';
 import { DryRunPnlTracker } from './dryRunPnl.js';
 import { CopyDashboardServer } from './dashboard.js';
+import { createCopyFeed } from './feedFactory.js';
 import {
   COPY_TARGETS,
+  COPY_FEED_MODE,
   COPY_POLL_MS,
   COPY_DRY_RUN,
   COPY_SIZE_MODE,
@@ -53,6 +54,7 @@ export async function main() {
     wallet: wallet.address,
     dryRun: COPY_DRY_RUN,
     targets: COPY_TARGETS,
+    feedMode: COPY_FEED_MODE,
     pollMs: COPY_POLL_MS,
     sizing: COPY_SIZE_MODE,
     fixedUsdc: COPY_FIXED_USDC,
@@ -82,6 +84,7 @@ export async function main() {
       },
       config: {
         targets: COPY_TARGETS,
+        feedMode: COPY_FEED_MODE,
         pollMs: COPY_POLL_MS,
         sizing: COPY_SIZE_MODE,
         fixedUsdc: COPY_FIXED_USDC,
@@ -122,7 +125,11 @@ export async function main() {
 
   // ── Wire up feed → trader ────────────────────────────────────────────────
   const trader = new CopyTrader(wallet);
-  const feed = new ActivityFeed(COPY_TARGETS, COPY_POLL_MS);
+  const feed = createCopyFeed({
+    mode: COPY_FEED_MODE,
+    targets: COPY_TARGETS,
+    pollMs: COPY_POLL_MS,
+  });
   const dryRunPnl = COPY_DRY_RUN ? new DryRunPnlTracker() : null;
 
   if (dryRunPnl) {
@@ -188,6 +195,7 @@ export async function main() {
 
   feed.on('trade', (ev) => {
     dashboard?.recordTrade({
+      source: ev.source ?? COPY_FEED_MODE.toLowerCase(),
       target: ev.target,
       slug: ev.slug,
       conditionId: ev.conditionId,
@@ -205,7 +213,7 @@ export async function main() {
     });
   });
 
-  feed.start();
+  await feed.start();
 
   // ── Periodic stats ──────────────────────────────────────────────────────
   const statsTimer = setInterval(() => {
