@@ -285,6 +285,66 @@ export async function fetchWalletPositions(proxyWallet, {
 }
 
 /**
+ * Fetch recent trade history for a Polymarket proxy wallet from the Data API.
+ *
+ * Useful when settled positions no longer appear in `/positions`, but we still
+ * need to reconstruct market-level PnL from actual executed fills.
+ */
+export async function fetchWalletTrades(proxyWallet, {
+  limit = 200,
+  maxPages = 5,
+  takerOnly = false,
+} = {}) {
+  const wallet = normaliseWalletAddress(proxyWallet);
+  if (!wallet) throw new Error('fetchWalletTrades: proxyWallet is required');
+
+  const rows = [];
+  let offset = 0;
+
+  for (let page = 0; page < maxPages; page++) {
+    const res = await axios.get(`${DATA_API_URL}/trades`, {
+      timeout: 10_000,
+      params: {
+        user: wallet,
+        limit,
+        offset,
+        takerOnly,
+      },
+    });
+
+    const batch = Array.isArray(res.data) ? res.data : [];
+    if (!batch.length) break;
+
+    rows.push(...batch.map((trade) => {
+      const tsRaw = Number(trade.timestamp ?? trade.match_time ?? trade.created_at ?? 0);
+      const timestamp = tsRaw > 1e12 ? Math.floor(tsRaw / 1000) : tsRaw;
+      const price = Number(trade.price ?? 0);
+      const size = Number(trade.size ?? 0);
+      const usdc = Number(trade.usdcSize ?? trade.usdc_size ?? (price * size));
+      return {
+        proxyWallet: wallet,
+        asset: String(trade.asset ?? trade.asset_id ?? trade.tokenId ?? ''),
+        conditionId: String(trade.conditionId ?? trade.condition_id ?? '').toLowerCase(),
+        side: String(trade.side ?? '').toUpperCase(),
+        price,
+        size,
+        usdc,
+        timestamp,
+        txHash: String(trade.transactionHash ?? trade.transaction_hash ?? '').toLowerCase(),
+        slug: trade.slug ?? trade.eventSlug ?? '',
+        outcome: trade.outcome ?? '',
+        title: trade.question ?? trade.title ?? '',
+      };
+    }));
+
+    if (batch.length < limit) break;
+    offset += batch.length;
+  }
+
+  return rows;
+}
+
+/**
  * Convenience wrapper for the configured copy-trade target wallet.
  */
 export async function fetchTargetWalletPositions(options = {}) {

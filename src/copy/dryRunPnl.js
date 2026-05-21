@@ -1,6 +1,6 @@
 import { EventEmitter } from 'events';
 import logger from '../logger.js';
-import { waitForResolution } from '../market.js';
+import { fetchWalletPositions, fetchWalletTrades, waitForResolution } from '../market.js';
 import { PnlTracker } from '../pnl.js';
 
 function normalizeOutcomeKey(value) {
@@ -25,6 +25,7 @@ export class DryRunPnlTracker extends EventEmitter {
     });
 
     market.copies.push({
+      target: ev.target ?? null,
       outcome,
       shares,
       spent,
@@ -99,6 +100,8 @@ export class DryRunPnlTracker extends EventEmitter {
         slug,
         conditionId: market.conditionId,
         question: market.question,
+        actualTraderPnl: market.actualTraderPnl ?? null,
+        actualTraderPnlSource: market.actualTraderPnlSource ?? null,
         redeemed: market.redeemed,
         settled: market.settled,
         settledAt: market.settledAt,
@@ -110,9 +113,12 @@ export class DryRunPnlTracker extends EventEmitter {
   _getMarket(slug, meta = {}) {
     if (!this._markets.has(slug)) {
       this._markets.set(slug, {
+        slug,
         conditionId: meta.conditionId ?? '',
         question: meta.question ?? '',
         copies: [],
+        actualTraderPnl: null,
+        actualTraderPnlSource: null,
         redeemed: 0,
         settled: false,
         settledAt: null,
@@ -130,7 +136,7 @@ export class DryRunPnlTracker extends EventEmitter {
           slug,
           conditionId: marketMeta?.conditionId ?? this._markets.get(slug)?.conditionId ?? '',
         }, 12 * 60 * 60 * 1000, 10_000);
-        this._settleMarket(slug, market);
+        await this._settleMarket(slug, market);
       } catch (err) {
         logger.warn('copy.dryRun: failed to settle simulated market', {
           slug,
@@ -144,7 +150,7 @@ export class DryRunPnlTracker extends EventEmitter {
     this._settlementTasks.set(slug, task);
   }
 
-  _settleMarket(slug, resolvedMarket) {
+  async _settleMarket(slug, resolvedMarket) {
     const market = this._markets.get(slug);
     if (!market || market.settled) return;
 
@@ -163,6 +169,11 @@ export class DryRunPnlTracker extends EventEmitter {
     market.settled = true;
     market.redeemed = redeemed;
     market.settledAt = Date.now();
+    market.outcomes = outcomes;
+    market.resolvedPayouts = payouts;
+    const actualTraderPnl = await this._fetchActualTraderPnl(market);
+    market.actualTraderPnl = actualTraderPnl?.pnl ?? null;
+    market.actualTraderPnlSource = actualTraderPnl?.source ?? null;
     this.pnl.recordRedeem(slug, redeemed, 'dry-run');
 
     logger.info('copy.dryRun: simulated market settled', {
@@ -171,6 +182,8 @@ export class DryRunPnlTracker extends EventEmitter {
       copies: market.copies.length,
       redeemed: redeemed.toFixed(2),
       pnl: this.pnl.marketPnl(slug).toFixed(2),
+      actualTraderPnl: market.actualTraderPnl,
+      actualTraderPnlSource: market.actualTraderPnlSource,
       payouts,
       outcomes,
     });
@@ -179,10 +192,133 @@ export class DryRunPnlTracker extends EventEmitter {
       question: market.question || resolvedMarket.question || null,
       redeemed,
       pnl: this.pnl.marketPnl(slug),
+      actualTraderPnl: market.actualTraderPnl,
+      actualTraderPnlSource: market.actualTraderPnlSource,
       payouts,
       outcomes,
       settledAt: market.settledAt,
       copies: market.copies.map((copy) => ({ ...copy })),
     });
+  }
+
+  async _fetchActualTraderPnl(market) {
+    const targets = [...new Set(market.copies.map((copy) => copy.target).filter(Boolean))];
+    if (!targets.length) return null;
+
+    const historyPnl = await this._fetchActualTraderPnlFromTradeHistory(market, targets);
+    if (historyPnl) return historyPnl;
+
+    let realizedTotal = 0;
+    let cashTotal = 0;
+    let foundAny = false;
+
+    for (const target of targets) {
+      try {
+        const positions = await fetchWalletPositions(target, {
+          sizeThreshold: 0,
+          limit: 500,
+        });
+        const matches = positions.filter((position) =>
+          (market.conditionId && position.conditionId?.toLowerCase() === market.conditionId.toLowerCase()) ||
+          (market.slug && position.slug === market.slug)
+        );
+        if (!matches.length) continue;
+
+        foundAny = true;
+        realizedTotal += matches.reduce((sum, position) => sum + Number(position.realizedPnl ?? 0), 0);
+        cashTotal += matches.reduce((sum, position) => sum + Number(position.cashPnl ?? 0), 0);
+      } catch (err) {
+        logger.debug('copy.dryRun: unable to fetch target trader pnl', {
+          target,
+          conditionId: market.conditionId,
+          err: err.message,
+        });
+      }
+    }
+
+    if (!foundAny) return null;
+    if (Math.abs(realizedTotal) > 1e-9) {
+      return { pnl: realizedTotal, source: 'realizedPnl' };
+    }
+    return { pnl: cashTotal, source: 'cashPnl' };
+  }
+
+  async _fetchActualTraderPnlFromTradeHistory(market, targets) {
+    let pnlTotal = 0;
+    let foundAny = false;
+
+    for (const target of targets) {
+      try {
+        const trades = await fetchWalletTrades(target, {
+          limit: 200,
+          maxPages: 8,
+          takerOnly: false,
+        });
+        const matches = trades.filter((trade) =>
+          (market.conditionId && trade.conditionId === market.conditionId.toLowerCase()) ||
+          (market.slug && trade.slug === market.slug)
+        );
+        if (!matches.length) continue;
+
+        const pnl = this._marketPnlFromTradeHistory(market, matches);
+        if (pnl == null) continue;
+
+        foundAny = true;
+        pnlTotal += pnl;
+      } catch (err) {
+        logger.debug('copy.dryRun: unable to rebuild target trader pnl from trade history', {
+          target,
+          slug: market.slug,
+          conditionId: market.conditionId,
+          err: err.message,
+        });
+      }
+    }
+
+    if (!foundAny) return null;
+    return { pnl: pnlTotal, source: 'tradeHistory' };
+  }
+
+  _marketPnlFromTradeHistory(market, trades) {
+    const payoutByOutcome = this._resolvedPayoutMap(market);
+    if (!payoutByOutcome.size) return null;
+
+    let spent = 0;
+    let proceeds = 0;
+    const netSharesByOutcome = new Map();
+
+    for (const trade of trades) {
+      if (!Number.isFinite(trade.price) || !Number.isFinite(trade.size) || trade.size <= 0) continue;
+
+      const outcomeKey = normalizeOutcomeKey(trade.outcome);
+      const currentShares = netSharesByOutcome.get(outcomeKey) ?? 0;
+      const notional = Number.isFinite(trade.usdc) && trade.usdc > 0
+        ? trade.usdc
+        : trade.price * trade.size;
+
+      if (trade.side === 'BUY') {
+        spent += notional;
+        netSharesByOutcome.set(outcomeKey, currentShares + trade.size);
+      } else if (trade.side === 'SELL') {
+        proceeds += notional;
+        netSharesByOutcome.set(outcomeKey, currentShares - trade.size);
+      }
+    }
+
+    let redemption = 0;
+    for (const [outcomeKey, shares] of netSharesByOutcome) {
+      if (shares <= 0) continue;
+      redemption += shares * (payoutByOutcome.get(outcomeKey) ?? 0);
+    }
+
+    return proceeds + redemption - spent;
+  }
+
+  _resolvedPayoutMap(market) {
+    const payouts = market.resolvedPayouts ?? [];
+    const outcomes = market.outcomes ?? [];
+    return new Map(
+      outcomes.map((outcome, index) => [normalizeOutcomeKey(outcome), Number(payouts[index] ?? 0)]),
+    );
   }
 }

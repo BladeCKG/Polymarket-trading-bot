@@ -489,6 +489,8 @@ function htmlPage() {
                 <div><dt>Spent</dt><dd>\${money(market.spent)}</dd></div>
                 <div><dt>Redeemed</dt><dd>\${money(market.redeemed)}</dd></div>
                 <div><dt>PnL</dt><dd>\${money(market.pnl)}</dd></div>
+                <div><dt>Trader PnL</dt><dd>\${item.actualTraderPnl == null ? '—' : money(item.actualTraderPnl)}</dd></div>
+                <div><dt>PnL Source</dt><dd>\${item.actualTraderPnlSource || '—'}</dd></div>
                 <div><dt>Settled At</dt><dd>\${ts(item.settledAt)}</dd></div>
               </dl>
             </article>
