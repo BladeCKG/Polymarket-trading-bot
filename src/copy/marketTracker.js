@@ -2,6 +2,7 @@ import { EventEmitter } from 'events';
 import logger from '../logger.js';
 import { fetchWalletPositions, fetchWalletTrades, waitForResolution } from '../market.js';
 import { PnlTracker } from '../pnl.js';
+import { PROXY_WALLET } from '../config.js';
 
 function normalizeOutcomeKey(value) {
   return typeof value === 'string' ? value.trim().toLowerCase() : '';
@@ -60,6 +61,41 @@ export class CopyMarketTracker extends EventEmitter {
     });
   }
 
+  recordExecutedCopy({ ev, shares, maxPrice, assumedSpent }) {
+    const slug = ev?.slug ?? ev?.conditionId ?? ev?.tokenId;
+    if (!slug) return;
+
+    const market = this._getMarket(slug, {
+      conditionId: ev.conditionId,
+      question: ev.question,
+    });
+    const dedupeKey = [
+      ev.txHash ?? '',
+      ev.tokenId ?? '',
+      ev.outcome ?? '',
+      Number(maxPrice ?? 0).toFixed(12),
+      Number(shares ?? 0).toFixed(12),
+      Number(assumedSpent ?? 0).toFixed(12),
+    ].join(':');
+
+    if (market.ownTradeKeys.has(dedupeKey)) return;
+    market.ownTradeKeys.add(dedupeKey);
+    market.ownTrades.push({
+      target: PROXY_WALLET?.toLowerCase?.() ?? '',
+      tokenId: ev.tokenId ?? null,
+      conditionId: ev.conditionId?.toLowerCase?.() ?? '',
+      side: 'BUY',
+      outcome: ev.outcome ?? null,
+      price: Number(maxPrice ?? 0),
+      size: Number(shares ?? 0),
+      usdc: Number(assumedSpent ?? 0),
+      timestamp: Date.now(),
+      txHash: ev.txHash?.toLowerCase?.() ?? '',
+      slug: ev.slug ?? null,
+    });
+    this._ensureSettlementWatch(slug, market);
+  }
+
   recordObservedTargetTrade(ev) {
     const slug = ev?.slug ?? ev?.conditionId ?? ev?.tokenId;
     if (!slug) return;
@@ -107,6 +143,10 @@ export class CopyMarketTracker extends EventEmitter {
     let targetSettledSpent = 0;
     let targetSettledRedeemed = 0;
     let targetSettledPnl = 0;
+    let ownSettledMarkets = 0;
+    let ownSettledSpent = 0;
+    let ownSettledRedeemed = 0;
+    let ownSettledPnl = 0;
 
     for (const [slug, market] of this._markets) {
       const marketSpent = market.copies.reduce((sum, copy) => sum + copy.spent, 0);
@@ -123,6 +163,16 @@ export class CopyMarketTracker extends EventEmitter {
         }
         if (Number.isFinite(market.actualTraderRedeemed)) {
           targetSettledRedeemed += market.actualTraderRedeemed;
+        }
+        if (Number.isFinite(market.ownTraderPnl)) {
+          ownSettledMarkets++;
+          ownSettledPnl += market.ownTraderPnl;
+        }
+        if (Number.isFinite(market.ownTraderSpent)) {
+          ownSettledSpent += market.ownTraderSpent;
+        }
+        if (Number.isFinite(market.ownTraderRedeemed)) {
+          ownSettledRedeemed += market.ownTraderRedeemed;
         }
       } else {
         openMarkets++;
@@ -141,6 +191,10 @@ export class CopyMarketTracker extends EventEmitter {
       targetSettledSpent: targetSettledSpent.toFixed(2),
       targetSettledRedeemed: targetSettledRedeemed.toFixed(2),
       targetSettledPnl: targetSettledPnl.toFixed(2),
+      ownSettledMarkets,
+      ownSettledSpent: ownSettledSpent.toFixed(2),
+      ownSettledRedeemed: ownSettledRedeemed.toFixed(2),
+      ownSettledPnl: ownSettledPnl.toFixed(2),
     };
   }
 
@@ -161,6 +215,11 @@ export class CopyMarketTracker extends EventEmitter {
         actualTraderTradeCount: market.actualTraderTradeCount ?? 0,
         actualTraderSpent: market.actualTraderSpent ?? null,
         actualTraderRedeemed: market.actualTraderRedeemed ?? null,
+        ownTraderPnl: market.ownTraderPnl ?? null,
+        ownTraderPnlSource: market.ownTraderPnlSource ?? null,
+        ownTraderTradeCount: market.ownTraderTradeCount ?? 0,
+        ownTraderSpent: market.ownTraderSpent ?? null,
+        ownTraderRedeemed: market.ownTraderRedeemed ?? null,
         redeemed: market.redeemed,
         settled: market.settled,
         settledAt: market.settledAt,
@@ -181,11 +240,18 @@ export class CopyMarketTracker extends EventEmitter {
         actualTraderTradeCount: 0,
         actualTraderSpent: null,
         actualTraderRedeemed: null,
+        ownTraderPnl: null,
+        ownTraderPnlSource: null,
+        ownTraderTradeCount: 0,
+        ownTraderSpent: null,
+        ownTraderRedeemed: null,
         redeemed: 0,
         settled: false,
         settledAt: null,
         targetTrades: [],
         targetTradeKeys: new Set(),
+        ownTrades: [],
+        ownTradeKeys: new Set(),
       });
     }
     const market = this._markets.get(slug);
@@ -244,6 +310,12 @@ export class CopyMarketTracker extends EventEmitter {
     market.actualTraderTradeCount = actualTraderPnl?.tradeCount ?? 0;
     market.actualTraderSpent = actualTraderPnl?.spent ?? null;
     market.actualTraderRedeemed = actualTraderPnl?.redeemed ?? null;
+    const ownTraderPnl = await this._fetchOwnTraderPnl(market);
+    market.ownTraderPnl = ownTraderPnl?.pnl ?? null;
+    market.ownTraderPnlSource = ownTraderPnl?.source ?? null;
+    market.ownTraderTradeCount = ownTraderPnl?.tradeCount ?? 0;
+    market.ownTraderSpent = ownTraderPnl?.spent ?? null;
+    market.ownTraderRedeemed = ownTraderPnl?.redeemed ?? null;
     this.pnl.recordRedeem(slug, redeemed, 'dry-run');
 
     logger.info('copy.dryRun: simulated market settled', {
@@ -254,6 +326,8 @@ export class CopyMarketTracker extends EventEmitter {
       pnl: this.pnl.marketPnl(slug).toFixed(2),
       actualTraderPnl: market.actualTraderPnl,
       actualTraderPnlSource: market.actualTraderPnlSource,
+      ownTraderPnl: market.ownTraderPnl,
+      ownTraderPnlSource: market.ownTraderPnlSource,
       payouts,
       outcomes,
     });
@@ -264,6 +338,8 @@ export class CopyMarketTracker extends EventEmitter {
       pnl: this.pnl.marketPnl(slug),
       actualTraderPnl: market.actualTraderPnl,
       actualTraderPnlSource: market.actualTraderPnlSource,
+      ownTraderPnl: market.ownTraderPnl,
+      ownTraderPnlSource: market.ownTraderPnlSource,
       payouts,
       outcomes,
       settledAt: market.settledAt,
@@ -327,6 +403,46 @@ export class CopyMarketTracker extends EventEmitter {
     return { pnl: cashTotal, source: 'cashPnl', tradeCount: 0, spent: null, redeemed: null };
   }
 
+  async _fetchOwnTraderPnl(market) {
+    const wallet = PROXY_WALLET?.toLowerCase?.();
+    if (!wallet) return null;
+
+    if (this._traderPnlSource === 'OBSERVED') {
+      return this._fetchOwnTraderPnlFromObservedTrades(market);
+    }
+
+    if (this._traderPnlSource === 'AUTO') {
+      const observedPnl = this._fetchOwnTraderPnlFromObservedTrades(market);
+      if (observedPnl) return observedPnl;
+    }
+
+    const trades = await fetchWalletTrades(wallet, {
+      limit: 10_000,
+      maxPages: 2,
+      takerOnly: false,
+      markets: market.conditionId ? [market.conditionId] : [],
+    });
+    const matches = trades.filter((trade) =>
+      (market.conditionId && trade.conditionId === market.conditionId.toLowerCase()) ||
+      (market.slug && trade.slug === market.slug)
+    );
+    if (matches.length) {
+      const summary = this._marketTradeSummary(market, matches);
+      if (summary) {
+        return {
+          pnl: summary.pnl,
+          source: 'tradeHistory',
+          tradeCount: matches.length,
+          spent: summary.spent,
+          redeemed: summary.redemption,
+        };
+      }
+    }
+
+    if (this._traderPnlSource === 'API') return null;
+    return this._fetchOwnTraderPnlFromObservedTrades(market);
+  }
+
   _fetchActualTraderPnlFromObservedTrades(market, targets) {
     const targetSet = new Set(targets.map((target) => target.toLowerCase()));
     const matches = market.targetTrades.filter((trade) => targetSet.has((trade.target ?? '').toLowerCase()));
@@ -338,6 +454,19 @@ export class CopyMarketTracker extends EventEmitter {
       pnl: summary.pnl,
       source: 'observedTargetTrades',
       tradeCount: matches.length,
+      spent: summary.spent,
+      redeemed: summary.redemption,
+    };
+  }
+
+  _fetchOwnTraderPnlFromObservedTrades(market) {
+    if (!market.ownTrades.length) return null;
+    const summary = this._marketTradeSummary(market, market.ownTrades);
+    if (!summary) return null;
+    return {
+      pnl: summary.pnl,
+      source: 'observedOwnTrades',
+      tradeCount: market.ownTrades.length,
       spent: summary.spent,
       redeemed: summary.redemption,
     };

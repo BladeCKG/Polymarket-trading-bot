@@ -366,6 +366,7 @@ function htmlPage() {
           ['Live Spend', money(state.stats.totalSpent ?? 0)],
           ['Dry-run Open Cost', money(state.stats.dryRunOpenCost ?? 0)],
           ['Dry-run Settled PnL', money(state.stats.dryRunSettledPnl ?? 0)],
+          ['My Settled PnL', money(state.stats.ownSettledPnl ?? 0)],
           ['Target Settled PnL', money(state.stats.targetSettledPnl ?? 0)],
         ]
         : [
@@ -375,6 +376,7 @@ function htmlPage() {
           ['Live Spend', money(state.stats.totalSpent ?? 0)],
           ['Tracked Markets Open', state.dryRun?.markets?.filter((item) => !item.settled).length ?? 0],
           ['Tracked Markets Settled', state.dryRun?.markets?.filter((item) => item.settled).length ?? 0],
+          ['My Settled PnL', money(state.stats.ownSettledPnl ?? 0)],
           ['Target Settled PnL', money(state.stats.targetSettledPnl ?? 0)],
         ];
       topStatsEl.innerHTML = cards.map(([label, value]) => \`
@@ -519,6 +521,11 @@ function htmlPage() {
                 <div><dt>Trader Spend</dt><dd>\${item.actualTraderSpent == null ? 'â€”' : money(item.actualTraderSpent)}</dd></div>
                 <div><dt>Trader Redeemed</dt><dd>\${item.actualTraderRedeemed == null ? 'â€”' : money(item.actualTraderRedeemed)}</dd></div>
                 <div><dt>Trader Trades</dt><dd>\${item.actualTraderTradeCount ?? 0}</dd></div>
+                <div><dt>My PnL</dt><dd>\${item.ownTraderPnl == null ? 'â€”' : money(item.ownTraderPnl)}</dd></div>
+                <div><dt>My Source</dt><dd>\${item.ownTraderPnlSource || 'â€”'}</dd></div>
+                <div><dt>My Spend</dt><dd>\${item.ownTraderSpent == null ? 'â€”' : money(item.ownTraderSpent)}</dd></div>
+                <div><dt>My Redeemed</dt><dd>\${item.ownTraderRedeemed == null ? 'â€”' : money(item.ownTraderRedeemed)}</dd></div>
+                <div><dt>My Trades</dt><dd>\${item.ownTraderTradeCount ?? 0}</dd></div>
                 <div><dt>Settled At</dt><dd>\${ts(item.settledAt)}</dd></div>
               </dl>
             </article>

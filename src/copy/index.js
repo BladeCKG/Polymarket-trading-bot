@@ -161,6 +161,10 @@ export async function main() {
   dashboard?.setDryRunSnapshot(marketTracker.snapshot());
 
   trader.on('copy', (payload) => {
+    if (!payload.dryRun) {
+      marketTracker.recordExecutedCopy(payload);
+      dashboard?.setDryRunSnapshot(marketTracker.snapshot());
+    }
     dashboard?.recordCopy({
       slug: payload.ev?.slug ?? null,
       conditionId: payload.ev?.conditionId ?? null,
