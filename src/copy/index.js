@@ -30,6 +30,7 @@ import {
   COPY_FEED_MODE,
   COPY_POLL_MS,
   COPY_DRY_RUN,
+  COPY_SETTLED_TRADER_PNL_SOURCE,
   COPY_SIZE_MODE,
   COPY_FIXED_USDC,
   COPY_RATIO,
@@ -85,6 +86,7 @@ export async function main() {
       config: {
         targets: COPY_TARGETS,
         feedMode: COPY_FEED_MODE,
+        settledTraderPnlSource: COPY_SETTLED_TRADER_PNL_SOURCE,
         pollMs: COPY_POLL_MS,
         sizing: COPY_SIZE_MODE,
         fixedUsdc: COPY_FIXED_USDC,
@@ -130,7 +132,9 @@ export async function main() {
     targets: COPY_TARGETS,
     pollMs: COPY_POLL_MS,
   });
-  const dryRunPnl = COPY_DRY_RUN ? new DryRunPnlTracker() : null;
+  const dryRunPnl = COPY_DRY_RUN
+    ? new DryRunPnlTracker({ traderPnlSource: COPY_SETTLED_TRADER_PNL_SOURCE })
+    : null;
 
   if (dryRunPnl) {
     trader.on('copy', (payload) => {
@@ -194,6 +198,7 @@ export async function main() {
   });
 
   feed.on('trade', (ev) => {
+    dryRunPnl?.recordObservedTargetTrade(ev);
     dashboard?.recordTrade({
       source: ev.source ?? COPY_FEED_MODE.toLowerCase(),
       target: ev.target,

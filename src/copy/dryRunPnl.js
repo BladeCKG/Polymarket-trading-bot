@@ -8,11 +8,12 @@ function normalizeOutcomeKey(value) {
 }
 
 export class DryRunPnlTracker extends EventEmitter {
-  constructor() {
+  constructor({ traderPnlSource = 'API' } = {}) {
     super();
     this.pnl = new PnlTracker();
     this._markets = new Map();
     this._settlementTasks = new Map();
+    this._traderPnlSource = String(traderPnlSource ?? 'API').toUpperCase();
   }
 
   recordSimulatedCopy({ ev, shares, maxPrice, ourUsdc }) {
@@ -59,6 +60,42 @@ export class DryRunPnlTracker extends EventEmitter {
     });
   }
 
+  recordObservedTargetTrade(ev) {
+    const slug = ev?.slug ?? ev?.conditionId ?? ev?.tokenId;
+    if (!slug) return;
+
+    const market = this._getMarket(slug, {
+      conditionId: ev.conditionId,
+      question: ev.question,
+    });
+    const dedupeKey = [
+      ev.txHash ?? '',
+      ev.tokenId ?? '',
+      ev.outcome ?? '',
+      ev.side ?? '',
+      Number(ev.price ?? 0).toFixed(12),
+      Number(ev.size ?? 0).toFixed(12),
+      Number(ev.usdc ?? 0).toFixed(12),
+      ev.target ?? '',
+    ].join(':');
+
+    if (market.targetTradeKeys.has(dedupeKey)) return;
+    market.targetTradeKeys.add(dedupeKey);
+    market.targetTrades.push({
+      target: ev.target ?? null,
+      tokenId: ev.tokenId ?? null,
+      conditionId: ev.conditionId?.toLowerCase?.() ?? '',
+      side: String(ev.side ?? 'BUY').toUpperCase(),
+      outcome: ev.outcome ?? null,
+      price: Number(ev.price ?? 0),
+      size: Number(ev.size ?? 0),
+      usdc: Number(ev.usdc ?? 0),
+      timestamp: Number(ev.timestamp ?? 0),
+      txHash: ev.txHash?.toLowerCase?.() ?? '',
+      slug: ev.slug ?? null,
+    });
+  }
+
   stats() {
     let openMarkets = 0;
     let settledMarkets = 0;
@@ -102,6 +139,7 @@ export class DryRunPnlTracker extends EventEmitter {
         question: market.question,
         actualTraderPnl: market.actualTraderPnl ?? null,
         actualTraderPnlSource: market.actualTraderPnlSource ?? null,
+        actualTraderTradeCount: market.actualTraderTradeCount ?? 0,
         redeemed: market.redeemed,
         settled: market.settled,
         settledAt: market.settledAt,
@@ -119,9 +157,12 @@ export class DryRunPnlTracker extends EventEmitter {
         copies: [],
         actualTraderPnl: null,
         actualTraderPnlSource: null,
+        actualTraderTradeCount: 0,
         redeemed: 0,
         settled: false,
         settledAt: null,
+        targetTrades: [],
+        targetTradeKeys: new Set(),
       });
     }
     return this._markets.get(slug);
@@ -174,6 +215,7 @@ export class DryRunPnlTracker extends EventEmitter {
     const actualTraderPnl = await this._fetchActualTraderPnl(market);
     market.actualTraderPnl = actualTraderPnl?.pnl ?? null;
     market.actualTraderPnlSource = actualTraderPnl?.source ?? null;
+    market.actualTraderTradeCount = actualTraderPnl?.tradeCount ?? 0;
     this.pnl.recordRedeem(slug, redeemed, 'dry-run');
 
     logger.info('copy.dryRun: simulated market settled', {
@@ -205,8 +247,19 @@ export class DryRunPnlTracker extends EventEmitter {
     const targets = [...new Set(market.copies.map((copy) => copy.target).filter(Boolean))];
     if (!targets.length) return null;
 
+    if (this._traderPnlSource === 'OBSERVED') {
+      return this._fetchActualTraderPnlFromObservedTrades(market, targets);
+    }
+
+    if (this._traderPnlSource === 'AUTO') {
+      const observedPnl = this._fetchActualTraderPnlFromObservedTrades(market, targets);
+      if (observedPnl) return observedPnl;
+    }
+
     const historyPnl = await this._fetchActualTraderPnlFromTradeHistory(market, targets);
     if (historyPnl) return historyPnl;
+
+    if (this._traderPnlSource === 'API') return null;
 
     let realizedTotal = 0;
     let cashTotal = 0;
@@ -238,21 +291,37 @@ export class DryRunPnlTracker extends EventEmitter {
 
     if (!foundAny) return null;
     if (Math.abs(realizedTotal) > 1e-9) {
-      return { pnl: realizedTotal, source: 'realizedPnl' };
+      return { pnl: realizedTotal, source: 'realizedPnl', tradeCount: 0 };
     }
-    return { pnl: cashTotal, source: 'cashPnl' };
+    return { pnl: cashTotal, source: 'cashPnl', tradeCount: 0 };
+  }
+
+  _fetchActualTraderPnlFromObservedTrades(market, targets) {
+    const targetSet = new Set(targets.map((target) => target.toLowerCase()));
+    const matches = market.targetTrades.filter((trade) => targetSet.has((trade.target ?? '').toLowerCase()));
+    if (!matches.length) return null;
+
+    const pnl = this._marketPnlFromTradeHistory(market, matches);
+    if (pnl == null) return null;
+    return {
+      pnl,
+      source: 'observedTargetTrades',
+      tradeCount: matches.length,
+    };
   }
 
   async _fetchActualTraderPnlFromTradeHistory(market, targets) {
     let pnlTotal = 0;
     let foundAny = false;
+    let tradeCount = 0;
 
     for (const target of targets) {
       try {
         const trades = await fetchWalletTrades(target, {
-          limit: 200,
-          maxPages: 8,
+          limit: 10_000,
+          maxPages: 2,
           takerOnly: false,
+          markets: market.conditionId ? [market.conditionId] : [],
         });
         const matches = trades.filter((trade) =>
           (market.conditionId && trade.conditionId === market.conditionId.toLowerCase()) ||
@@ -265,6 +334,7 @@ export class DryRunPnlTracker extends EventEmitter {
 
         foundAny = true;
         pnlTotal += pnl;
+        tradeCount += matches.length;
       } catch (err) {
         logger.debug('copy.dryRun: unable to rebuild target trader pnl from trade history', {
           target,
@@ -276,7 +346,7 @@ export class DryRunPnlTracker extends EventEmitter {
     }
 
     if (!foundAny) return null;
-    return { pnl: pnlTotal, source: 'tradeHistory' };
+    return { pnl: pnlTotal, source: 'tradeHistory', tradeCount };
   }
 
   _marketPnlFromTradeHistory(market, trades) {

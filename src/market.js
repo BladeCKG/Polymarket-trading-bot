@@ -302,9 +302,14 @@ export async function fetchWalletTrades(proxyWallet, {
   limit = 200,
   maxPages = 5,
   takerOnly = false,
+  markets = [],
 } = {}) {
   const wallet = normaliseWalletAddress(proxyWallet);
   if (!wallet) throw new Error('fetchWalletTrades: proxyWallet is required');
+  const marketList = Array.isArray(markets)
+    ? markets.map((market) => String(market ?? '').toLowerCase()).filter(Boolean)
+    : [];
+  const marketParam = marketList.join(',');
 
   const rows = [];
   let offset = 0;
@@ -317,6 +322,7 @@ export async function fetchWalletTrades(proxyWallet, {
         limit,
         offset,
         takerOnly,
+        ...(marketParam ? { market: marketParam } : {}),
       },
     });
 
