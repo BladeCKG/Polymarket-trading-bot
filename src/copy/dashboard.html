@@ -517,10 +517,13 @@
           const market = trackedMarketView(item);
           const traderPnl = Number(item.actualTraderPnl);
           const ownPnl = Number(item.ownTraderPnl);
+          const comparisonPnl = state.runtime.dryRun
+            ? market.pnl
+            : ownPnl;
           const hasMismatch = item.settled &&
             Number.isFinite(traderPnl) &&
-            Number.isFinite(ownPnl) &&
-            ((traderPnl > 0 && ownPnl < 0) || (traderPnl < 0 && ownPnl > 0));
+            Number.isFinite(comparisonPnl) &&
+            ((traderPnl > 0 && comparisonPnl < 0) || (traderPnl < 0 && comparisonPnl > 0));
           const statusClass = !item.settled
             ? ''
             : market.pnl > 0
