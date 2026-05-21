@@ -326,14 +326,18 @@ function htmlPage() {
 
     function money(v) {
       const n = Number(v);
-      return Number.isFinite(n) ? '$' + n.toFixed(2) : String(v ?? '—');
+      return Number.isFinite(n) ? '$' + n.toFixed(2) : String(v ?? '-');
     }
 
     function ts(v) {
-      if (!v) return '—';
+      if (!v) return '-';
       const d = new Date(v);
-      if (Number.isNaN(d.getTime())) return String(v ?? '—');
+      if (Number.isNaN(d.getTime())) return String(v ?? '-');
       return d.toLocaleTimeString();
+    }
+
+    function dashIfEmpty(value) {
+      return value == null || value === '' ? '-' : String(value);
     }
 
     function relSlug(item) {
@@ -434,7 +438,7 @@ function htmlPage() {
       const runtime = panel('runtime', 'Runtime Snapshot', state.runtime.mode ? state.runtime.mode.toUpperCase() : 'Runtime', \`
         <div class="cards">
           <div class="mini"><div class="k">Mode</div><div class="v">\${state.runtime.mode || 'copy'}</div></div>
-          <div class="mini"><div class="k">Wallet</div><div class="v">\${state.runtime.wallet || '—'}</div></div>
+          <div class="mini"><div class="k">Wallet</div><div class="v">\${dashIfEmpty(state.runtime.wallet)}</div></div>
           <div class="mini"><div class="k">Dry Run</div><div class="v">\${String(state.runtime.dryRun ?? false)}</div></div>
           <div class="mini"><div class="k">Started</div><div class="v">\${ts(state.runtime.startedAt)}</div></div>
         </div>
@@ -448,12 +452,12 @@ function htmlPage() {
           <article class="item">
             <header><span>\${relSlug(item)}</span><span>\${ts(item.seenAt)}</span></header>
             <dl>
-              <div><dt>Outcome</dt><dd>\${item.outcome || '—'}</dd></div>
+              <div><dt>Outcome</dt><dd>\${dashIfEmpty(item.outcome)}</dd></div>
               <div><dt>Price</dt><dd>\${item.price}</dd></div>
               <div><dt>Size</dt><dd>\${item.size}</dd></div>
               <div><dt>USDC</dt><dd>\${item.usdc}</dd></div>
               <div><dt>Target</dt><dd>\${item.target}</dd></div>
-              <div><dt>Tx</dt><dd>\${item.txHash || '—'}</dd></div>
+              <div><dt>Tx</dt><dd>\${dashIfEmpty(item.txHash)}</dd></div>
             </dl>
           </article>
         \`));
@@ -463,7 +467,7 @@ function htmlPage() {
           <article class="item">
             <header><span>\${relSlug(item)}</span><span>\${item.dryRun ? 'DRY RUN' : 'LIVE'}</span></header>
             <dl>
-              <div><dt>Outcome</dt><dd>\${item.outcome || '—'}</dd></div>
+              <div><dt>Outcome</dt><dd>\${dashIfEmpty(item.outcome)}</dd></div>
               <div><dt>Shares</dt><dd>\${item.shares}</dd></div>
               <div><dt>Max Price</dt><dd>\${item.maxPrice}</dd></div>
               <div><dt>Assumed Spend</dt><dd>\${money(item.assumedSpent)}</dd></div>
@@ -478,10 +482,10 @@ function htmlPage() {
           <article class="item">
             <header><span>\${relSlug(item)}</span><span>\${item.reason}</span></header>
             <dl>
-              <div><dt>Phase</dt><dd>\${item.phase || '—'}</dd></div>
-              <div><dt>Outcome</dt><dd>\${item.outcome || '—'}</dd></div>
-              <div><dt>Price</dt><dd>\${item.price ?? '—'}</dd></div>
-              <div><dt>USDC</dt><dd>\${item.usdc ?? '—'}</dd></div>
+              <div><dt>Phase</dt><dd>\${dashIfEmpty(item.phase)}</dd></div>
+              <div><dt>Outcome</dt><dd>\${dashIfEmpty(item.outcome)}</dd></div>
+              <div><dt>Price</dt><dd>\${dashIfEmpty(item.price)}</dd></div>
+              <div><dt>USDC</dt><dd>\${dashIfEmpty(item.usdc)}</dd></div>
               <div><dt>Seen</dt><dd>\${ts(item.timestamp)}</dd></div>
             </dl>
           </article>
@@ -492,8 +496,8 @@ function htmlPage() {
           <article class="item">
             <header><span>\${relSlug(item)}</span><span>\${ts(item.timestamp)}</span></header>
             <dl>
-              <div><dt>Token</dt><dd>\${item.tokenId || '—'}</dd></div>
-              <div><dt>Outcome</dt><dd>\${item.outcome || '—'}</dd></div>
+              <div><dt>Token</dt><dd>\${dashIfEmpty(item.tokenId)}</dd></div>
+              <div><dt>Outcome</dt><dd>\${dashIfEmpty(item.outcome)}</dd></div>
               <div><dt>Error</dt><dd>\${item.error}</dd></div>
             </dl>
           </article>
@@ -534,24 +538,24 @@ function htmlPage() {
             <article class="item \${cardClass}">
               <header><span>\${item.slug}</span><span class="header-badges"><span class="status-chip \${chipClass}">\${chipLabel}</span>\${hasMismatch ? '<span class="status-chip mismatch">Opposite Result</span>' : ''}</span></header>
               <dl>
-                <div><dt>Question</dt><dd>\${item.question || '—'}</dd></div>
+                <div><dt>Question</dt><dd>\${dashIfEmpty(item.question)}</dd></div>
                 <div><dt>Copies</dt><dd>\${item.copies.length}</dd></div>
                 <div><dt>Spent</dt><dd>\${money(market.spent)}</dd></div>
                 <div><dt>Redeemed</dt><dd>\${money(market.redeemed)}</dd></div>
                 <div><dt>PnL</dt><dd>\${money(market.pnl)}</dd></div>
-                <div><dt>Trader PnL</dt><dd>\${item.actualTraderPnl == null ? '—' : money(item.actualTraderPnl)}</dd></div>
-                <div><dt>PnL Source</dt><dd>\${item.actualTraderPnlSource || '—'}</dd></div>
-                <div><dt>Trader Spend</dt><dd>\${item.actualTraderSpent == null ? 'â€”' : money(item.actualTraderSpent)}</dd></div>
-                <div><dt>Trader Redeemed</dt><dd>\${item.actualTraderRedeemed == null ? 'â€”' : money(item.actualTraderRedeemed)}</dd></div>
+                <div><dt>Trader PnL</dt><dd>\${item.actualTraderPnl == null ? '-' : money(item.actualTraderPnl)}</dd></div>
+                <div><dt>PnL Source</dt><dd>\${dashIfEmpty(item.actualTraderPnlSource)}</dd></div>
+                <div><dt>Trader Spend</dt><dd>\${item.actualTraderSpent == null ? '-' : money(item.actualTraderSpent)}</dd></div>
+                <div><dt>Trader Redeemed</dt><dd>\${item.actualTraderRedeemed == null ? '-' : money(item.actualTraderRedeemed)}</dd></div>
                 <div><dt>Trader Trades</dt><dd>\${item.actualTraderTradeCount ?? 0}</dd></div>
-                <div><dt>My PnL</dt><dd>\${item.ownTraderPnl == null ? 'â€”' : money(item.ownTraderPnl)}</dd></div>
-                <div><dt>My Source</dt><dd>\${item.ownTraderPnlSource || 'â€”'}</dd></div>
-                <div><dt>My Spend</dt><dd>\${item.ownTraderSpent == null ? 'â€”' : money(item.ownTraderSpent)}</dd></div>
-                <div><dt>My Redeemed</dt><dd>\${item.ownTraderRedeemed == null ? 'â€”' : money(item.ownTraderRedeemed)}</dd></div>
+                <div><dt>My PnL</dt><dd>\${item.ownTraderPnl == null ? '-' : money(item.ownTraderPnl)}</dd></div>
+                <div><dt>My Source</dt><dd>\${dashIfEmpty(item.ownTraderPnlSource)}</dd></div>
+                <div><dt>My Spend</dt><dd>\${item.ownTraderSpent == null ? '-' : money(item.ownTraderSpent)}</dd></div>
+                <div><dt>My Redeemed</dt><dd>\${item.ownTraderRedeemed == null ? '-' : money(item.ownTraderRedeemed)}</dd></div>
                 <div><dt>My Trades</dt><dd>\${item.ownTraderTradeCount ?? 0}</dd></div>
-                <div><dt>Skipped PnL</dt><dd>\${item.skippedPnl == null ? 'â€”' : money(item.skippedPnl)}</dd></div>
-                <div><dt>Skipped Spend</dt><dd>\${item.skippedSpent == null ? 'â€”' : money(item.skippedSpent)}</dd></div>
-                <div><dt>Skipped Redeemed</dt><dd>\${item.skippedRedeemed == null ? 'â€”' : money(item.skippedRedeemed)}</dd></div>
+                <div><dt>Skipped PnL</dt><dd>\${item.skippedPnl == null ? '-' : money(item.skippedPnl)}</dd></div>
+                <div><dt>Skipped Spend</dt><dd>\${item.skippedSpent == null ? '-' : money(item.skippedSpent)}</dd></div>
+                <div><dt>Skipped Redeemed</dt><dd>\${item.skippedRedeemed == null ? '-' : money(item.skippedRedeemed)}</dd></div>
                 <div><dt>Skipped Trades</dt><dd>\${item.skippedTradeCount ?? 0}</dd></div>
                 <div><dt>Settled At</dt><dd>\${ts(item.settledAt)}</dd></div>
               </dl>
@@ -562,7 +566,7 @@ function htmlPage() {
       const logs = panel('logs', 'Live Logs', state.logs.length + ' recent lines',
         renderList(state.logs, (item) => \`
           <div class="log-line \${item.level || 'info'}">
-            [\${item.timestamp || '—'}] \${item.level || 'info'}: \${escapeHtml(item.message || '')}
+            [\${dashIfEmpty(item.timestamp)}] \${item.level || 'info'}: \${escapeHtml(item.message || '')}
             \${item.meta && Object.keys(item.meta).length ? '<div class="muted">' + escapeHtml(JSON.stringify(item.meta)) + '</div>' : ''}
           </div>
         \`));
