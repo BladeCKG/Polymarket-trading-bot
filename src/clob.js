@@ -352,6 +352,31 @@ export class ClobClient {
     }
   }
 
+  static feeRateBpsToDecimal(feeRateBps) {
+    const bps = Number(feeRateBps ?? 0);
+    return Number.isFinite(bps) ? (bps / 10_000) : 0;
+  }
+
+  static estimateTakerFeeUsdc({ shares, price, feeRateBps }) {
+    const size = Number(shares ?? 0);
+    const p = Number(price ?? 0);
+    const rate = ClobClient.feeRateBpsToDecimal(feeRateBps);
+    if (!Number.isFinite(size) || !Number.isFinite(p) || !Number.isFinite(rate)) return 0;
+    if (size <= 0 || p <= 0 || p >= 1 || rate <= 0) return 0;
+
+    const rawFee = size * rate * p * (1 - p);
+    const rounded = Math.round(rawFee * 100_000) / 100_000;
+    return rounded >= 0.00001 ? rounded : 0;
+  }
+
+  static async estimateTokenTakerFeeUsdc(tokenId, shares, price) {
+    const feeRateBps = await ClobClient.getTakerFeeBps(tokenId);
+    return {
+      feeRateBps: Number(feeRateBps ?? 0),
+      estimatedFee: ClobClient.estimateTakerFeeUsdc({ shares, price, feeRateBps }),
+    };
+  }
+
   /**
    * Session keep-alive for resting orders (GTC ladder).
    * @see https://docs.polymarket.com/api-reference/trade/send-heartbeat

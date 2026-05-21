@@ -5,7 +5,7 @@
  * On every ActivityFeed 'trade' event:
  *   1. Filter (price band, slippage, staleness, spend caps, allow/block lists).
  *   2. Compute our size (MIRROR / FIXED / RATIO), capped by every configured limit.
- *   3. Fire a FOK BUY via ClobClient.postIOCBuy at maxPrice = target.price + slippage.
+ *   3. Fire a FAK BUY via ClobClient.postIOCBuy at maxPrice = target.price + slippage.
  *   4. Record spend and emit a 'copy' event for observability.
  *
  * No REST/WS calls happen in the hot path beyond the single order POST.
@@ -43,6 +43,8 @@ export class CopyTrader extends EventEmitter {
     // Spend tracking (USDC, human units).
     this.totalSpent   = 0;
     this.spentByMarket = new Map();  // conditionId → usdc
+    this.estimatedFeesTotal = 0;
+    this.estimatedFeesByMarket = new Map(); // conditionId → estimated fee usdc
     this.hourlySpends  = [];         // [{ ts, usdc }, …] pruned on query
 
     // Stats
@@ -79,6 +81,19 @@ export class CopyTrader extends EventEmitter {
     );
     // Size in shares at maxPrice (guarantees we never exceed ourUsdc in USDC).
     const shares = Math.max(1, Math.floor(ourUsdc / maxPrice));
+    const assumedSpent = shares * maxPrice;
+    let estimatedFee = 0;
+    let feeRateBps = 0;
+    try {
+      const feeEstimate = await ClobClient.estimateTokenTakerFeeUsdc(ev.tokenId, shares, maxPrice);
+      estimatedFee = feeEstimate.estimatedFee;
+      feeRateBps = feeEstimate.feeRateBps;
+    } catch (err) {
+      logger.debug('copy.CopyTrader: fee estimate unavailable', {
+        tokenId: ev.tokenId,
+        err: err.message,
+      });
+    }
 
     const fireAt = Date.now();
     const latencyMs = fireAt - ev.timestamp * 1000;
@@ -93,26 +108,30 @@ export class CopyTrader extends EventEmitter {
       ourUsdc:    ourUsdc.toFixed(2),
       maxPrice,
       shares,
+      estimatedFee: estimatedFee.toFixed(5),
+      feeRateBps,
       latencyMs,
       txHash:     ev.txHash,
     });
 
     if (COPY_DRY_RUN) {
+      this._recordEstimatedFee(ev.conditionId, estimatedFee);
       this.copyCount++;
-      this.emit('copy', { ev, ourUsdc, shares, maxPrice, dryRun: true, assumedSpent: shares * maxPrice });
+      this.emit('copy', { ev, ourUsdc, shares, maxPrice, dryRun: true, assumedSpent, estimatedFee, feeRateBps });
       return;
     }
 
     // ── Fire the order ─────────────────────────────────────────────────────
     try {
-      const res = await ClobClient.postIOCBuy(this.wallet, ev.tokenId, maxPrice, shares);
+      // postIOCBuy expects a USDC amount, not a share count.
+      const res = await ClobClient.postIOCBuy(this.wallet, ev.tokenId, maxPrice, assumedSpent);
       const elapsedMs = Date.now() - fireAt;
 
       // Assume we filled the full shares at maxPrice for accounting (conservative).
       // If Polymarket returns a `makingAmount` / `takingAmount` we can refine,
       // but for spend-caps overshooting never hurts.
-      const assumedSpent = shares * maxPrice;
       this._recordSpend(ev.conditionId, assumedSpent);
+      this._recordEstimatedFee(ev.conditionId, estimatedFee);
       this.copyCount++;
 
       logger.info('copy.CopyTrader: order sent', {
@@ -121,11 +140,13 @@ export class CopyTrader extends EventEmitter {
         shares,
         maxPrice,
         assumedSpent: assumedSpent.toFixed(2),
+        estimatedFee: estimatedFee.toFixed(5),
+        feeRateBps,
         orderLatencyMs: elapsedMs,
         signalLatencyMs: fireAt - ev.timestamp * 1000,
         res,
       });
-      this.emit('copy', { ev, ourUsdc, shares, maxPrice, res, dryRun: false, assumedSpent });
+      this.emit('copy', { ev, ourUsdc, shares, maxPrice, res, dryRun: false, assumedSpent, estimatedFee, feeRateBps });
     } catch (err) {
       this.failCount++;
       logger.warn('copy.CopyTrader: order failed', {
@@ -216,6 +237,14 @@ export class CopyTrader extends EventEmitter {
     this.hourlySpends.push({ ts: Date.now(), usdc });
   }
 
+  _recordEstimatedFee(conditionId, feeUsdc) {
+    const fee = Number(feeUsdc ?? 0);
+    if (!Number.isFinite(fee) || fee <= 0) return;
+    const cid = (conditionId || '').toLowerCase();
+    this.estimatedFeesTotal += fee;
+    this.estimatedFeesByMarket.set(cid, (this.estimatedFeesByMarket.get(cid) ?? 0) + fee);
+  }
+
   _rollingHourSpent() {
     const cutoff = Date.now() - HOUR_MS;
     // Prune while-we-look-up (keeps array bounded).
@@ -233,6 +262,7 @@ export class CopyTrader extends EventEmitter {
       skips:    this.skipCount,
       failures: this.failCount,
       totalSpent:      this.totalSpent.toFixed(2),
+      totalEstimatedFees: this.estimatedFeesTotal.toFixed(5),
       rollingHourUsdc: this._rollingHourSpent().toFixed(2),
       markets:         this.spentByMarket.size,
     };

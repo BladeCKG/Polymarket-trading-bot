@@ -378,6 +378,7 @@
           ['Skipped Signals', state.stats.skips ?? 0],
           ['Failures', state.stats.failures ?? 0],
           ['Live Spend', money(state.stats.totalSpent ?? 0)],
+          ['Estimated Fees', money(state.stats.totalEstimatedFees ?? 0)],
           ['Dry-run Open Cost', money(state.stats.dryRunOpenCost ?? 0)],
           ['Dry-run Settled PnL', money(state.stats.dryRunSettledPnl ?? 0)],
           ['My Settled PnL', money(state.stats.ownSettledPnl ?? 0)],
@@ -389,6 +390,7 @@
           ['Skipped Signals', state.stats.skips ?? 0],
           ['Failures', state.stats.failures ?? 0],
           ['Live Spend', money(state.stats.totalSpent ?? 0)],
+          ['Estimated Fees', money(state.stats.totalEstimatedFees ?? 0)],
           ['Tracked Markets Open', state.dryRun?.markets?.filter((item) => !item.settled).length ?? 0],
           ['Tracked Markets Settled', state.dryRun?.markets?.filter((item) => item.settled).length ?? 0],
           ['My Settled PnL', money(state.stats.ownSettledPnl ?? 0)],
@@ -474,6 +476,7 @@
               <div><dt>Shares</dt><dd>${item.shares}</dd></div>
               <div><dt>Max Price</dt><dd>${item.maxPrice}</dd></div>
               <div><dt>Assumed Spend</dt><dd>${money(item.assumedSpent)}</dd></div>
+              <div><dt>Fee Est.</dt><dd>${money(item.estimatedFee)}</dd></div>
               <div><dt>Target Price</dt><dd>${item.targetPrice}</dd></div>
               <div><dt>Seen</dt><dd>${ts(item.timestamp)}</dd></div>
             </dl>

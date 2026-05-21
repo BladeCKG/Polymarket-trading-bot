@@ -17,7 +17,7 @@ export class CopyMarketTracker extends EventEmitter {
     this._traderPnlSource = String(traderPnlSource ?? 'API').toUpperCase();
   }
 
-  recordSimulatedCopy({ ev, shares, maxPrice, ourUsdc }) {
+  recordSimulatedCopy({ ev, shares, maxPrice, ourUsdc, estimatedFee, feeRateBps }) {
     const slug = ev.slug ?? ev.conditionId ?? ev.tokenId;
     const outcome = ev.outcome ?? ev.tokenId;
     const spent = shares * maxPrice;
@@ -31,6 +31,8 @@ export class CopyMarketTracker extends EventEmitter {
       outcome,
       shares,
       spent,
+      feeEstimate: Number(estimatedFee ?? 0),
+      feeRateBps: Number(feeRateBps ?? 0),
       maxPrice,
       targetPrice: ev.price,
       requestedUsdc: ourUsdc,
@@ -61,7 +63,7 @@ export class CopyMarketTracker extends EventEmitter {
     });
   }
 
-  recordExecutedCopy({ ev, shares, maxPrice, assumedSpent }) {
+  recordExecutedCopy({ ev, shares, maxPrice, assumedSpent, estimatedFee, feeRateBps }) {
     const slug = ev?.slug ?? ev?.conditionId ?? ev?.tokenId;
     if (!slug) return;
 
@@ -89,6 +91,8 @@ export class CopyMarketTracker extends EventEmitter {
       price: Number(maxPrice ?? 0),
       size: Number(shares ?? 0),
       usdc: Number(assumedSpent ?? 0),
+      feeEstimate: Number(estimatedFee ?? 0),
+      feeRateBps: Number(feeRateBps ?? 0),
       timestamp: Date.now(),
       txHash: ev.txHash?.toLowerCase?.() ?? '',
       slug: ev.slug ?? null,

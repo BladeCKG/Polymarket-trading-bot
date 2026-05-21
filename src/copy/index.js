@@ -173,6 +173,8 @@ export async function main() {
       shares: payload.shares,
       maxPrice: payload.maxPrice,
       assumedSpent: payload.assumedSpent ?? null,
+      estimatedFee: payload.estimatedFee ?? null,
+      feeRateBps: payload.feeRateBps ?? null,
       dryRun: Boolean(payload.dryRun),
       timestamp: Date.now(),
     });
