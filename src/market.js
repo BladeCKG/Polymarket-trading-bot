@@ -65,15 +65,22 @@ function isNear(value, target, tolerance = 1e-3) {
 }
 
 export function resolvedPayoutsFromMarket(rawMarket) {
+  const isClosed = Boolean(
+    rawMarket?.closed ??
+    rawMarket?.resolved ??
+    rawMarket?.is_resolved,
+  );
+  if (!isClosed) return null;
+
   const payouts = parseArrayField(rawMarket?.outcomePrices).map(Number);
   if (!payouts.length || payouts.some((value) => !Number.isFinite(value))) return null;
 
   const total = payouts.reduce((sum, value) => sum + value, 0);
-  const valuesLookResolved = payouts.every((value) =>
+  const valuesLookResolutionShaped = payouts.every((value) =>
     isNear(value, 0) || isNear(value, 0.5) || isNear(value, 1),
   );
 
-  if (!valuesLookResolved || !isNear(total, 1, 2e-3)) return null;
+  if (!valuesLookResolutionShaped || !isNear(total, 1, 2e-3)) return null;
   return payouts;
 }
 
@@ -118,7 +125,8 @@ function normalizeMarketRecord(m, fallbackSlug = null) {
     upToken,
     downToken,
     active: m.active ?? !m.closed,
-    resolved: Boolean(m.resolved ?? m.is_resolved) || resolvedPayouts !== null,
+    closed: Boolean(m.closed),
+    resolved: Boolean(m.resolved ?? m.is_resolved ?? m.closed),
     question: m.question ?? m.title,
     outcomes,
     outcomePrices,

@@ -6,6 +6,12 @@
  * OrderFilled events on the official exchange contracts, filters for target
  * maker wallets, and normalizes BUY fills into the same shape expected by
  * CopyTrader.
+ *
+ * Freshness note:
+ * We intentionally use the local log receive time as the event timestamp in
+ * chain mode. That avoids an extra `getBlock()` RPC call for every new fill,
+ * which keeps the feed lightweight and scalable. In practice this is what we
+ * care about for copy trading: how fresh the signal was when *we* received it.
  */
 import { EventEmitter } from 'events';
 import { ethers } from 'ethers';
@@ -37,7 +43,6 @@ export class ChainActivityFeed extends EventEmitter {
     this._filters = [];
     this._seenLogs = new Set();
     this._marketCache = new Map();
-    this._blockTimestampCache = new Map();
     this._stopped = false;
     this._destroyTimer = null;
   }
@@ -120,12 +125,13 @@ export class ChainActivityFeed extends EventEmitter {
     }
 
     try {
+      const receivedAt = Date.now();
       const decoded = decodeOrderFilledLog(exchange, log);
       if (!decoded.isBuy) return;
 
       const market = await this._lookupMarket(decoded.tokenId);
-      const timestamp = await this._blockTimestamp(log.blockNumber);
-      const ageMs = Date.now() - timestamp * 1000;
+      const timestamp = Math.floor(receivedAt / 1000);
+      const ageMs = Math.max(0, Date.now() - receivedAt);
       const token = market.tokens?.find((entry) => String(entry.tokenId) === String(decoded.tokenId)) ?? null;
       const size = Number(decoded.takerAmountFilled) / USDC_SCALE;
       const usdc = Number(decoded.makerAmountFilled) / USDC_SCALE;
@@ -152,6 +158,7 @@ export class ChainActivityFeed extends EventEmitter {
           exchangeAddress: decoded.exchangeAddress,
           blockNumber: log.blockNumber,
           logIndex: log.index ?? log.logIndex ?? null,
+          receivedAt,
         },
         raw: {
           log,
@@ -182,28 +189,6 @@ export class ChainActivityFeed extends EventEmitter {
       });
 
     this._marketCache.set(tokenId, pending);
-    return pending;
-  }
-
-  async _blockTimestamp(blockNumber) {
-    if (this._blockTimestampCache.has(blockNumber)) {
-      return this._blockTimestampCache.get(blockNumber);
-    }
-
-    const pending = this._provider.getBlock(blockNumber)
-      .then((block) => {
-        if (!block) throw new Error(`Block not found: ${blockNumber}`);
-        const timestamp = Number(block.timestamp);
-        this._blockTimestampCache.set(blockNumber, timestamp);
-        trimCache(this._blockTimestampCache, 2_000);
-        return timestamp;
-      })
-      .catch((err) => {
-        this._blockTimestampCache.delete(blockNumber);
-        throw err;
-      });
-
-    this._blockTimestampCache.set(blockNumber, pending);
     return pending;
   }
 }
