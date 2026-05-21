@@ -366,6 +366,7 @@ function htmlPage() {
           ['Live Spend', money(state.stats.totalSpent ?? 0)],
           ['Dry-run Open Cost', money(state.stats.dryRunOpenCost ?? 0)],
           ['Dry-run Settled PnL', money(state.stats.dryRunSettledPnl ?? 0)],
+          ['Target Settled PnL', money(state.stats.targetSettledPnl ?? 0)],
         ]
         : [
           ['Accepted Copies', state.stats.copies ?? 0],
@@ -374,6 +375,7 @@ function htmlPage() {
           ['Live Spend', money(state.stats.totalSpent ?? 0)],
           ['Tracked Markets Open', state.dryRun?.markets?.filter((item) => !item.settled).length ?? 0],
           ['Tracked Markets Settled', state.dryRun?.markets?.filter((item) => item.settled).length ?? 0],
+          ['Target Settled PnL', money(state.stats.targetSettledPnl ?? 0)],
         ];
       topStatsEl.innerHTML = cards.map(([label, value]) => \`
         <article class="stat">

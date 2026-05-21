@@ -103,6 +103,10 @@ export class CopyMarketTracker extends EventEmitter {
     let openCost = 0;
     let settledSpent = 0;
     let settledRedeemed = 0;
+    let targetSettledMarkets = 0;
+    let targetSettledSpent = 0;
+    let targetSettledRedeemed = 0;
+    let targetSettledPnl = 0;
 
     for (const [slug, market] of this._markets) {
       const marketSpent = market.copies.reduce((sum, copy) => sum + copy.spent, 0);
@@ -110,6 +114,16 @@ export class CopyMarketTracker extends EventEmitter {
         settledMarkets++;
         settledSpent += marketSpent;
         settledRedeemed += market.redeemed ?? 0;
+        if (Number.isFinite(market.actualTraderPnl)) {
+          targetSettledMarkets++;
+          targetSettledPnl += market.actualTraderPnl;
+        }
+        if (Number.isFinite(market.actualTraderSpent)) {
+          targetSettledSpent += market.actualTraderSpent;
+        }
+        if (Number.isFinite(market.actualTraderRedeemed)) {
+          targetSettledRedeemed += market.actualTraderRedeemed;
+        }
       } else {
         openMarkets++;
         openCost += marketSpent;
@@ -123,6 +137,10 @@ export class CopyMarketTracker extends EventEmitter {
       dryRunSettledSpent: settledSpent.toFixed(2),
       dryRunSettledRedeemed: settledRedeemed.toFixed(2),
       dryRunSettledPnl: (settledRedeemed - settledSpent).toFixed(2),
+      targetSettledMarkets,
+      targetSettledSpent: targetSettledSpent.toFixed(2),
+      targetSettledRedeemed: targetSettledRedeemed.toFixed(2),
+      targetSettledPnl: targetSettledPnl.toFixed(2),
     };
   }
 

@@ -154,7 +154,7 @@ export async function main() {
     dashboard?.setDryRunSnapshot(marketTracker.snapshot());
     dashboard?.setStats({
       ...trader.stats(),
-      ...(COPY_DRY_RUN ? marketTracker.stats() : {}),
+      ...marketTracker.stats(),
     });
   });
 
@@ -225,7 +225,7 @@ export async function main() {
   const statsTimer = setInterval(() => {
     const stats = {
       ...trader.stats(),
-      ...(COPY_DRY_RUN ? marketTracker.stats() : {}),
+      ...marketTracker.stats(),
     };
     logger.info('copy.main: stats', stats);
     dashboard?.setStats(stats);
@@ -233,14 +233,14 @@ export async function main() {
 
   dashboard?.setStats({
     ...trader.stats(),
-    ...(COPY_DRY_RUN ? marketTracker.stats() : {}),
+    ...marketTracker.stats(),
   });
 
   // ── Graceful shutdown ────────────────────────────────────────────────────
   const shutdown = (sig) => {
     logger.info(`copy.main: ${sig} received, shutting down…`, {
       ...trader.stats(),
-      ...(COPY_DRY_RUN ? marketTracker.stats() : {}),
+      ...marketTracker.stats(),
     });
     clearInterval(statsTimer);
     feed.stop();
