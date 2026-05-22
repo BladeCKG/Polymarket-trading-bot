@@ -44,6 +44,12 @@ function jsonSafe(value) {
   return value;
 }
 
+const WATCHDOG_INTERVAL_MS = 30_000;
+const INITIAL_BLOCK_TIMEOUT_MS = 20_000;
+const MAX_BLOCK_SILENCE_MS = 90_000;
+const RECONNECT_BASE_MS = 2_000;
+const RECONNECT_MAX_MS = 30_000;
+
 export class ChainActivityFeed extends EventEmitter {
   constructor(targets) {
     super();
@@ -54,6 +60,14 @@ export class ChainActivityFeed extends EventEmitter {
     this._marketCache = new Map();
     this._stopped = false;
     this._destroyTimer = null;
+    this._watchdogTimer = null;
+    this._reconnectTimer = null;
+    this._reconnectAttempts = 0;
+    this._lastBlockAt = 0;
+    this._connectedAt = 0;
+    this._connecting = false;
+    this._socketListeners = [];
+    this._blockListener = null;
   }
 
   async start() {
@@ -64,7 +78,18 @@ export class ChainActivityFeed extends EventEmitter {
       throw new Error('ChainActivityFeed requires at least one target wallet');
     }
 
-    this._provider = new ethers.WebSocketProvider(POLYGON_WS_RPC);
+    this._stopped = false;
+    await this._connect();
+    this._startWatchdog();
+  }
+
+  async _connect() {
+    if (this._stopped || this._connecting) return;
+    this._connecting = true;
+    this._clearReconnectTimer();
+
+    const provider = new ethers.WebSocketProvider(POLYGON_WS_RPC);
+    this._provider = provider;
     const targetTopics = this.targets.map(makerTopic);
 
     for (const exchange of WATCHED_EXCHANGES) {
@@ -73,13 +98,26 @@ export class ChainActivityFeed extends EventEmitter {
         topics: [exchange.orderFilledTopic, null, targetTopics],
       };
       const listener = (log) => {
+        this._lastBlockAt = Date.now();
         void this._handleLog(exchange, log);
       };
-      this._provider.on(filter, listener);
+      provider.on(filter, listener);
       this._filters.push({ filter, listener });
     }
 
+    this._blockListener = () => {
+      this._lastBlockAt = Date.now();
+    };
+    provider.on('block', this._blockListener);
+    const blockNumber = await provider.getBlockNumber();
+    this._connectedAt = Date.now();
+    this._lastBlockAt = 0;
+    this._attachSocketListeners(provider);
+    this._reconnectAttempts = 0;
+    this._connecting = false;
+
     logger.info('copy.ChainActivityFeed: listening for on-chain fills', {
+      blockNumber,
       targets: this.targets,
       exchanges: WATCHED_EXCHANGES.map((exchange) => ({
         key: exchange.key,
@@ -90,36 +128,23 @@ export class ChainActivityFeed extends EventEmitter {
 
   stop() {
     this._stopped = true;
-    const provider = this._provider;
-    this._provider = null;
     if (this._destroyTimer) {
       clearTimeout(this._destroyTimer);
       this._destroyTimer = null;
     }
-
-    if (provider) {
-      for (const { filter, listener } of this._filters) {
-        provider.off(filter, listener);
-      }
-
-      try {
-        const socket = provider.websocket;
-        socket.onopen = null;
-        socket.onmessage = null;
-        socket.onerror = () => {};
-        socket.onclose = () => {};
-      } catch {
-        // Ignore cases where the websocket is already closed or unavailable.
-      }
-      this._destroyTimer = setTimeout(() => {
-        this._destroyTimer = null;
-        void provider.destroy().catch((err) => {
-          logger.debug('copy.ChainActivityFeed: provider destroy error', { err: err.message });
-        });
-      }, 1_000);
-      this._destroyTimer.unref?.();
+    if (this._watchdogTimer) {
+      clearInterval(this._watchdogTimer);
+      this._watchdogTimer = null;
     }
+    this._clearReconnectTimer();
+    this._teardownProvider(this._provider);
+    this._provider = null;
     this._filters = [];
+    this._blockListener = null;
+    this._socketListeners = [];
+    this._connectedAt = 0;
+    this._lastBlockAt = 0;
+    this._connecting = false;
   }
 
   async _handleLog(exchange, log) {
@@ -208,5 +233,135 @@ export class ChainActivityFeed extends EventEmitter {
 
     this._marketCache.set(tokenId, pending);
     return pending;
+  }
+
+  _startWatchdog() {
+    if (this._watchdogTimer) clearInterval(this._watchdogTimer);
+    this._watchdogTimer = setInterval(() => {
+      if (this._stopped || !this._provider || !this._connectedAt) return;
+      const hasSeenBlock = this._lastBlockAt > 0;
+      const referenceAt = hasSeenBlock ? this._lastBlockAt : this._connectedAt;
+      const allowedSilenceMs = hasSeenBlock ? MAX_BLOCK_SILENCE_MS : INITIAL_BLOCK_TIMEOUT_MS;
+      const silenceMs = Date.now() - referenceAt;
+      if (silenceMs <= allowedSilenceMs) return;
+
+      logger.warn('copy.ChainActivityFeed: chain feed stalled, reconnecting', {
+        phase: hasSeenBlock ? 'steady-state' : 'startup',
+        silenceMs,
+        allowedSilenceMs,
+      });
+      this._scheduleReconnect(hasSeenBlock ? 'block-heartbeat-stalled' : 'startup-no-blocks');
+    }, WATCHDOG_INTERVAL_MS);
+    this._watchdogTimer.unref?.();
+  }
+
+  _attachSocketListeners(provider) {
+    try {
+      const socket = provider.websocket;
+      if (!socket) return;
+
+      const onClose = (event) => {
+        const code = typeof event === 'number' ? event : event?.code;
+        const reason = typeof event === 'string' ? event : event?.reason;
+        logger.warn('copy.ChainActivityFeed: websocket closed', { code, reason });
+        this._scheduleReconnect('socket-close');
+      };
+      const onError = (err) => {
+        logger.warn('copy.ChainActivityFeed: websocket error', {
+          err: err?.message ?? String(err),
+        });
+        this._scheduleReconnect('socket-error');
+      };
+
+      if (typeof socket.on === 'function') {
+        socket.on('close', onClose);
+        socket.on('error', onError);
+        this._socketListeners.push(['close', onClose], ['error', onError]);
+        return;
+      }
+      if (typeof socket.addEventListener === 'function') {
+        socket.addEventListener('close', onClose);
+        socket.addEventListener('error', onError);
+        this._socketListeners.push(['close', onClose], ['error', onError]);
+      }
+    } catch {
+      // Ignore websocket listener attachment issues and rely on the watchdog.
+    }
+  }
+
+  _scheduleReconnect(reason) {
+    if (this._stopped || this._reconnectTimer || this._connecting) return;
+    const currentProvider = this._provider;
+    this._provider = null;
+    this._teardownProvider(currentProvider);
+
+    const delayMs = Math.min(
+      RECONNECT_MAX_MS,
+      RECONNECT_BASE_MS * (2 ** Math.min(this._reconnectAttempts, 4)),
+    );
+    this._reconnectAttempts += 1;
+
+    logger.info('copy.ChainActivityFeed: scheduling reconnect', {
+      reason,
+      delayMs,
+      attempt: this._reconnectAttempts,
+    });
+    this._reconnectTimer = setTimeout(() => {
+      this._reconnectTimer = null;
+      void this._connect().catch((err) => {
+        this._connecting = false;
+        logger.warn('copy.ChainActivityFeed: reconnect failed', {
+          err: err.message,
+          attempt: this._reconnectAttempts,
+        });
+        this._scheduleReconnect('reconnect-failed');
+      });
+    }, delayMs);
+    this._reconnectTimer.unref?.();
+  }
+
+  _clearReconnectTimer() {
+    if (!this._reconnectTimer) return;
+    clearTimeout(this._reconnectTimer);
+    this._reconnectTimer = null;
+  }
+
+  _teardownProvider(provider) {
+    if (!provider) return;
+
+    for (const { filter, listener } of this._filters) {
+      provider.off(filter, listener);
+    }
+    this._filters = [];
+
+    if (this._blockListener) {
+      provider.off('block', this._blockListener);
+    }
+
+    try {
+      const socket = provider.websocket;
+      for (const [eventName, handler] of this._socketListeners) {
+        if (typeof socket?.off === 'function') {
+          socket.off(eventName, handler);
+        } else if (typeof socket?.removeEventListener === 'function') {
+          socket.removeEventListener(eventName, handler);
+        }
+      }
+    } catch {
+      // Ignore listener removal issues on a stale websocket.
+    }
+    this._socketListeners = [];
+
+    if (this._destroyTimer) {
+      clearTimeout(this._destroyTimer);
+      this._destroyTimer = null;
+    }
+    this._destroyTimer = setTimeout(() => {
+      this._destroyTimer = null;
+      void provider.destroy().catch((err) => {
+        logger.debug('copy.ChainActivityFeed: provider destroy error', { err: err.message });
+      });
+    }, 1_000);
+    this._destroyTimer.unref?.();
   }
 }
