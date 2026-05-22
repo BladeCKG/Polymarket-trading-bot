@@ -419,7 +419,7 @@ export class ClobClient {
     return { ...best, tickSize: book.tickSize, minOrderSize: book.minOrderSize };
   }
 
-  static estimateMarketBuyFillFromBook(book, maxPrice, amountUsdc) {
+  static estimateMarketBuyFillFromBook(book, maxPrice, amountUsdc, feeRateBps = 0) {
     const asks = Array.isArray(book?.asks) ? [...book.asks] : [];
     const max = Number(maxPrice ?? 0);
     let remainingUsdc = Number(amountUsdc ?? 0);
@@ -439,20 +439,47 @@ export class ClobClient {
     const bestAsk = eligible[0]?.price ?? asks[0]?.price ?? null;
     let filledShares = 0;
     let spentUsdc = 0;
+    let estimatedFeeUsdc = 0;
+    const fills = [];
 
     for (const ask of eligible) {
       if (remainingUsdc <= 0) break;
       const levelNotional = ask.price * ask.size;
       if (levelNotional <= remainingUsdc) {
+        const levelFeeUsdc = ClobClient.estimateTakerFeeUsdc({
+          shares: ask.size,
+          price: ask.price,
+          feeRateBps,
+        });
         filledShares += ask.size;
         spentUsdc += levelNotional;
+        estimatedFeeUsdc += levelFeeUsdc;
+        fills.push({
+          price: ask.price,
+          shares: ask.size,
+          spentUsdc: levelNotional,
+          feeUsdc: levelFeeUsdc,
+        });
         remainingUsdc -= levelNotional;
         continue;
       }
 
       const partialShares = remainingUsdc / ask.price;
+      const partialSpentUsdc = partialShares * ask.price;
+      const partialFeeUsdc = ClobClient.estimateTakerFeeUsdc({
+        shares: partialShares,
+        price: ask.price,
+        feeRateBps,
+      });
       filledShares += partialShares;
-      spentUsdc += partialShares * ask.price;
+      spentUsdc += partialSpentUsdc;
+      estimatedFeeUsdc += partialFeeUsdc;
+      fills.push({
+        price: ask.price,
+        shares: partialShares,
+        spentUsdc: partialSpentUsdc,
+        feeUsdc: partialFeeUsdc,
+      });
       remainingUsdc = 0;
       break;
     }
@@ -466,12 +493,18 @@ export class ClobClient {
       unfilledUsdc: remainingUsdc,
       fullyFilled: remainingUsdc <= 0.000001,
       askLevelsConsidered: eligible.length,
+      feeRateBps: Number(feeRateBps ?? 0),
+      estimatedFeeUsdc,
+      fills,
     };
   }
 
   static async estimateMarketBuyFill(tokenId, maxPrice, amountUsdc) {
-    const book = await ClobClient.getBook(tokenId);
-    return ClobClient.estimateMarketBuyFillFromBook(book, maxPrice, amountUsdc);
+    const [book, feeRateBps] = await Promise.all([
+      ClobClient.getBook(tokenId),
+      ClobClient.getTakerFeeBps(tokenId),
+    ]);
+    return ClobClient.estimateMarketBuyFillFromBook(book, maxPrice, amountUsdc, feeRateBps);
   }
 
   // ── Order management ────────────────────────────────────────────────────────

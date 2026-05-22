@@ -103,18 +103,12 @@ export class CopyTrader extends EventEmitter {
     const simulatedPrice = Number.isFinite(executionEstimate?.avgFillPrice) && executionEstimate.avgFillPrice > 0
       ? executionEstimate.avgFillPrice
       : maxPrice;
-    let estimatedFee = 0;
-    let feeRateBps = 0;
-    try {
-      const feeEstimate = await ClobClient.estimateTokenTakerFeeUsdc(ev.tokenId, simulatedShares, simulatedPrice);
-      estimatedFee = feeEstimate.estimatedFee;
-      feeRateBps = feeEstimate.feeRateBps;
-    } catch (err) {
-      logger.debug('copy.CopyTrader: fee estimate unavailable', {
-        tokenId: ev.tokenId,
-        err: err.message,
-      });
-    }
+    const estimatedFee = Number.isFinite(executionEstimate?.estimatedFeeUsdc)
+      ? executionEstimate.estimatedFeeUsdc
+      : 0;
+    const feeRateBps = Number.isFinite(executionEstimate?.feeRateBps)
+      ? executionEstimate.feeRateBps
+      : 0;
 
     const fireAt = Date.now();
     const latencyMs = fireAt - ev.timestamp * 1000;
