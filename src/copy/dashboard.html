@@ -235,6 +235,15 @@
       grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
       gap: 8px 12px;
     }
+    .item dl.market-grid {
+      grid-template-columns: repeat(5, minmax(120px, 1fr));
+    }
+    .item dl.market-grid .span-2 {
+      grid-column: span 2;
+    }
+    .item dl.market-grid .span-3 {
+      grid-column: span 3;
+    }
     .item dt {
       color: var(--muted);
       font-size: 0.75rem;
@@ -281,6 +290,13 @@
       .shell { padding: 16px 12px 28px; }
       details.panel > summary { padding: 16px; }
       .panel-body { padding: 0 16px 16px; }
+      .item dl.market-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+      .item dl.market-grid .span-2,
+      .item dl.market-grid .span-3 {
+        grid-column: span 2;
+      }
     }
   </style>
 </head>
@@ -558,30 +574,33 @@
           return `
             <article class="item ${cardClass}">
               <header><span>${item.slug}</span><span class="header-badges"><span class="status-chip ${chipClass}">${chipLabel}</span>${hasMismatch ? '<span class="status-chip mismatch">Opposite Result</span>' : ''}</span></header>
-              <dl>
-                <div><dt>Question</dt><dd>${dashIfEmpty(item.question)}</dd></div>
+              <dl class="market-grid">
+                <div class="span-3"><dt>Question</dt><dd>${dashIfEmpty(item.question)}</dd></div>
+                <div><dt>Settled At</dt><dd>${ts(item.settledAt)}</dd></div>
                 <div><dt>Copies</dt><dd>${item.copies.length}</dd></div>
-                <div><dt>Spent</dt><dd>${money(market.spent)}</dd></div>
-                <div><dt>Redeemed</dt><dd>${money(market.redeemed)}</dd></div>
-                <div><dt>PnL</dt><dd>${money(market.pnl)}</dd></div>
-                <div><dt>Trader PnL</dt><dd>${item.actualTraderPnl == null ? '-' : money(item.actualTraderPnl)}</dd></div>
-                <div><dt>PnL Source</dt><dd>${dashIfEmpty(item.actualTraderPnlSource)}</dd></div>
+                <div><dt>Copy Source</dt><dd>${state.runtime.dryRun ? 'dry-run' : 'tracked'}</dd></div>
+                <div><dt>Copy Trades</dt><dd>${item.copies.length}</dd></div>
+                <div><dt>Copy Spend</dt><dd>${money(market.spent)}</dd></div>
+                <div><dt>Copy Redeemed</dt><dd>${money(market.redeemed)}</dd></div>
+                <div><dt>Copy PnL</dt><dd>${money(market.pnl)}</dd></div>
+                <div><dt>Trader Source</dt><dd>${dashIfEmpty(item.actualTraderPnlSource)}</dd></div>
+                <div><dt>Trader Trades</dt><dd>${item.actualTraderTradeCount ?? 0}</dd></div>
                 <div><dt>Trader Spend</dt><dd>${item.actualTraderSpent == null ? '-' : money(item.actualTraderSpent)}</dd></div>
                 <div><dt>Trader Redeemed</dt><dd>${item.actualTraderRedeemed == null ? '-' : money(item.actualTraderRedeemed)}</dd></div>
-                <div><dt>Trader Fee</dt><dd>${item.actualTraderFeeValue == null ? '-' : money(item.actualTraderFeeValue)}</dd></div>
-                <div><dt>Trader Fee Amount</dt><dd>${item.actualTraderFeeAmount == null ? '-' : item.actualTraderFeeAmount + ' ' + (item.actualTraderFeeUnit || '')}</dd></div>
-                <div><dt>Trader Fee Source</dt><dd>${dashIfEmpty(item.actualTraderFeeSource)}</dd></div>
-                <div><dt>Trader Trades</dt><dd>${item.actualTraderTradeCount ?? 0}</dd></div>
-                <div><dt>My PnL</dt><dd>${item.ownTraderPnl == null ? '-' : money(item.ownTraderPnl)}</dd></div>
+                <div><dt>Trader PnL</dt><dd>${item.actualTraderPnl == null ? '-' : money(item.actualTraderPnl)}</dd></div>
                 <div><dt>My Source</dt><dd>${dashIfEmpty(item.ownTraderPnlSource)}</dd></div>
+                <div><dt>My Trades</dt><dd>${item.ownTraderTradeCount ?? 0}</dd></div>
                 <div><dt>My Spend</dt><dd>${item.ownTraderSpent == null ? '-' : money(item.ownTraderSpent)}</dd></div>
                 <div><dt>My Redeemed</dt><dd>${item.ownTraderRedeemed == null ? '-' : money(item.ownTraderRedeemed)}</dd></div>
-                <div><dt>My Trades</dt><dd>${item.ownTraderTradeCount ?? 0}</dd></div>
-                <div><dt>Skipped PnL</dt><dd>${item.skippedPnl == null ? '-' : money(item.skippedPnl)}</dd></div>
+                <div><dt>My PnL</dt><dd>${item.ownTraderPnl == null ? '-' : money(item.ownTraderPnl)}</dd></div>
+                <div><dt>Skipped Source</dt><dd>hypothetical</dd></div>
+                <div><dt>Skipped Trades</dt><dd>${item.skippedTradeCount ?? 0}</dd></div>
                 <div><dt>Skipped Spend</dt><dd>${item.skippedSpent == null ? '-' : money(item.skippedSpent)}</dd></div>
                 <div><dt>Skipped Redeemed</dt><dd>${item.skippedRedeemed == null ? '-' : money(item.skippedRedeemed)}</dd></div>
-                <div><dt>Skipped Trades</dt><dd>${item.skippedTradeCount ?? 0}</dd></div>
-                <div><dt>Settled At</dt><dd>${ts(item.settledAt)}</dd></div>
+                <div><dt>Skipped PnL</dt><dd>${item.skippedPnl == null ? '-' : money(item.skippedPnl)}</dd></div>
+                <div><dt>Trader Fee Source</dt><dd>${dashIfEmpty(item.actualTraderFeeSource)}</dd></div>
+                <div><dt>Trader Fee Amount</dt><dd>${item.actualTraderFeeAmount == null ? '-' : item.actualTraderFeeAmount + ' ' + (item.actualTraderFeeUnit || '')}</dd></div>
+                <div><dt>Trader Fee</dt><dd>${item.actualTraderFeeValue == null ? '-' : money(item.actualTraderFeeValue)}</dd></div>
               </dl>
             </article>
           `;
