@@ -473,7 +473,8 @@
             <header><span>${relSlug(item)}</span><span>${item.dryRun ? 'DRY RUN' : 'LIVE'}</span></header>
             <dl>
               <div><dt>Outcome</dt><dd>${dashIfEmpty(item.outcome)}</dd></div>
-              <div><dt>Shares</dt><dd>${item.shares}</dd></div>
+              <div><dt>Exec Shares</dt><dd>${item.executionShares ?? item.shares}</dd></div>
+              <div><dt>Exec Price</dt><dd>${item.executionPrice ?? '-'}</dd></div>
               <div><dt>Max Price</dt><dd>${item.maxPrice}</dd></div>
               <div><dt>Assumed Spend</dt><dd>${money(item.assumedSpent)}</dd></div>
               <div><dt>Fee Est.</dt><dd>${money(item.estimatedFee)}</dd></div>

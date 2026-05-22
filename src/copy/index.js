@@ -25,6 +25,7 @@ import { CopyTrader } from './copyTrader.js';
 import { CopyMarketTracker } from './marketTracker.js';
 import { CopyDashboardServer } from './dashboard.js';
 import { createCopyFeed } from './feedFactory.js';
+import { CopyTraceFile } from './traceFile.js';
 import {
   COPY_TARGETS,
   COPY_FEED_MODE,
@@ -133,6 +134,17 @@ export async function main() {
     pollMs: COPY_POLL_MS,
   });
   const marketTracker = new CopyMarketTracker({ traderPnlSource: COPY_SETTLED_TRADER_PNL_SOURCE });
+  const traceFile = new CopyTraceFile();
+  const traceFilename = traceFile.start();
+  logger.info('copy.main: detailed trace file enabled', { traceFilename });
+  traceFile.write('startup', {
+    wallet: wallet.address,
+    dryRun: COPY_DRY_RUN,
+    targets: COPY_TARGETS,
+    feedMode: COPY_FEED_MODE,
+    pollMs: COPY_POLL_MS,
+    settledTraderPnlSource: COPY_SETTLED_TRADER_PNL_SOURCE,
+  });
 
   if (COPY_DRY_RUN) {
     trader.on('copy', (payload) => {
@@ -165,12 +177,25 @@ export async function main() {
       marketTracker.recordExecutedCopy(payload);
       dashboard?.setDryRunSnapshot(marketTracker.snapshot());
     }
+    traceFile.write('copy', {
+      details: payload.details ?? null,
+      targetEvent: payload.ev ?? null,
+      response: payload.res ?? null,
+      dryRun: Boolean(payload.dryRun),
+    });
+    logger.info('copy.main: corresponding copy trade', {
+      details: payload.details ?? null,
+      targetEvent: payload.ev ?? null,
+      response: payload.res ?? null,
+    });
     dashboard?.recordCopy({
       slug: payload.ev?.slug ?? null,
       conditionId: payload.ev?.conditionId ?? null,
       outcome: payload.ev?.outcome ?? null,
       targetPrice: payload.ev?.price ?? null,
       shares: payload.shares,
+      executionShares: payload.executionEstimate?.fillShares ?? payload.shares ?? null,
+      executionPrice: payload.executionPrice ?? payload.details?.simulatedPrice ?? null,
       maxPrice: payload.maxPrice,
       assumedSpent: payload.assumedSpent ?? null,
       estimatedFee: payload.estimatedFee ?? null,
@@ -183,6 +208,16 @@ export async function main() {
   trader.on('skip', (payload) => {
     marketTracker.recordSkippedTrade(payload);
     dashboard?.setDryRunSnapshot(marketTracker.snapshot());
+    traceFile.write('skip', {
+      details: payload.details ?? null,
+      targetEvent: payload.ev ?? null,
+      reason: payload.reason,
+      phase: payload.phase ?? null,
+    });
+    logger.info('copy.main: corresponding skipped trade', {
+      details: payload.details ?? null,
+      targetEvent: payload.ev ?? null,
+    });
     dashboard?.recordSkip({
       slug: payload.ev?.slug ?? null,
       conditionId: payload.ev?.conditionId ?? null,
@@ -198,6 +233,16 @@ export async function main() {
   });
 
   trader.on('copy-failed', ({ ev, err }) => {
+    traceFile.write('copy-failed', {
+      targetEvent: ev ?? null,
+      err: err?.message ?? String(err),
+      stack: err?.stack ?? null,
+    });
+    logger.warn('copy.main: corresponding copy failure', {
+      targetEvent: ev ?? null,
+      err: err?.message ?? String(err),
+      stack: err?.stack ?? null,
+    });
     dashboard?.recordFailure({
       slug: ev?.slug ?? null,
       tokenId: ev?.tokenId ?? null,
@@ -210,6 +255,14 @@ export async function main() {
   feed.on('trade', (ev) => {
     marketTracker.recordObservedTargetTrade(ev);
     dashboard?.setDryRunSnapshot(marketTracker.snapshot());
+    traceFile.write('observed-trade', {
+      normalized: ev,
+      raw: ev?.raw ?? null,
+    });
+    logger.info('copy.main: observed target trade', {
+      normalized: ev,
+      raw: ev?.raw ?? null,
+    });
     dashboard?.recordTrade({
       source: ev.source ?? COPY_FEED_MODE.toLowerCase(),
       target: ev.target,
@@ -248,6 +301,13 @@ export async function main() {
 
   // ── Graceful shutdown ────────────────────────────────────────────────────
   const shutdown = (sig) => {
+    traceFile.write('shutdown', {
+      signal: sig,
+      stats: {
+        ...trader.stats(),
+        ...marketTracker.stats(),
+      },
+    });
     logger.info(`copy.main: ${sig} received, shutting down…`, {
       ...trader.stats(),
       ...marketTracker.stats(),
@@ -255,6 +315,7 @@ export async function main() {
     clearInterval(statsTimer);
     feed.stop();
     if (COPY_DRY_RUN) marketTracker.printSummary();
+    traceFile.stop();
     dashboard?.stop();
     // Give any in-flight order a moment to flush.
     setTimeout(() => process.exit(0), 1_000);

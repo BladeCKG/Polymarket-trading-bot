@@ -419,6 +419,61 @@ export class ClobClient {
     return { ...best, tickSize: book.tickSize, minOrderSize: book.minOrderSize };
   }
 
+  static estimateMarketBuyFillFromBook(book, maxPrice, amountUsdc) {
+    const asks = Array.isArray(book?.asks) ? [...book.asks] : [];
+    const max = Number(maxPrice ?? 0);
+    let remainingUsdc = Number(amountUsdc ?? 0);
+    if (!Number.isFinite(max) || !Number.isFinite(remainingUsdc) || max <= 0 || remainingUsdc <= 0) {
+      return null;
+    }
+
+    asks.sort((a, b) => a.price - b.price);
+    const eligible = asks.filter((ask) =>
+      Number.isFinite(ask.price) &&
+      Number.isFinite(ask.size) &&
+      ask.price > 0 &&
+      ask.size > 0 &&
+      ask.price <= max
+    );
+
+    const bestAsk = eligible[0]?.price ?? asks[0]?.price ?? null;
+    let filledShares = 0;
+    let spentUsdc = 0;
+
+    for (const ask of eligible) {
+      if (remainingUsdc <= 0) break;
+      const levelNotional = ask.price * ask.size;
+      if (levelNotional <= remainingUsdc) {
+        filledShares += ask.size;
+        spentUsdc += levelNotional;
+        remainingUsdc -= levelNotional;
+        continue;
+      }
+
+      const partialShares = remainingUsdc / ask.price;
+      filledShares += partialShares;
+      spentUsdc += partialShares * ask.price;
+      remainingUsdc = 0;
+      break;
+    }
+
+    const avgFillPrice = filledShares > 0 ? (spentUsdc / filledShares) : null;
+    return {
+      bestAsk,
+      avgFillPrice,
+      fillShares: filledShares,
+      spentUsdc,
+      unfilledUsdc: remainingUsdc,
+      fullyFilled: remainingUsdc <= 0.000001,
+      askLevelsConsidered: eligible.length,
+    };
+  }
+
+  static async estimateMarketBuyFill(tokenId, maxPrice, amountUsdc) {
+    const book = await ClobClient.getBook(tokenId);
+    return ClobClient.estimateMarketBuyFillFromBook(book, maxPrice, amountUsdc);
+  }
+
   // ── Order management ────────────────────────────────────────────────────────
 
   /**

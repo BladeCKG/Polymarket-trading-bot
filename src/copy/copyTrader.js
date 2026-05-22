@@ -56,12 +56,14 @@ export class CopyTrader extends EventEmitter {
   /** Handle a normalized trade event from ActivityFeed. */
   async onTrade(ev) {
     const skipHypothetical = this._skipHypothetical(ev);
+    const decisionBase = this._decisionSnapshot(ev);
     // ── Pre-flight filters (O(1), no I/O) ──────────────────────────────────
     const reason = this._rejectReason(ev);
     if (reason) {
       this.skipCount++;
-      this.emit('skip', { reason, ev, phase: 'filter', hypothetical: skipHypothetical });
-      logger.debug('copy.CopyTrader: skipping trade', { reason, ev: this._evSummary(ev) });
+      const details = { ...decisionBase, reason, phase: 'filter', hypothetical: skipHypothetical };
+      this.emit('skip', { reason, ev, phase: 'filter', hypothetical: skipHypothetical, details });
+      logger.info('copy.CopyTrader: skipped trade', details);
       return;
     }
 
@@ -69,8 +71,9 @@ export class CopyTrader extends EventEmitter {
     const ourUsdc = this._ourUsdc(ev);
     if (!ourUsdc || ourUsdc < 1) {
       this.skipCount++;
-      this.emit('skip', { reason: 'computed-size-too-small', ev, ourUsdc, phase: 'size', hypothetical: skipHypothetical });
-      logger.debug('copy.CopyTrader: computed size too small', { ourUsdc, ev: this._evSummary(ev) });
+      const details = { ...decisionBase, reason: 'computed-size-too-small', phase: 'size', ourUsdc, hypothetical: skipHypothetical };
+      this.emit('skip', { reason: 'computed-size-too-small', ev, ourUsdc, phase: 'size', hypothetical: skipHypothetical, details });
+      logger.info('copy.CopyTrader: skipped trade', details);
       return;
     }
 
@@ -82,10 +85,28 @@ export class CopyTrader extends EventEmitter {
     // Size in shares at maxPrice (guarantees we never exceed ourUsdc in USDC).
     const shares = Math.max(1, Math.floor(ourUsdc / maxPrice));
     const assumedSpent = shares * maxPrice;
+    let executionEstimate = null;
+    try {
+      executionEstimate = await ClobClient.estimateMarketBuyFill(ev.tokenId, maxPrice, ourUsdc);
+    } catch (err) {
+      logger.debug('copy.CopyTrader: execution estimate unavailable', {
+        tokenId: ev.tokenId,
+        err: err.message,
+      });
+    }
+    const simulatedShares = Number.isFinite(executionEstimate?.fillShares) && executionEstimate.fillShares > 0
+      ? executionEstimate.fillShares
+      : shares;
+    const simulatedSpent = Number.isFinite(executionEstimate?.spentUsdc) && executionEstimate.spentUsdc > 0
+      ? executionEstimate.spentUsdc
+      : assumedSpent;
+    const simulatedPrice = Number.isFinite(executionEstimate?.avgFillPrice) && executionEstimate.avgFillPrice > 0
+      ? executionEstimate.avgFillPrice
+      : maxPrice;
     let estimatedFee = 0;
     let feeRateBps = 0;
     try {
-      const feeEstimate = await ClobClient.estimateTokenTakerFeeUsdc(ev.tokenId, shares, maxPrice);
+      const feeEstimate = await ClobClient.estimateTokenTakerFeeUsdc(ev.tokenId, simulatedShares, simulatedPrice);
       estimatedFee = feeEstimate.estimatedFee;
       feeRateBps = feeEstimate.feeRateBps;
     } catch (err) {
@@ -99,25 +120,39 @@ export class CopyTrader extends EventEmitter {
     const latencyMs = fireAt - ev.timestamp * 1000;
 
     logger.info('copy.CopyTrader: copying BUY', {
-      target:     ev.target,
-      tokenId:    ev.tokenId,
-      conditionId: ev.conditionId,
-      slug:       ev.slug,
+      ...decisionBase,
       targetPx:   ev.price,
       targetSize: ev.size,
-      ourUsdc:    ourUsdc.toFixed(2),
+      ourUsdc,
       maxPrice,
       shares,
+      assumedSpent,
+      simulatedShares,
+      simulatedSpent,
+      simulatedPrice,
+      executionEstimate,
       estimatedFee: estimatedFee.toFixed(5),
       feeRateBps,
       latencyMs,
-      txHash:     ev.txHash,
     });
 
     if (COPY_DRY_RUN) {
       this._recordEstimatedFee(ev.conditionId, estimatedFee);
       this.copyCount++;
-      this.emit('copy', { ev, ourUsdc, shares, maxPrice, dryRun: true, assumedSpent, estimatedFee, feeRateBps });
+      this.emit('copy', { ev, ourUsdc, shares: simulatedShares, maxPrice, executionPrice: simulatedPrice, dryRun: true, assumedSpent: simulatedSpent, estimatedFee, feeRateBps, executionEstimate, details: {
+        ...decisionBase,
+        ourUsdc,
+        maxPrice,
+        shares,
+        assumedSpent,
+        simulatedShares,
+        simulatedSpent,
+        simulatedPrice,
+        executionEstimate,
+        estimatedFee,
+        feeRateBps,
+        dryRun: true,
+      } });
       return;
     }
 
@@ -135,24 +170,39 @@ export class CopyTrader extends EventEmitter {
       this.copyCount++;
 
       logger.info('copy.CopyTrader: order sent', {
-        slug:       ev.slug,
-        tokenId:    ev.tokenId,
+        ...decisionBase,
         shares,
         maxPrice,
-        assumedSpent: assumedSpent.toFixed(2),
-        estimatedFee: estimatedFee.toFixed(5),
+        ourUsdc,
+        assumedSpent,
+        estimatedFee,
         feeRateBps,
         orderLatencyMs: elapsedMs,
         signalLatencyMs: fireAt - ev.timestamp * 1000,
         res,
       });
-      this.emit('copy', { ev, ourUsdc, shares, maxPrice, res, dryRun: false, assumedSpent, estimatedFee, feeRateBps });
+      this.emit('copy', { ev, ourUsdc, shares, maxPrice, res, dryRun: false, assumedSpent, estimatedFee, feeRateBps, details: {
+        ...decisionBase,
+        ourUsdc,
+        maxPrice,
+        shares,
+        assumedSpent,
+        estimatedFee,
+        feeRateBps,
+        dryRun: false,
+        orderLatencyMs: elapsedMs,
+        signalLatencyMs: fireAt - ev.timestamp * 1000,
+      } });
     } catch (err) {
       this.failCount++;
       logger.warn('copy.CopyTrader: order failed', {
-        tokenId: ev.tokenId,
+        ...decisionBase,
         maxPrice,
         shares,
+        ourUsdc,
+        assumedSpent,
+        estimatedFee,
+        feeRateBps,
         err: err.message,
       });
       this.emit('copy-failed', { ev, err });
@@ -272,11 +322,51 @@ export class CopyTrader extends EventEmitter {
     return {
       target:     ev.target,
       tokenId:    ev.tokenId,
+      conditionId: ev.conditionId,
       slug:       ev.slug,
+      question:   ev.question,
+      outcome:    ev.outcome,
+      side:       ev.side,
       price:      ev.price,
       size:       ev.size,
-      usdc:       ev.usdc?.toFixed?.(2),
+      usdc:       ev.usdc,
       ageMs:      ev.ageMs,
+      timestamp:  ev.timestamp,
+      txHash:     ev.txHash,
+      source:     ev.source ?? null,
+      raw:        ev.raw ?? null,
+    };
+  }
+
+  _decisionSnapshot(ev) {
+    const cid = (ev.conditionId || '').toLowerCase();
+    const rollingHourSpent = this._rollingHourSpent();
+    const marketSpent = this.spentByMarket.get(cid) ?? 0;
+    return {
+      event: this._evSummary(ev),
+      sizingMode: COPY_SIZE_MODE,
+      fixedUsdc: COPY_FIXED_USDC,
+      ratio: COPY_RATIO,
+      filters: {
+        minPrice: COPY_MIN_PRICE,
+        maxPrice: COPY_MAX_PRICE,
+        maxSlippage: COPY_MAX_SLIPPAGE,
+        staleMs: COPY_STALE_MS,
+      },
+      caps: {
+        perTrade: COPY_MAX_USDC_PER_TRADE,
+        perMarket: COPY_MAX_USDC_PER_MARKET,
+        perHour: COPY_MAX_USDC_PER_HOUR,
+        total: COPY_MAX_USDC_TOTAL,
+      },
+      spendState: {
+        totalSpent: this.totalSpent,
+        rollingHourSpent,
+        marketSpent,
+        remainingPerMarket: COPY_MAX_USDC_PER_MARKET - marketSpent,
+        remainingPerHour: COPY_MAX_USDC_PER_HOUR - rollingHourSpent,
+        remainingTotal: COPY_MAX_USDC_TOTAL - this.totalSpent,
+      },
     };
   }
 }

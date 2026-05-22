@@ -35,6 +35,15 @@ function trimCache(map, maxSize) {
   }
 }
 
+function jsonSafe(value) {
+  if (typeof value === 'bigint') return value.toString();
+  if (Array.isArray(value)) return value.map(jsonSafe);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([key, entry]) => [key, jsonSafe(entry)]));
+  }
+  return value;
+}
+
 export class ChainActivityFeed extends EventEmitter {
   constructor(targets) {
     super();
@@ -161,8 +170,8 @@ export class ChainActivityFeed extends EventEmitter {
           receivedAt,
         },
         raw: {
-          log,
-          decoded,
+          log: jsonSafe(log),
+          decoded: jsonSafe(decoded),
         },
       });
     } catch (err) {

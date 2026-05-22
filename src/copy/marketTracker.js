@@ -17,10 +17,11 @@ export class CopyMarketTracker extends EventEmitter {
     this._traderPnlSource = String(traderPnlSource ?? 'API').toUpperCase();
   }
 
-  recordSimulatedCopy({ ev, shares, maxPrice, ourUsdc, estimatedFee, feeRateBps }) {
+  recordSimulatedCopy({ ev, shares, maxPrice, executionPrice, assumedSpent, ourUsdc, estimatedFee, feeRateBps, executionEstimate }) {
     const slug = ev.slug ?? ev.conditionId ?? ev.tokenId;
     const outcome = ev.outcome ?? ev.tokenId;
-    const spent = shares * maxPrice;
+    const price = Number.isFinite(Number(executionPrice)) ? Number(executionPrice) : maxPrice;
+    const spent = Number.isFinite(Number(assumedSpent)) ? Number(assumedSpent) : (shares * price);
     const market = this._getMarket(slug, {
       conditionId: ev.conditionId,
       question: ev.question,
@@ -33,13 +34,15 @@ export class CopyMarketTracker extends EventEmitter {
       spent,
       feeEstimate: Number(estimatedFee ?? 0),
       feeRateBps: Number(feeRateBps ?? 0),
+      executionEstimate: executionEstimate ?? null,
+      executionPrice: price,
       maxPrice,
       targetPrice: ev.price,
       requestedUsdc: ourUsdc,
       recordedAt: Date.now(),
     });
 
-    this.pnl.recordBuy(slug, outcome, maxPrice, shares);
+    this.pnl.recordBuy(slug, outcome, price, shares);
     this._ensureSettlementWatch(slug, market);
 
     logger.info('copy.dryRun: simulated buy recorded', {
@@ -55,6 +58,7 @@ export class CopyMarketTracker extends EventEmitter {
       question: market.question,
       outcome,
       shares,
+      executionPrice: price,
       maxPrice,
       spent,
       requestedUsdc: ourUsdc,
