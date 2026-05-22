@@ -383,7 +383,7 @@
           ['Dry-run Settled PnL', money(state.stats.dryRunSettledPnl ?? 0)],
           ['My Settled PnL', money(state.stats.ownSettledPnl ?? 0)],
           ['Skipped Settled PnL', money(state.stats.skippedSettledPnl ?? 0)],
-          ['Target Settled Fees', money(state.stats.targetSettledFeeValue ?? 0)],
+          ['Target Fee', money(state.stats.targetFeeValue ?? 0)],
           ['Target Settled PnL', money(state.stats.targetSettledPnl ?? 0)],
         ]
         : [
@@ -396,7 +396,7 @@
           ['Tracked Markets Settled', state.dryRun?.markets?.filter((item) => item.settled).length ?? 0],
           ['My Settled PnL', money(state.stats.ownSettledPnl ?? 0)],
           ['Skipped Settled PnL', money(state.stats.skippedSettledPnl ?? 0)],
-          ['Target Settled Fees', money(state.stats.targetSettledFeeValue ?? 0)],
+          ['Target Fee', money(state.stats.targetFeeValue ?? 0)],
           ['Target Settled PnL', money(state.stats.targetSettledPnl ?? 0)],
         ];
       topStatsEl.innerHTML = cards.map(([label, value]) => `
