@@ -272,6 +272,10 @@ export async function main() {
       price: ev.price,
       size: ev.size,
       usdc: ev.usdc?.toFixed?.(2) ?? ev.usdc,
+      feeAmount: ev.feeAmount ?? null,
+      feeUnit: ev.feeUnit ?? null,
+      feeValueUsdc: ev.feeValueUsdc ?? null,
+      feeSource: ev.feeSource ?? null,
       txHash: ev.txHash,
       seenAt: Date.now(),
     });

@@ -383,6 +383,7 @@
           ['Dry-run Settled PnL', money(state.stats.dryRunSettledPnl ?? 0)],
           ['My Settled PnL', money(state.stats.ownSettledPnl ?? 0)],
           ['Skipped Settled PnL', money(state.stats.skippedSettledPnl ?? 0)],
+          ['Target Settled Fees', money(state.stats.targetSettledFeeValue ?? 0)],
           ['Target Settled PnL', money(state.stats.targetSettledPnl ?? 0)],
         ]
         : [
@@ -395,6 +396,7 @@
           ['Tracked Markets Settled', state.dryRun?.markets?.filter((item) => item.settled).length ?? 0],
           ['My Settled PnL', money(state.stats.ownSettledPnl ?? 0)],
           ['Skipped Settled PnL', money(state.stats.skippedSettledPnl ?? 0)],
+          ['Target Settled Fees', money(state.stats.targetSettledFeeValue ?? 0)],
           ['Target Settled PnL', money(state.stats.targetSettledPnl ?? 0)],
         ];
       topStatsEl.innerHTML = cards.map(([label, value]) => `
@@ -459,6 +461,9 @@
               <div><dt>Price</dt><dd>${item.price}</dd></div>
               <div><dt>Size</dt><dd>${item.size}</dd></div>
               <div><dt>USDC</dt><dd>${item.usdc}</dd></div>
+              <div><dt>Exact Fee</dt><dd>${item.feeAmount == null ? '-' : item.feeAmount + ' ' + (item.feeUnit || '')}</dd></div>
+              <div><dt>Fee Value</dt><dd>${item.feeValueUsdc == null ? '-' : money(item.feeValueUsdc)}</dd></div>
+              <div><dt>Fee Source</dt><dd>${dashIfEmpty(item.feeSource)}</dd></div>
               <div><dt>Target</dt><dd>${item.target}</dd></div>
               <div><dt>Tx</dt><dd>${dashIfEmpty(item.txHash)}</dd></div>
             </dl>
@@ -563,6 +568,9 @@
                 <div><dt>PnL Source</dt><dd>${dashIfEmpty(item.actualTraderPnlSource)}</dd></div>
                 <div><dt>Trader Spend</dt><dd>${item.actualTraderSpent == null ? '-' : money(item.actualTraderSpent)}</dd></div>
                 <div><dt>Trader Redeemed</dt><dd>${item.actualTraderRedeemed == null ? '-' : money(item.actualTraderRedeemed)}</dd></div>
+                <div><dt>Trader Fee</dt><dd>${item.actualTraderFeeValue == null ? '-' : money(item.actualTraderFeeValue)}</dd></div>
+                <div><dt>Trader Fee Amount</dt><dd>${item.actualTraderFeeAmount == null ? '-' : item.actualTraderFeeAmount + ' ' + (item.actualTraderFeeUnit || '')}</dd></div>
+                <div><dt>Trader Fee Source</dt><dd>${dashIfEmpty(item.actualTraderFeeSource)}</dd></div>
                 <div><dt>Trader Trades</dt><dd>${item.actualTraderTradeCount ?? 0}</dd></div>
                 <div><dt>My PnL</dt><dd>${item.ownTraderPnl == null ? '-' : money(item.ownTraderPnl)}</dd></div>
                 <div><dt>My Source</dt><dd>${dashIfEmpty(item.ownTraderPnlSource)}</dd></div>

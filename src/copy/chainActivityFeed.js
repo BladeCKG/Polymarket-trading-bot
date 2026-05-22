@@ -144,7 +144,12 @@ export class ChainActivityFeed extends EventEmitter {
       const token = market.tokens?.find((entry) => String(entry.tokenId) === String(decoded.tokenId)) ?? null;
       const size = Number(decoded.takerAmountFilled) / USDC_SCALE;
       const usdc = Number(decoded.makerAmountFilled) / USDC_SCALE;
+      const feeAmount = Number(decoded.fee) / USDC_SCALE;
+      const price = usdc / size;
       if (!Number.isFinite(size) || !Number.isFinite(usdc) || size <= 0 || usdc <= 0) return;
+      const feeValueUsdc = Number.isFinite(feeAmount) && feeAmount >= 0
+        ? feeAmount * price
+        : null;
 
       this.emit('trade', {
         source: 'chain',
@@ -152,9 +157,13 @@ export class ChainActivityFeed extends EventEmitter {
         tokenId: decoded.tokenId,
         conditionId: market.conditionId?.toLowerCase?.() ?? '',
         side: 'BUY',
-        price: usdc / size,
+        price,
         size,
         usdc,
+        feeAmount: Number.isFinite(feeAmount) ? feeAmount : null,
+        feeUnit: 'SHARES',
+        feeValueUsdc,
+        feeSource: 'chain-exact',
         timestamp,
         ageMs,
         txHash: normaliseAddress(log.transactionHash),

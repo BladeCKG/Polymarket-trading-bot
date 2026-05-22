@@ -134,6 +134,10 @@ export class CopyMarketTracker extends EventEmitter {
       price: Number(ev.price ?? 0),
       size: Number(ev.size ?? 0),
       usdc: Number(ev.usdc ?? 0),
+      feeAmount: Number.isFinite(Number(ev.feeAmount)) ? Number(ev.feeAmount) : null,
+      feeUnit: ev.feeUnit ?? null,
+      feeValueUsdc: Number.isFinite(Number(ev.feeValueUsdc)) ? Number(ev.feeValueUsdc) : null,
+      feeSource: ev.feeSource ?? null,
       timestamp: Number(ev.timestamp ?? 0),
       txHash: ev.txHash?.toLowerCase?.() ?? '',
       slug: ev.slug ?? null,
@@ -190,6 +194,7 @@ export class CopyMarketTracker extends EventEmitter {
     let targetSettledSpent = 0;
     let targetSettledRedeemed = 0;
     let targetSettledPnl = 0;
+    let targetSettledFeeValue = 0;
     let ownSettledMarkets = 0;
     let ownSettledSpent = 0;
     let ownSettledRedeemed = 0;
@@ -214,6 +219,9 @@ export class CopyMarketTracker extends EventEmitter {
         }
         if (Number.isFinite(market.actualTraderRedeemed)) {
           targetSettledRedeemed += market.actualTraderRedeemed;
+        }
+        if (Number.isFinite(market.actualTraderFeeValue)) {
+          targetSettledFeeValue += market.actualTraderFeeValue;
         }
         if (Number.isFinite(market.ownTraderPnl)) {
           ownSettledMarkets++;
@@ -252,6 +260,7 @@ export class CopyMarketTracker extends EventEmitter {
       targetSettledSpent: targetSettledSpent.toFixed(2),
       targetSettledRedeemed: targetSettledRedeemed.toFixed(2),
       targetSettledPnl: targetSettledPnl.toFixed(2),
+      targetSettledFeeValue: targetSettledFeeValue.toFixed(2),
       ownSettledMarkets,
       ownSettledSpent: ownSettledSpent.toFixed(2),
       ownSettledRedeemed: ownSettledRedeemed.toFixed(2),
@@ -280,6 +289,10 @@ export class CopyMarketTracker extends EventEmitter {
         actualTraderTradeCount: market.actualTraderTradeCount ?? 0,
         actualTraderSpent: market.actualTraderSpent ?? null,
         actualTraderRedeemed: market.actualTraderRedeemed ?? null,
+        actualTraderFeeValue: market.actualTraderFeeValue ?? null,
+        actualTraderFeeAmount: market.actualTraderFeeAmount ?? null,
+        actualTraderFeeUnit: market.actualTraderFeeUnit ?? null,
+        actualTraderFeeSource: market.actualTraderFeeSource ?? null,
         ownTraderPnl: market.ownTraderPnl ?? null,
         ownTraderPnlSource: market.ownTraderPnlSource ?? null,
         ownTraderTradeCount: market.ownTraderTradeCount ?? 0,
@@ -309,6 +322,10 @@ export class CopyMarketTracker extends EventEmitter {
         actualTraderTradeCount: 0,
         actualTraderSpent: null,
         actualTraderRedeemed: null,
+        actualTraderFeeValue: null,
+        actualTraderFeeAmount: null,
+        actualTraderFeeUnit: null,
+        actualTraderFeeSource: null,
         ownTraderPnl: null,
         ownTraderPnlSource: null,
         ownTraderTradeCount: 0,
@@ -385,6 +402,11 @@ export class CopyMarketTracker extends EventEmitter {
     market.actualTraderTradeCount = actualTraderPnl?.tradeCount ?? 0;
     market.actualTraderSpent = actualTraderPnl?.spent ?? null;
     market.actualTraderRedeemed = actualTraderPnl?.redeemed ?? null;
+    const actualTraderFee = this._summarizeObservedTargetFees(market);
+    market.actualTraderFeeValue = actualTraderFee?.valueUsdc ?? null;
+    market.actualTraderFeeAmount = actualTraderFee?.amount ?? null;
+    market.actualTraderFeeUnit = actualTraderFee?.unit ?? null;
+    market.actualTraderFeeSource = actualTraderFee?.source ?? null;
     const ownTraderPnl = await this._fetchOwnTraderPnl(market);
     market.ownTraderPnl = ownTraderPnl?.pnl ?? null;
     market.ownTraderPnlSource = ownTraderPnl?.source ?? null;
@@ -406,6 +428,10 @@ export class CopyMarketTracker extends EventEmitter {
       pnl: this.pnl.marketPnl(slug).toFixed(2),
       actualTraderPnl: market.actualTraderPnl,
       actualTraderPnlSource: market.actualTraderPnlSource,
+      actualTraderFeeValue: market.actualTraderFeeValue,
+      actualTraderFeeAmount: market.actualTraderFeeAmount,
+      actualTraderFeeUnit: market.actualTraderFeeUnit,
+      actualTraderFeeSource: market.actualTraderFeeSource,
       ownTraderPnl: market.ownTraderPnl,
       ownTraderPnlSource: market.ownTraderPnlSource,
       skippedPnl: market.skippedPnl,
@@ -667,6 +693,34 @@ export class CopyMarketTracker extends EventEmitter {
       spent,
       redeemed,
       pnl: redeemed - spent,
+    };
+  }
+
+  _summarizeObservedTargetFees(market) {
+    if (!market.targetTrades.length) return null;
+
+    let valueUsdc = 0;
+    let amount = 0;
+    let foundAny = false;
+    let unit = null;
+
+    for (const trade of market.targetTrades) {
+      if (!Number.isFinite(trade.feeValueUsdc) || trade.feeValueUsdc < 0) continue;
+      foundAny = true;
+      valueUsdc += trade.feeValueUsdc;
+      if (Number.isFinite(trade.feeAmount) && trade.feeAmount >= 0) {
+        amount += trade.feeAmount;
+        if (!unit) unit = trade.feeUnit ?? null;
+        else if (unit !== (trade.feeUnit ?? null)) unit = 'MIXED';
+      }
+    }
+
+    if (!foundAny) return null;
+    return {
+      valueUsdc,
+      amount,
+      unit,
+      source: 'observedChainFee',
     };
   }
 
