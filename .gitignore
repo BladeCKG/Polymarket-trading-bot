@@ -26,3 +26,4 @@ Thumbs.db
 # Analysis output (raw data dumps, not source)
 out/
 first_line.json
+logs/
