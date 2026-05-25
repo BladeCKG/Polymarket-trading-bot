@@ -127,6 +127,10 @@ export async function main() {
       symbols: VALUE_SYMBOLS,
       durations: VALUE_DURATIONS,
     });
+    logger.info('value.main: markets refreshed', {
+      count: markets.length,
+      slugs: markets.slice(0, 12).map((market) => market.slug),
+    });
     engine.syncMarkets(markets);
     dashboard?.setStats(engine.stats());
   };

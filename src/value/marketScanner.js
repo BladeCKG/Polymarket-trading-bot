@@ -61,38 +61,55 @@ function normalizeMarketRecord(market) {
   };
 }
 
-function matchesShortDurationCryptoMarket(market, symbols, durations) {
-  const slug = String(market.slug ?? '').toLowerCase();
-  if (!slug) return false;
-  return symbols.some((symbol) =>
-    durations.some((duration) => slug.startsWith(`${symbol}-updown-${duration}-`))
-  );
+function durationSecondsFor(duration) {
+  return DURATION_SECONDS[duration] ?? null;
+}
+
+function windowStartsForDuration(durationSeconds, nowTs) {
+  const currentStart = Math.floor(nowTs / durationSeconds) * durationSeconds;
+  return [
+    currentStart - durationSeconds,
+    currentStart,
+    currentStart + durationSeconds,
+    currentStart + (2 * durationSeconds),
+  ];
+}
+
+function unique(values) {
+  return [...new Set(values)];
+}
+
+async function fetchMarketBySlug(slug) {
+  try {
+    const res = await axios.get(`${GAMMA_API_URL}/markets/slug/${slug}`, {
+      timeout: 10_000,
+    });
+    return res.data;
+  } catch (err) {
+    if (err.response?.status === 404) return null;
+    throw err;
+  }
 }
 
 export async function fetchActiveValueMarkets({
   symbols,
   durations,
-  pageSize = 200,
-  maxPages = 5,
 } = {}) {
-  const rows = [];
-  for (let page = 0; page < maxPages; page++) {
-    const res = await axios.get(`${GAMMA_API_URL}/markets`, {
-      timeout: 10_000,
-      params: {
-        limit: pageSize,
-        offset: page * pageSize,
-      },
-    });
-    const batch = Array.isArray(res.data) ? res.data : [];
-    if (!batch.length) break;
-    rows.push(...batch);
-    if (batch.length < pageSize) break;
-  }
-
   const nowTs = Math.floor(Date.now() / 1000);
-  return rows
-    .filter((market) => matchesShortDurationCryptoMarket(market, symbols, durations))
+  const candidateSlugs = unique(
+    symbols.flatMap((symbol) =>
+      durations.flatMap((duration) => {
+        const durationSeconds = durationSecondsFor(duration);
+        if (!durationSeconds) return [];
+        return windowStartsForDuration(durationSeconds, nowTs).map((windowTs) =>
+          `${symbol}-updown-${duration}-${windowTs}`
+        );
+      })
+    )
+  );
+
+  const markets = await Promise.all(candidateSlugs.map((slug) => fetchMarketBySlug(slug)));
+  return markets
     .map(normalizeMarketRecord)
     .filter(Boolean)
     .filter((market) => market.active && !market.closed && market.closeTs > nowTs);
