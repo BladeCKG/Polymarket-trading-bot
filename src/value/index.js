@@ -15,9 +15,9 @@ import {
   VALUE_DASHBOARD_PORT,
   VALUE_DRY_RUN,
   VALUE_DURATIONS,
+  VALUE_ENDGAME_EXIT_BELOW_PRICE,
   VALUE_ENTRY_MAX_PRICE,
   VALUE_ENTRY_MIN_PRICE,
-  VALUE_ENDGAME_HOLD_WINNER_PRICE,
   VALUE_FIRST_LEG_CUTOFF_SECONDS,
   VALUE_LEG_USDC,
   VALUE_MARKET_REFRESH_MS,
@@ -50,7 +50,7 @@ export async function main() {
     orderMode: VALUE_ORDER_MODE,
     legUsdc: VALUE_LEG_USDC,
     targetShares: VALUE_TARGET_SHARES,
-    endgameHoldWinnerPrice: VALUE_ENDGAME_HOLD_WINNER_PRICE,
+    endgameExitBelowPrice: VALUE_ENDGAME_EXIT_BELOW_PRICE,
   });
 
   const traceFile = new ValueTraceFile();
@@ -67,7 +67,7 @@ export async function main() {
     orderMode: VALUE_ORDER_MODE,
     legUsdc: VALUE_LEG_USDC,
     targetShares: VALUE_TARGET_SHARES,
-    endgameHoldWinnerPrice: VALUE_ENDGAME_HOLD_WINNER_PRICE,
+    endgameExitBelowPrice: VALUE_ENDGAME_EXIT_BELOW_PRICE,
   });
   logger.info('value.main: trace file enabled', { path: tracePath });
 
@@ -93,7 +93,7 @@ export async function main() {
         targetShares: VALUE_TARGET_SHARES,
         firstLegCutoffSeconds: VALUE_FIRST_LEG_CUTOFF_SECONDS,
         secondLegCutoffSeconds: VALUE_SECOND_LEG_CUTOFF_SECONDS,
-        endgameHoldWinnerPrice: VALUE_ENDGAME_HOLD_WINNER_PRICE,
+        endgameExitBelowPrice: VALUE_ENDGAME_EXIT_BELOW_PRICE,
         maxOpenMarkets: VALUE_MAX_OPEN_MARKETS,
         maxStrandedLegs: VALUE_MAX_STRANDED_LEGS,
       },

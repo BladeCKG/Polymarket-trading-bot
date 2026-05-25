@@ -4,10 +4,10 @@ import { ClobClient } from '../clob.js';
 import { waitForResolution } from '../market.js';
 import {
   VALUE_DRY_RUN,
+  VALUE_ENDGAME_EXIT_BELOW_PRICE,
   VALUE_ENTRY_MIN_PRICE,
   VALUE_ENTRY_MAX_PRICE,
   VALUE_FIRST_LEG_CUTOFF_SECONDS,
-  VALUE_ENDGAME_HOLD_WINNER_PRICE,
   VALUE_LEG_USDC,
   VALUE_MAX_OPEN_MARKETS,
   VALUE_MAX_SLIPPAGE,
@@ -57,9 +57,16 @@ export class ValueStrategyEngine extends EventEmitter {
       const existing = this.markets.get(market.slug);
       if (existing) {
         Object.assign(existing, market);
+        if ((existing.closed || existing.resolved) && this._hasOpenExposure(existing)) {
+          this._ensureSettlementWatch(existing);
+        }
         continue;
       }
-      this.markets.set(market.slug, this._createMarketState(market));
+      const created = this._createMarketState(market);
+      this.markets.set(market.slug, created);
+      if ((created.closed || created.resolved) && this._hasOpenExposure(created)) {
+        this._ensureSettlementWatch(created);
+      }
     }
 
     for (const [slug, market] of this.markets) {
@@ -124,6 +131,8 @@ export class ValueStrategyEngine extends EventEmitter {
         positionType: this._positionType(market),
         enteredLegs: this._enteredLegs(market),
         winningOutcome: this._winningOutcome(market),
+        upFinalValue: this._outcomePayout(market, 'Up'),
+        downFinalValue: this._outcomePayout(market, 'Down'),
         upAsk: market.quote.Up?.bestAsk ?? null,
         upBid: market.quote.Up?.bestBid ?? null,
         downAsk: market.quote.Down?.bestAsk ?? null,
@@ -150,6 +159,14 @@ export class ValueStrategyEngine extends EventEmitter {
       }));
   }
 
+  _outcomePayout(market, outcomeName) {
+    if (!Array.isArray(market.outcomes) || !Array.isArray(market.payouts)) return null;
+    const index = market.outcomes.findIndex((outcome) => outcome === outcomeName);
+    if (index < 0) return null;
+    const payout = Number(market.payouts[index] ?? 0);
+    return Number.isFinite(payout) ? payout : null;
+  }
+
   _createMarketState(market) {
     return {
       ...market,
@@ -172,7 +189,6 @@ export class ValueStrategyEngine extends EventEmitter {
       hadAnyTrade: false,
       outcomes: [],
       payouts: [],
-      endgameHoldSide: null,
     };
   }
 
@@ -235,16 +251,14 @@ export class ValueStrategyEngine extends EventEmitter {
       this._getBookIfLive(market, 'Down', market.downToken.tokenId),
     ]);
 
-    if (!upBook || !downBook) {
-      market.quote.Up = { bestAsk: upBook ? (bestAskFromBook(upBook)?.price ?? null) : null };
-      market.quote.Down = { bestAsk: downBook ? (bestAskFromBook(downBook)?.price ?? null) : null };
-      return;
-    }
-
-    market.quote.Up = { bestAsk: bestAskFromBook(upBook)?.price ?? null };
-    market.quote.Down = { bestAsk: bestAskFromBook(downBook)?.price ?? null };
-    market.quote.Up.bestBid = bestBidFromBook(upBook)?.price ?? null;
-    market.quote.Down.bestBid = bestBidFromBook(downBook)?.price ?? null;
+    market.quote.Up = {
+      bestAsk: upBook ? (bestAskFromBook(upBook)?.price ?? null) : null,
+      bestBid: upBook ? (bestBidFromBook(upBook)?.price ?? null) : null,
+    };
+    market.quote.Down = {
+      bestAsk: downBook ? (bestAskFromBook(downBook)?.price ?? null) : null,
+      bestBid: downBook ? (bestBidFromBook(downBook)?.price ?? null) : null,
+    };
 
     const timeLeftSec = market.closeTs - nowSec();
     if (timeLeftSec <= 0) {
@@ -257,8 +271,8 @@ export class ValueStrategyEngine extends EventEmitter {
       if (this._countStrandedLegs() >= VALUE_MAX_STRANDED_LEGS) return;
       if (timeLeftSec <= VALUE_FIRST_LEG_CUTOFF_SECONDS) return;
 
-      const upInBand = this._isInBand(market.quote.Up?.bestAsk);
-      const downInBand = this._isInBand(market.quote.Down?.bestAsk);
+      const upInBand = upBook && this._isInBand(market.quote.Up?.bestAsk);
+      const downInBand = downBook && this._isInBand(market.quote.Down?.bestAsk);
       if (upInBand) await this._enterLeg(market, 'Up', upBook);
       if (downInBand && market.state === 'NONE') await this._enterLeg(market, 'Down', downBook);
       return;
@@ -269,7 +283,7 @@ export class ValueStrategyEngine extends EventEmitter {
         await this._handleEndgame(market, 'Up', upBook, 'Down', downBook);
         return;
       }
-      if (this._isSecondLegEligible(market.quote.Down?.bestAsk)) {
+      if (downBook && this._isSecondLegEligible(market.quote.Down?.bestAsk)) {
         await this._enterLeg(market, 'Down', downBook);
       }
       return;
@@ -280,7 +294,7 @@ export class ValueStrategyEngine extends EventEmitter {
         await this._handleEndgame(market, 'Down', downBook, 'Up', upBook);
         return;
       }
-      if (this._isSecondLegEligible(market.quote.Up?.bestAsk)) {
+      if (upBook && this._isSecondLegEligible(market.quote.Up?.bestAsk)) {
         await this._enterLeg(market, 'Up', upBook);
       }
     }
@@ -454,56 +468,65 @@ export class ValueStrategyEngine extends EventEmitter {
   }
 
   async _handleEndgame(market, openSide, openBook, oppositeSide, oppositeBook) {
-    if (this._shouldHoldWinnerIntoSettlement(market, openSide, openBook)) {
-      if (market.endgameHoldSide !== openSide) {
-        const legQuote = market.quote?.[openSide] ?? {};
-        const holdPrice = Number.isFinite(legQuote.bestBid) ? legQuote.bestBid : legQuote.bestAsk;
-        market.endgameHoldSide = openSide;
-        market.lastAction = `${VALUE_DRY_RUN ? 'dry-run' : 'hold'} ${openSide.toLowerCase()} winner @ ${Number(holdPrice).toFixed(4)}`;
-        this.actions += 1;
-        this.emit('action', {
-          type: 'hold-winner',
-          slug: market.slug,
-          side: openSide,
-          state: market.state,
-          spent: 0,
-          shares: this._openShares(market.legs[openSide]),
-          price: holdPrice,
-          threshold: VALUE_ENDGAME_HOLD_WINNER_PRICE,
-          timestamp: Date.now(),
-        });
-        logger.info('value.engine: holding apparent winner into settlement', {
-          slug: market.slug,
-          side: openSide,
-          state: market.state,
-          bestBid: legQuote.bestBid ?? null,
-          bestAsk: legQuote.bestAsk ?? null,
-          threshold: VALUE_ENDGAME_HOLD_WINNER_PRICE,
-          dryRun: VALUE_DRY_RUN,
-        });
-        this.emit('markets-updated', this.snapshotMarkets());
-      }
+    if (!openBook) {
+      market.lastAction = `endgame skipped - no ${openSide.toLowerCase()} book`;
+      this._ensureSettlementWatch(market);
+      this.emit('markets-updated', this.snapshotMarkets());
+      logger.info('value.engine: endgame skipped, open-leg book unavailable', {
+        slug: market.slug,
+        openSide,
+        oppositeSide,
+        dryRun: VALUE_DRY_RUN,
+      });
+      return;
+    }
+
+    if (!this._shouldExitStrandedLeg(market, openSide, openBook)) {
+      const legQuote = market.quote?.[openSide] ?? {};
+      const holdPrice = Number.isFinite(legQuote.bestBid) ? legQuote.bestBid : legQuote.bestAsk;
+      market.lastAction = `holding ${openSide.toLowerCase()} into settlement @ ${Number(holdPrice).toFixed(4)}`;
+      logger.info('value.engine: keeping stranded leg into settlement', {
+        slug: market.slug,
+        side: openSide,
+        state: market.state,
+        bestBid: legQuote.bestBid ?? null,
+        bestAsk: legQuote.bestAsk ?? null,
+        exitBelowPrice: VALUE_ENDGAME_EXIT_BELOW_PRICE,
+        dryRun: VALUE_DRY_RUN,
+      });
+      this.emit('markets-updated', this.snapshotMarkets());
       this._ensureSettlementWatch(market);
       return;
     }
 
-    market.endgameHoldSide = null;
     const flattened = await this._flattenOpenLeg(market, openSide, openBook);
     if (flattened) return;
+    if (!oppositeBook) {
+      market.lastAction = `endgame no ${oppositeSide.toLowerCase()} book after flatten failed`;
+      this._ensureSettlementWatch(market);
+      this.emit('markets-updated', this.snapshotMarkets());
+      logger.info('value.engine: force-pair skipped, opposite-leg book unavailable', {
+        slug: market.slug,
+        openSide,
+        oppositeSide,
+        dryRun: VALUE_DRY_RUN,
+      });
+      return;
+    }
     await this._enterLeg(market, oppositeSide, oppositeBook, { force: true });
   }
 
-  _shouldHoldWinnerIntoSettlement(market, side, book) {
+  _shouldExitStrandedLeg(market, side, book) {
     const leg = market.legs[side];
     if (!leg?.entered || this._openShares(leg) <= 1e-9) return false;
-    if (!Number.isFinite(VALUE_ENDGAME_HOLD_WINNER_PRICE) || VALUE_ENDGAME_HOLD_WINNER_PRICE <= 0) {
+    if (!Number.isFinite(VALUE_ENDGAME_EXIT_BELOW_PRICE) || VALUE_ENDGAME_EXIT_BELOW_PRICE <= 0) {
       return false;
     }
 
     const bestBid = bestBidFromBook(book)?.price ?? null;
     const bestAsk = bestAskFromBook(book)?.price ?? null;
     const signalPrice = Number.isFinite(bestBid) ? bestBid : bestAsk;
-    return Number.isFinite(signalPrice) && signalPrice >= VALUE_ENDGAME_HOLD_WINNER_PRICE;
+    return Number.isFinite(signalPrice) && signalPrice < VALUE_ENDGAME_EXIT_BELOW_PRICE;
   }
 
   async _flattenOpenLeg(market, side, book) {

@@ -56,6 +56,8 @@ function normalizeMarketRecord(market) {
     closeTs: windowTs + durationSeconds,
     active: market.active ?? !market.closed,
     closed: Boolean(market.closed),
+    resolved: Boolean(market.resolved ?? market.is_resolved ?? market.closed),
+    acceptingOrders: Boolean(market.acceptingOrders ?? market.accepting_orders ?? true),
     upToken,
     downToken,
   };
@@ -136,6 +138,7 @@ export async function fetchActiveValueMarkets({
     .filter((market) =>
       market.active &&
       !market.closed &&
+      market.acceptingOrders &&
       market.windowTs <= nowTs &&
       market.closeTs > nowTs
     );
