@@ -103,7 +103,7 @@ function buildHeaders(method, path, body = '') {
 }
 
 // ── REST base call ────────────────────────────────────────────────────────────
-async function restCall(method, path, data = null, auth = true) {
+async function restCall(method, path, data = null, auth = true, options = {}) {
   const url    = CLOB_API_URL + path;
   const body   = data ? JSON.stringify(data) : '';
   const config = {
@@ -118,6 +118,7 @@ async function restCall(method, path, data = null, auth = true) {
   } catch (err) {
     const status = err.response?.status;
     const detail = err.response?.data;
+    const quietStatuses = new Set(options.quietStatuses ?? []);
     if (
       auth &&
       status === 401 &&
@@ -134,7 +135,9 @@ async function restCall(method, path, data = null, auth = true) {
       const retryRes = await axios(retryConfig);
       return retryRes.data;
     }
-    logger.error('CLOB REST error', { method, path, status, detail });
+    if (!quietStatuses.has(status)) {
+      logger.error('CLOB REST error', { method, path, status, detail });
+    }
     throw err;
   }
 }
@@ -396,8 +399,14 @@ export class ClobClient {
    *               the CLOB rejects the order with INVALID_ORDER_MIN_TICK_SIZE.
    * minOrderSize – minimum order size in USDC (typically 5).
    */
-  static async getBook(tokenId) {
-    const raw = await restCall('GET', `/book?token_id=${tokenId}`, null, false);
+  static async getBook(tokenId, { quietNotFound = false } = {}) {
+    const raw = await restCall(
+      'GET',
+      `/book?token_id=${tokenId}`,
+      null,
+      false,
+      quietNotFound ? { quietStatuses: [404] } : {},
+    );
     return {
       bids:         (raw.bids ?? []).map(b => ({ price: parseFloat(b.price), size: parseFloat(b.size) })),
       asks:         (raw.asks ?? []).map(a => ({ price: parseFloat(a.price), size: parseFloat(a.size) })),

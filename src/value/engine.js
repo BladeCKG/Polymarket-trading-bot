@@ -240,7 +240,7 @@ export class ValueStrategyEngine extends EventEmitter {
 
   async _getBookIfLive(market, side, tokenId) {
     try {
-      return await ClobClient.getBook(tokenId);
+      return await ClobClient.getBook(tokenId, { quietNotFound: true });
     } catch (err) {
       if (err.response?.status === 404) {
         logger.debug('value.engine: orderbook not live yet', {
