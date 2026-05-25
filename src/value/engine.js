@@ -612,7 +612,7 @@ export class ValueStrategyEngine extends EventEmitter {
 
   _entryMaxPrice(market, bestAsk, force = false) {
     if (force) {
-      return Math.min(0.99, Number((bestAsk + VALUE_MAX_SLIPPAGE).toFixed(4)));
+      return 0.99;
     }
     if (market.state === 'NONE') {
       return Math.min(
@@ -730,7 +730,7 @@ export class ValueStrategyEngine extends EventEmitter {
       return false;
     }
 
-    const minPrice = Math.max(0.01, Number((bestBid.price - VALUE_MAX_SLIPPAGE).toFixed(4)));
+    const minPrice = 0.01;
     const plan = estimateSellProceedsForSharesFromBook(book, openShares, minPrice);
     if (!plan || !plan.fullyFilled || plan.soldShares <= 0 || plan.proceedsUsdc <= 0) {
       this._emitDecision(market, {
