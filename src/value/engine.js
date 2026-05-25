@@ -5,6 +5,7 @@ import { waitForResolution } from '../market.js';
 import {
   VALUE_DRY_RUN,
   VALUE_ENDGAME_EXIT_BELOW_PRICE,
+  VALUE_IMMEDIATE_EXIT_BELOW_PRICE,
   VALUE_ENTRY_MIN_PRICE,
   VALUE_ENTRY_MAX_PRICE,
   VALUE_FIRST_LEG_CUTOFF_SECONDS,
@@ -363,6 +364,10 @@ export class ValueStrategyEngine extends EventEmitter {
     }
 
     if (market.state === 'WAIT_DOWN') {
+      if (this._shouldImmediateExitStrandedLeg(market, 'Up', upBook)) {
+        await this._handleEndgame(market, 'Up', upBook, 'Down', downBook, { immediate: true });
+        return;
+      }
       if (timeLeftSec <= VALUE_SECOND_LEG_CUTOFF_SECONDS) {
         await this._handleEndgame(market, 'Up', upBook, 'Down', downBook);
         return;
@@ -391,6 +396,10 @@ export class ValueStrategyEngine extends EventEmitter {
     }
 
     if (market.state === 'WAIT_UP') {
+      if (this._shouldImmediateExitStrandedLeg(market, 'Down', downBook)) {
+        await this._handleEndgame(market, 'Down', downBook, 'Up', upBook, { immediate: true });
+        return;
+      }
       if (timeLeftSec <= VALUE_SECOND_LEG_CUTOFF_SECONDS) {
         await this._handleEndgame(market, 'Down', downBook, 'Up', upBook);
         return;
@@ -623,11 +632,11 @@ export class ValueStrategyEngine extends EventEmitter {
     return Math.min(0.99, Number((bestAsk + VALUE_MAX_SLIPPAGE).toFixed(4)));
   }
 
-  async _handleEndgame(market, openSide, openBook, oppositeSide, oppositeBook) {
+  async _handleEndgame(market, openSide, openBook, oppositeSide, oppositeBook, { immediate = false } = {}) {
     if (!openBook) {
-      market.lastAction = `endgame skipped - no ${openSide.toLowerCase()} book`;
+      market.lastAction = `${immediate ? 'immediate-exit' : 'endgame'} skipped - no ${openSide.toLowerCase()} book`;
       this._emitDecision(market, {
-        type: 'endgame',
+        type: immediate ? 'immediate-exit' : 'endgame',
         side: openSide,
         reason: 'open-leg-book-unavailable',
         openSide,
@@ -635,7 +644,7 @@ export class ValueStrategyEngine extends EventEmitter {
       });
       this._ensureSettlementWatch(market);
       this.emit('markets-updated', this.snapshotMarkets());
-      logger.info('value.engine: endgame skipped, open-leg book unavailable', {
+      logger.info(`value.engine: ${immediate ? 'immediate exit' : 'endgame'} skipped, open-leg book unavailable`, {
         slug: market.slug,
         openSide,
         oppositeSide,
@@ -644,7 +653,7 @@ export class ValueStrategyEngine extends EventEmitter {
       return;
     }
 
-    if (!this._shouldExitStrandedLeg(market, openSide, openBook)) {
+    if (!immediate && !this._shouldExitStrandedLeg(market, openSide, openBook)) {
       const legQuote = market.quote?.[openSide] ?? {};
       const holdPrice = Number.isFinite(legQuote.bestBid) ? legQuote.bestBid : legQuote.bestAsk;
       market.lastAction = `holding ${openSide.toLowerCase()} into settlement @ ${Number(holdPrice).toFixed(4)}`;
@@ -674,9 +683,9 @@ export class ValueStrategyEngine extends EventEmitter {
     const flattened = await this._flattenOpenLeg(market, openSide, openBook);
     if (flattened) return;
     if (!oppositeBook) {
-      market.lastAction = `endgame no ${oppositeSide.toLowerCase()} book after flatten failed`;
+      market.lastAction = `${immediate ? 'immediate-exit' : 'endgame'} no ${oppositeSide.toLowerCase()} book after flatten failed`;
       this._emitDecision(market, {
-        type: 'endgame',
+        type: immediate ? 'immediate-exit' : 'endgame',
         side: oppositeSide,
         reason: 'force-pair-no-opposite-book',
         openSide,
@@ -684,7 +693,7 @@ export class ValueStrategyEngine extends EventEmitter {
       });
       this._ensureSettlementWatch(market);
       this.emit('markets-updated', this.snapshotMarkets());
-      logger.info('value.engine: force-pair skipped, opposite-leg book unavailable', {
+      logger.info(`value.engine: ${immediate ? 'immediate exit' : 'force-pair'} skipped, opposite-leg book unavailable`, {
         slug: market.slug,
         openSide,
         oppositeSide,
@@ -693,6 +702,19 @@ export class ValueStrategyEngine extends EventEmitter {
       return;
     }
     await this._enterLeg(market, oppositeSide, oppositeBook, { force: true });
+  }
+
+  _shouldImmediateExitStrandedLeg(market, side, book) {
+    const leg = market.legs[side];
+    if (!leg?.entered || this._openShares(leg) <= 1e-9) return false;
+    if (!Number.isFinite(VALUE_IMMEDIATE_EXIT_BELOW_PRICE) || VALUE_IMMEDIATE_EXIT_BELOW_PRICE <= 0) {
+      return false;
+    }
+
+    const bestBid = bestBidFromBook(book)?.price ?? null;
+    const bestAsk = bestAskFromBook(book)?.price ?? null;
+    const signalPrice = Number.isFinite(bestBid) ? bestBid : bestAsk;
+    return Number.isFinite(signalPrice) && signalPrice < VALUE_IMMEDIATE_EXIT_BELOW_PRICE;
   }
 
   _shouldExitStrandedLeg(market, side, book) {
