@@ -96,11 +96,14 @@ export class ValueStrategyEngine extends EventEmitter {
     const strandedOpen = openMarkets.filter((market) =>
       market.state === 'WAIT_UP' || market.state === 'WAIT_DOWN'
     ).length;
-    const closedMarkets = markets.filter((market) => market.settled || market.state === 'FLAT').length;
+    const closed = markets.filter((market) => market.settled || market.state === 'FLAT');
+    const closedMarkets = closed.length;
     const openCost = openMarkets.reduce((sum, market) => sum + market.totalCost - market.cashProceeds, 0);
-    const settledPnl = markets
-      .filter((market) => market.settled || market.state === 'FLAT')
-      .reduce((sum, market) => sum + Number(market.pnl ?? 0), 0);
+    const settledPnl = closed.reduce((sum, market) => sum + Number(market.pnl ?? 0), 0);
+    const profitMarkets = closed.filter((market) => Number(market.pnl ?? 0) > 0).length;
+    const lossMarkets = closed.filter((market) => Number(market.pnl ?? 0) < 0).length;
+    const flatMarkets = closed.filter((market) => Number(market.pnl ?? 0) === 0).length;
+    const forcePairedMarkets = markets.filter((market) => market.hadForcePair).length;
 
     return {
       trackedMarkets: markets.length,
@@ -108,6 +111,10 @@ export class ValueStrategyEngine extends EventEmitter {
       pairedOpenMarkets: pairedOpen,
       strandedOpenMarkets: strandedOpen,
       settledMarkets: closedMarkets,
+      profitMarkets,
+      lossMarkets,
+      flatMarkets,
+      forcePairedMarkets,
       openCost: openCost.toFixed(2),
       settledPnl: settledPnl.toFixed(2),
       actions: this.actions,
@@ -187,6 +194,7 @@ export class ValueStrategyEngine extends EventEmitter {
       settledAt: null,
       hasAnyLeg: false,
       hadAnyTrade: false,
+      hadForcePair: false,
       outcomes: [],
       payouts: [],
     };
@@ -370,6 +378,7 @@ export class ValueStrategyEngine extends EventEmitter {
       market.totalCost += leg.spent;
       market.hasAnyLeg = true;
       market.hadAnyTrade = true;
+      if (force) market.hadForcePair = true;
       if (!market.firstSide) market.firstSide = side;
       market.lastAction = `${VALUE_DRY_RUN ? 'dry-run' : 'buy'} ${side.toLowerCase()} @ ${leg.avgPrice.toFixed(4)}`;
       market.state = this._computeState(market);
