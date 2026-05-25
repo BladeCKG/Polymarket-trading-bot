@@ -259,22 +259,29 @@
             <div class="span-3"><dt>Question</dt><dd>${dash(item.question)}</dd></div>
             <div><dt>Closes</dt><dd>${ts(item.closeTs * 1000)}</dd></div>
             <div><dt>Time Left</dt><dd>${dash(item.timeLeftSec)}</dd></div>
-            <div><dt>Up Ask</dt><dd>${dash(item.upAsk)}</dd></div>
-            <div><dt>Down Ask</dt><dd>${dash(item.downAsk)}</dd></div>
             <div><dt>Band</dt><dd>${dash(item.entryBand)}</dd></div>
             <div><dt>Chosen Side</dt><dd>${dash(item.firstSide)}</dd></div>
-            <div><dt>Up Status</dt><dd>${dash(item.upStatus)}</dd></div>
-            <div><dt>Up Spend</dt><dd>${money(item.upSpent)}</dd></div>
-            <div><dt>Up Shares</dt><dd>${dash(item.upShares)}</dd></div>
-            <div><dt>Up Avg Px</dt><dd>${dash(item.upPrice)}</dd></div>
-            <div><dt>Down Status</dt><dd>${dash(item.downStatus)}</dd></div>
-            <div><dt>Down Spend</dt><dd>${money(item.downSpent)}</dd></div>
-            <div><dt>Down Shares</dt><dd>${dash(item.downShares)}</dd></div>
-            <div><dt>Down Avg Px</dt><dd>${dash(item.downPrice)}</dd></div>
+            <div><dt>Up Ask</dt><dd>${dash(item.upAsk)}</dd></div>
+            <div><dt>Down Ask</dt><dd>${dash(item.downAsk)}</dd></div>
+            <div><dt>Position</dt><dd>${dash(item.positionType)}</dd></div>
+            <div><dt>Entered Legs</dt><dd>${item.enteredLegs?.length ? item.enteredLegs.join(', ') : '-'}</dd></div>
+            <div><dt>Winner</dt><dd>${dash(item.winningOutcome)}</dd></div>
+            <div><dt>Leg</dt><dd>Up</dd></div>
+            <div><dt>Status</dt><dd>${dash(item.upStatus)}</dd></div>
+            <div><dt>Spend</dt><dd>${money(item.upSpent)}</dd></div>
+            <div><dt>Shares</dt><dd>${dash(item.upShares)}</dd></div>
+            <div><dt>Avg Px</dt><dd>${dash(item.upPrice)}</dd></div>
+            <div><dt>Leg</dt><dd>Down</dd></div>
+            <div><dt>Status</dt><dd>${dash(item.downStatus)}</dd></div>
+            <div><dt>Spend</dt><dd>${money(item.downSpent)}</dd></div>
+            <div><dt>Shares</dt><dd>${dash(item.downShares)}</dd></div>
+            <div><dt>Avg Px</dt><dd>${dash(item.downPrice)}</dd></div>
+            <div><dt>Summary</dt><dd>Totals</dd></div>
             <div><dt>Total Cost</dt><dd>${money(item.totalCost)}</dd></div>
             <div><dt>Redeemed</dt><dd>${money(item.redeemed)}</dd></div>
             <div><dt>PnL</dt><dd>${money(item.pnl)}</dd></div>
-            <div class="span-2"><dt>Last Action</dt><dd>${dash(item.lastAction)}</dd></div>
+            <div><dt>State</dt><dd>${dash(item.state)}</dd></div>
+            <div class="span-5"><dt>Last Action</dt><dd>${dash(item.lastAction)}</dd></div>
           </dl>
         </article>
       `));

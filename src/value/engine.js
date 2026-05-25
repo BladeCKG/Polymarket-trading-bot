@@ -111,6 +111,9 @@ export class ValueStrategyEngine extends EventEmitter {
         state: market.state,
         entryBand: `${VALUE_ENTRY_MIN_PRICE.toFixed(2)}-${VALUE_ENTRY_MAX_PRICE.toFixed(2)}`,
         firstSide: market.firstSide,
+        positionType: this._positionType(market),
+        enteredLegs: this._enteredLegs(market),
+        winningOutcome: this._winningOutcome(market),
         upAsk: market.quote.Up?.bestAsk ?? null,
         downAsk: market.quote.Down?.bestAsk ?? null,
         upStatus: market.legs.Up.entered ? 'entered' : 'waiting',
@@ -149,6 +152,29 @@ export class ValueStrategyEngine extends EventEmitter {
       outcomes: [],
       payouts: [],
     };
+  }
+
+  _positionType(market) {
+    const up = market.legs.Up.entered;
+    const down = market.legs.Down.entered;
+    if (up && down) return 'Paired';
+    if (up) return 'Up only';
+    if (down) return 'Down only';
+    return 'None';
+  }
+
+  _enteredLegs(market) {
+    return ['Up', 'Down'].filter((side) => market.legs[side].entered);
+  }
+
+  _winningOutcome(market) {
+    if (!market.settled) return null;
+    const pairs = (market.outcomes ?? []).map((outcome, index) => ({
+      outcome,
+      payout: Number(market.payouts?.[index] ?? 0),
+    }));
+    const winner = pairs.find((pair) => pair.payout > 0);
+    return winner?.outcome ?? null;
   }
 
   _emptyLeg(tokenId) {
@@ -192,7 +218,7 @@ export class ValueStrategyEngine extends EventEmitter {
 
     if (market.state === 'WAIT_DOWN') {
       if (timeLeftSec <= VALUE_SECOND_LEG_CUTOFF_SECONDS) return;
-      if (this._isInBand(market.quote.Down?.bestAsk)) {
+      if (this._isSecondLegEligible(market.quote.Down?.bestAsk)) {
         await this._enterLeg(market, 'Down', downBook);
       }
       return;
@@ -200,7 +226,7 @@ export class ValueStrategyEngine extends EventEmitter {
 
     if (market.state === 'WAIT_UP') {
       if (timeLeftSec <= VALUE_SECOND_LEG_CUTOFF_SECONDS) return;
-      if (this._isInBand(market.quote.Up?.bestAsk)) {
+      if (this._isSecondLegEligible(market.quote.Up?.bestAsk)) {
         await this._enterLeg(market, 'Up', upBook);
       }
     }
@@ -208,6 +234,10 @@ export class ValueStrategyEngine extends EventEmitter {
 
   _isInBand(price) {
     return Number.isFinite(price) && price >= VALUE_ENTRY_MIN_PRICE && price <= VALUE_ENTRY_MAX_PRICE;
+  }
+
+  _isSecondLegEligible(price) {
+    return Number.isFinite(price) && price <= VALUE_ENTRY_MAX_PRICE;
   }
 
   _countOpenMarkets() {
@@ -225,7 +255,10 @@ export class ValueStrategyEngine extends EventEmitter {
     if (leg.entered) return;
 
     const quote = bestAskFromBook(book);
-    if (!quote || !this._isInBand(quote.price)) return;
+    const eligible = market.state === 'NONE'
+      ? this._isInBand(quote?.price)
+      : this._isSecondLegEligible(quote?.price);
+    if (!quote || !eligible) return;
 
     const maxPrice = Math.min(
       VALUE_ENTRY_MAX_PRICE,
