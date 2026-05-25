@@ -107,8 +107,33 @@
       font-family: "Consolas", "IBM Plex Mono", monospace;
       overflow-wrap: anywhere;
     }
+    .leg-table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 6px;
+      font-family: "Consolas", "IBM Plex Mono", monospace;
+      font-size: 0.9rem;
+    }
+    .leg-table th,
+    .leg-table td {
+      padding: 8px 10px;
+      text-align: left;
+      border-bottom: 1px solid rgba(15,118,110,0.08);
+      vertical-align: top;
+    }
+    .leg-table th {
+      color: var(--muted);
+      font-size: 0.75rem;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      font-family: "Aptos", "Segoe UI Variable", "Trebuchet MS", sans-serif;
+    }
+    .leg-table tr:last-child td {
+      border-bottom: none;
+    }
     .span-2 { grid-column: span 2; }
     .span-3 { grid-column: span 3; }
+    .span-5 { grid-column: span 5; }
     .empty {
       padding: 18px;
       color: var(--muted);
@@ -266,16 +291,38 @@
             <div><dt>Position</dt><dd>${dash(item.positionType)}</dd></div>
             <div><dt>Entered Legs</dt><dd>${item.enteredLegs?.length ? item.enteredLegs.join(', ') : '-'}</dd></div>
             <div><dt>Winner</dt><dd>${dash(item.winningOutcome)}</dd></div>
-            <div><dt>Leg</dt><dd>Up</dd></div>
-            <div><dt>Status</dt><dd>${dash(item.upStatus)}</dd></div>
-            <div><dt>Spend</dt><dd>${money(item.upSpent)}</dd></div>
-            <div><dt>Shares</dt><dd>${dash(item.upShares)}</dd></div>
-            <div><dt>Avg Px</dt><dd>${dash(item.upPrice)}</dd></div>
-            <div><dt>Leg</dt><dd>Down</dd></div>
-            <div><dt>Status</dt><dd>${dash(item.downStatus)}</dd></div>
-            <div><dt>Spend</dt><dd>${money(item.downSpent)}</dd></div>
-            <div><dt>Shares</dt><dd>${dash(item.downShares)}</dd></div>
-            <div><dt>Avg Px</dt><dd>${dash(item.downPrice)}</dd></div>
+            <div class="span-5">
+              <dt>Legs</dt>
+              <dd>
+                <table class="leg-table">
+                  <thead>
+                    <tr>
+                      <th>Leg</th>
+                      <th>Status</th>
+                      <th>Spend</th>
+                      <th>Shares</th>
+                      <th>Avg Px</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr>
+                      <td>Up</td>
+                      <td>${dash(item.upStatus)}</td>
+                      <td>${money(item.upSpent)}</td>
+                      <td>${dash(item.upShares)}</td>
+                      <td>${dash(item.upPrice)}</td>
+                    </tr>
+                    <tr>
+                      <td>Down</td>
+                      <td>${dash(item.downStatus)}</td>
+                      <td>${money(item.downSpent)}</td>
+                      <td>${dash(item.downShares)}</td>
+                      <td>${dash(item.downPrice)}</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </dd>
+            </div>
             <div><dt>Summary</dt><dd>Totals</dd></div>
             <div><dt>Total Cost</dt><dd>${money(item.totalCost)}</dd></div>
             <div><dt>Redeemed</dt><dd>${money(item.redeemed)}</dd></div>

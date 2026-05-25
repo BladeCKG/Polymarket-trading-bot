@@ -112,5 +112,10 @@ export async function fetchActiveValueMarkets({
   return markets
     .map(normalizeMarketRecord)
     .filter(Boolean)
-    .filter((market) => market.active && !market.closed && market.closeTs > nowTs);
+    .filter((market) =>
+      market.active &&
+      !market.closed &&
+      market.windowTs <= nowTs &&
+      market.closeTs > nowTs
+    );
 }

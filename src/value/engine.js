@@ -191,9 +191,15 @@ export class ValueStrategyEngine extends EventEmitter {
 
   async _pollMarket(market) {
     const [upBook, downBook] = await Promise.all([
-      ClobClient.getBook(market.upToken.tokenId),
-      ClobClient.getBook(market.downToken.tokenId),
+      this._getBookIfLive(market, 'Up', market.upToken.tokenId),
+      this._getBookIfLive(market, 'Down', market.downToken.tokenId),
     ]);
+
+    if (!upBook || !downBook) {
+      market.quote.Up = { bestAsk: upBook ? (bestAskFromBook(upBook)?.price ?? null) : null };
+      market.quote.Down = { bestAsk: downBook ? (bestAskFromBook(downBook)?.price ?? null) : null };
+      return;
+    }
 
     market.quote.Up = { bestAsk: bestAskFromBook(upBook)?.price ?? null };
     market.quote.Down = { bestAsk: bestAskFromBook(downBook)?.price ?? null };
@@ -229,6 +235,22 @@ export class ValueStrategyEngine extends EventEmitter {
       if (this._isSecondLegEligible(market.quote.Up?.bestAsk)) {
         await this._enterLeg(market, 'Up', upBook);
       }
+    }
+  }
+
+  async _getBookIfLive(market, side, tokenId) {
+    try {
+      return await ClobClient.getBook(tokenId);
+    } catch (err) {
+      if (err.response?.status === 404) {
+        logger.debug('value.engine: orderbook not live yet', {
+          slug: market.slug,
+          side,
+          tokenId,
+        });
+        return null;
+      }
+      throw err;
     }
   }
 
