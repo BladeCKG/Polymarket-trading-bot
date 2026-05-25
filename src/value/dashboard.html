@@ -308,7 +308,7 @@
 
     function renderMarketsSection() {
       const filteredMarkets = state.markets.filter(matchesMarketFilters);
-      const stateOptions = uniqueOptions(state.markets.map((item) => item.state).filter(Boolean));
+      const stateOptions = uniqueOptions(state.markets.map((item) => item.marketState).filter(Boolean));
       const positionOptions = uniqueOptions(state.markets.map((item) => item.positionType).filter(Boolean));
       return panel('markets', 'Markets', `${filteredMarkets.length} shown / ${state.markets.length} tracked`, `
         <div class="filters">
@@ -335,7 +335,7 @@
         <article class="item">
           <header>
             <span>${item.slug}</span>
-            <span class="state-chip ${item.state === 'SETTLED' ? (Number(item.pnl) >= 0 ? 'profit' : 'loss') : (item.state.includes('WAIT') ? 'warn' : '')}">${item.state}</span>
+            <span class="state-chip ${item.marketState === 'SETTLED' ? (Number(item.pnl) >= 0 ? 'profit' : 'loss') : (item.positionType === 'Up only' || item.positionType === 'Down only' ? 'warn' : '')}">${item.marketState}</span>
           </header>
           <dl class="market-grid">
             <div class="span-3"><dt>Question</dt><dd>${dash(item.question)}</dd></div>
@@ -347,6 +347,7 @@
             <div><dt>Down Ask</dt><dd>${dash(item.downAsk)}</dd></div>
             <div><dt>Up Bid</dt><dd>${dash(item.upBid)}</dd></div>
             <div><dt>Down Bid</dt><dd>${dash(item.downBid)}</dd></div>
+            <div><dt>Market State</dt><dd>${dash(item.marketState)}</dd></div>
             <div><dt>Position</dt><dd>${dash(item.positionType)}</dd></div>
             <div><dt>Entered Legs</dt><dd>${item.enteredLegs?.length ? item.enteredLegs.join(', ') : '-'}</dd></div>
             <div><dt>Winner</dt><dd>${dash(item.winningOutcome)}</dd></div>
@@ -359,9 +360,11 @@
                       <th>Leg</th>
                       <th>Status</th>
                       <th>Spend</th>
-                      <th>Shares</th>
+                      <th>Bought</th>
+                      <th>Buy Avg Px</th>
                       <th>Sold</th>
-                      <th>Avg Px</th>
+                      <th>Sell Avg Px</th>
+                      <th>Cash Out</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -370,16 +373,20 @@
                       <td>${dash(item.upStatus)}</td>
                       <td>${money(item.upSpent)}</td>
                       <td>${dash(item.upShares)}</td>
-                      <td>${dash(item.upSoldShares)}</td>
                       <td>${dash(item.upPrice)}</td>
+                      <td>${dash(item.upSoldShares)}</td>
+                      <td>${dash(item.upSellPrice)}</td>
+                      <td>${money(item.upSoldUsdc)}</td>
                     </tr>
                     <tr>
                       <td>Down</td>
                       <td>${dash(item.downStatus)}</td>
                       <td>${money(item.downSpent)}</td>
                       <td>${dash(item.downShares)}</td>
-                      <td>${dash(item.downSoldShares)}</td>
                       <td>${dash(item.downPrice)}</td>
+                      <td>${dash(item.downSoldShares)}</td>
+                      <td>${dash(item.downSellPrice)}</td>
+                      <td>${money(item.downSoldUsdc)}</td>
                     </tr>
                   </tbody>
                 </table>
@@ -390,7 +397,7 @@
             <div><dt>Cash Out</dt><dd>${money(item.cashProceeds)}</dd></div>
             <div><dt>Redeemed</dt><dd>${money(item.redeemed)}</dd></div>
             <div><dt>PnL</dt><dd>${money(item.pnl)}</dd></div>
-            <div><dt>State</dt><dd>${dash(item.state)}</dd></div>
+            <div><dt>Strategy State</dt><dd>${dash(item.state)}</dd></div>
             <div class="span-5"><dt>Last Action</dt><dd>${dash(item.lastAction)}</dd></div>
           </dl>
         </article>
@@ -453,7 +460,8 @@
     }
 
     function marketPnlBucket(item) {
-      if (item.state !== 'SETTLED' || item.pnl == null || item.pnl === '') return 'UNSETTLED';
+      if (item.marketState !== 'SETTLED' && item.positionType !== 'Flat') return 'UNSETTLED';
+      if (item.pnl == null || item.pnl === '') return 'UNSETTLED';
       const pnl = Number(item.pnl);
       if (!Number.isFinite(pnl)) return 'UNSETTLED';
       if (pnl > 0) return 'PROFIT';
@@ -462,7 +470,7 @@
     }
 
     function matchesMarketFilters(item) {
-      if (marketFilters.state !== 'ALL' && item.state !== marketFilters.state) return false;
+      if (marketFilters.state !== 'ALL' && item.marketState !== marketFilters.state) return false;
       if (marketFilters.position !== 'ALL' && item.positionType !== marketFilters.position) return false;
       if (marketFilters.pnl !== 'ALL' && marketPnlBucket(item) !== marketFilters.pnl) return false;
       return true;
