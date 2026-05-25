@@ -79,10 +79,10 @@ export class ValueStrategyEngine extends EventEmitter {
     const strandedOpen = openMarkets.filter((market) =>
       market.state === 'WAIT_UP' || market.state === 'WAIT_DOWN'
     ).length;
-    const settledMarkets = markets.filter((market) => market.settled).length;
+    const closedMarkets = markets.filter((market) => market.settled || market.state === 'FLAT').length;
     const openCost = openMarkets.reduce((sum, market) => sum + market.totalCost - market.cashProceeds, 0);
     const settledPnl = markets
-      .filter((market) => market.settled)
+      .filter((market) => market.settled || market.state === 'FLAT')
       .reduce((sum, market) => sum + Number(market.pnl ?? 0), 0);
 
     return {
@@ -90,7 +90,7 @@ export class ValueStrategyEngine extends EventEmitter {
       openMarkets: openMarkets.length,
       pairedOpenMarkets: pairedOpen,
       strandedOpenMarkets: strandedOpen,
-      settledMarkets,
+      settledMarkets: closedMarkets,
       openCost: openCost.toFixed(2),
       settledPnl: settledPnl.toFixed(2),
       actions: this.actions,
