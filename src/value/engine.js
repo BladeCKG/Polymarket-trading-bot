@@ -127,7 +127,7 @@ export class ValueStrategyEngine extends EventEmitter {
 
   snapshotMarkets() {
     return [...this.markets.values()]
-      .sort((a, b) => a.closeTs - b.closeTs)
+      .sort((a, b) => b.closeTs - a.closeTs)
       .map((market) => ({
         slug: market.slug,
         question: market.question,

@@ -308,11 +308,8 @@
         '<pre class="json">' + escapeHtml(JSON.stringify(state.config, null, 2)) + '</pre>', false);
     }
 
-    function renderMarketsSection() {
-      const filteredMarkets = state.markets.filter(matchesMarketFilters);
-      const stateOptions = uniqueOptions(state.markets.map((item) => item.marketState).filter(Boolean));
-      const positionOptions = uniqueOptions(state.markets.map((item) => item.positionType).filter(Boolean));
-      return panel('markets', 'Markets', `${filteredMarkets.length} shown / ${state.markets.length} tracked`, `
+    function renderMarketsFilters(stateOptions, positionOptions) {
+      return `
         <div class="filters">
           <div class="filter">
             <label for="market-filter-state">State</label>
@@ -332,8 +329,11 @@
               ${renderFilterOptions('ALL', ['PROFIT', 'LOSS', 'FLAT', 'UNSETTLED'], marketFilters.pnl)}
             </select>
           </div>
-        </div>
-        ${renderList(filteredMarkets, (item) => `
+        </div>`;
+    }
+
+    function renderMarketsResults(filteredMarkets) {
+      return renderList(filteredMarkets, (item) => `
         <article class="item">
           <header>
             <span>${item.slug}</span>
@@ -406,7 +406,49 @@
             <div class="span-5"><dt>Last Action</dt><dd>${dash(item.lastAction)}</dd></div>
           </dl>
         </article>
-      `)}`, true);
+      `);
+    }
+
+    function renderMarketsSection() {
+      const filteredMarkets = state.markets.filter(matchesMarketFilters);
+      const stateOptions = uniqueOptions(state.markets.map((item) => item.marketState).filter(Boolean));
+      const positionOptions = uniqueOptions(state.markets.map((item) => item.positionType).filter(Boolean));
+      return panel('markets', 'Markets', `${filteredMarkets.length} shown / ${state.markets.length} tracked`, `
+        ${renderMarketsFilters(stateOptions, positionOptions)}
+        <div id="markets-results">${renderMarketsResults(filteredMarkets)}</div>
+      `, true);
+    }
+
+    function syncFilterSelect(selectEl, allLabel, values, selected) {
+      if (!selectEl) return;
+      const optionsHtml = renderFilterOptions(allLabel, values, selected);
+      if (selectEl.innerHTML !== optionsHtml) {
+        const isFocused = document.activeElement === selectEl;
+        selectEl.innerHTML = optionsHtml;
+        selectEl.value = selected;
+        if (isFocused) selectEl.focus();
+      } else if (selectEl.value !== selected) {
+        selectEl.value = selected;
+      }
+    }
+
+    function updateMarketsSection(slot) {
+      if (!slot) return;
+      const filteredMarkets = state.markets.filter(matchesMarketFilters);
+      const stateOptions = uniqueOptions(state.markets.map((item) => item.marketState).filter(Boolean));
+      const positionOptions = uniqueOptions(state.markets.map((item) => item.positionType).filter(Boolean));
+      const details = slot.querySelector('details.panel[data-panel-key="markets"]');
+      if (!details) {
+        slot.innerHTML = renderMarketsSection();
+        return;
+      }
+      const summaryMeta = details.querySelector('.summary-meta');
+      if (summaryMeta) summaryMeta.textContent = `${filteredMarkets.length} shown / ${state.markets.length} tracked`;
+      syncFilterSelect(details.querySelector('#market-filter-state'), 'ALL', stateOptions, marketFilters.state);
+      syncFilterSelect(details.querySelector('#market-filter-position'), 'ALL', positionOptions, marketFilters.position);
+      syncFilterSelect(details.querySelector('#market-filter-pnl'), 'ALL', ['PROFIT', 'LOSS', 'FLAT', 'UNSETTLED'], marketFilters.pnl);
+      const results = details.querySelector('#markets-results');
+      if (results) results.innerHTML = renderMarketsResults(filteredMarkets);
     }
 
     function renderActionsSection() {
@@ -448,6 +490,10 @@
     function renderSection(key) {
       const slot = sectionSlots.get(key);
       if (!slot) return;
+      if (key === 'markets') {
+        updateMarketsSection(slot);
+        return;
+      }
       slot.innerHTML = renderers[key]();
     }
 
