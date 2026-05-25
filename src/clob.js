@@ -582,6 +582,24 @@ export class ClobClient {
     return res.orderId;
   }
 
+  static async postLimitSell(wallet, tokenId, price, shares, negRisk = true) {
+    const feeRateBps = await ClobClient.getTakerFeeBps(tokenId);
+    const { tickSize } = await ClobClient.getBook(tokenId);
+    const { orderData, signature } = await buildMarketSellOrder(
+      wallet, tokenId, price, shares, 0, negRisk, feeRateBps, tickSize,
+    );
+    const body = {
+      order: { ...orderData, signature },
+      owner: ClobClient._creds.apiKey,
+      orderType: 'GTC',
+    };
+    const path = '/order';
+    const res = await restCall('POST', path, body);
+    if (!res.success) throw new Error(`Order rejected: ${res.errorMsg ?? JSON.stringify(res)}`);
+    logger.debug('CLOB: limit sell posted', { tokenId, price, shares, orderId: res.orderId });
+    return res.orderId;
+  }
+
   /**
    * Post a FAK (Fill-And-Kill) BUY order.
    *

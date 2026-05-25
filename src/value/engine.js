@@ -6,8 +6,6 @@ import {
   VALUE_DRY_RUN,
   VALUE_ENDGAME_EXIT_BELOW_PRICE,
   VALUE_IMMEDIATE_EXIT_BELOW_PRICE,
-  VALUE_ENTRY_MIN_PRICE,
-  VALUE_ENTRY_MAX_PRICE,
   VALUE_FIRST_LEG_CUTOFF_SECONDS,
   VALUE_LEG_USDC,
   VALUE_MAX_OPEN_MARKETS,
@@ -15,6 +13,7 @@ import {
   VALUE_MAX_STRANDED_LEGS,
   VALUE_ORDER_MODE,
   VALUE_SECOND_LEG_CUTOFF_SECONDS,
+  VALUE_TARGET_PRICE,
   VALUE_TARGET_SHARES,
 } from './config.js';
 import {
@@ -141,7 +140,7 @@ export class ValueStrategyEngine extends EventEmitter {
         timeLeftSec: Math.max(0, market.closeTs - nowSec()),
         marketState: market.settled ? 'SETTLED' : 'OPEN',
         state: market.state,
-        entryBand: `${VALUE_ENTRY_MIN_PRICE.toFixed(2)}-${VALUE_ENTRY_MAX_PRICE.toFixed(2)}`,
+        targetPrice: VALUE_TARGET_PRICE,
         firstSide: market.firstSide,
         positionType: this._positionType(market),
         enteredLegs: this._enteredLegs(market),
@@ -192,6 +191,8 @@ export class ValueStrategyEngine extends EventEmitter {
       lastAction: null,
       quote: { Up: null, Down: null },
       lastLiveQuote: { Up: null, Down: null },
+      pendingBuyOrders: { Up: null, Down: null },
+      exitPlan: null,
       legs: {
         Up: this._emptyLeg(market.upToken.tokenId),
         Down: this._emptyLeg(market.downToken.tokenId),
@@ -289,6 +290,7 @@ export class ValueStrategyEngine extends EventEmitter {
       downBookLive: Boolean(downBook),
     });
     if (timeLeftSec <= 0) {
+      await this._cancelMarketOrders(market, 'market-closed');
       const estimated = this._estimateCloseResolution(market);
       if (estimated) {
         this._settleMarket(market, estimated, { source: 'close-price-estimate' });
@@ -306,6 +308,7 @@ export class ValueStrategyEngine extends EventEmitter {
 
     if (market.state === 'NONE') {
       if (this._countOpenMarkets() >= VALUE_MAX_OPEN_MARKETS) {
+        await this._cancelMarketOrders(market, 'max-open-markets');
         this._emitDecision(market, {
           type: 'poll-skip',
           side: null,
@@ -315,6 +318,7 @@ export class ValueStrategyEngine extends EventEmitter {
         return;
       }
       if (this._countStrandedLegs() >= VALUE_MAX_STRANDED_LEGS) {
+        await this._cancelMarketOrders(market, 'max-stranded-legs');
         this._emitDecision(market, {
           type: 'poll-skip',
           side: null,
@@ -324,6 +328,7 @@ export class ValueStrategyEngine extends EventEmitter {
         return;
       }
       if (timeLeftSec <= VALUE_FIRST_LEG_CUTOFF_SECONDS) {
+        await this._cancelMarketOrders(market, 'first-leg-cutoff');
         this._emitDecision(market, {
           type: 'poll-skip',
           side: null,
@@ -332,109 +337,65 @@ export class ValueStrategyEngine extends EventEmitter {
         });
         return;
       }
-
-      const upInBand = upBook && this._isInBand(market.quote.Up?.bestAsk);
-      const downInBand = downBook && this._isInBand(market.quote.Down?.bestAsk);
-      if (!upBook) {
-        this._emitDecision(market, {
-          type: 'buy-skipped',
-          side: 'Up',
-          reason: 'no-book',
-          timeLeftSec,
-        });
-      } else if (!upInBand) {
-        this._emitDecision(market, {
-          type: 'buy-skipped',
-          side: 'Up',
-          reason: 'not-in-band',
-          timeLeftSec,
-          quote: sideQuotes(market.quote.Up),
-        });
-      }
-      if (upInBand) await this._enterLeg(market, 'Up', upBook);
-      if (market.state === 'NONE') {
-        if (!downBook) {
-          this._emitDecision(market, {
-            type: 'buy-skipped',
-            side: 'Down',
-            reason: 'no-book',
-            timeLeftSec,
-          });
-        } else if (!downInBand) {
-          this._emitDecision(market, {
-            type: 'buy-skipped',
-            side: 'Down',
-            reason: 'not-in-band',
-            timeLeftSec,
-            quote: sideQuotes(market.quote.Down),
-          });
-        }
-        if (downInBand) await this._enterLeg(market, 'Down', downBook);
-      }
+      await this._ensureFirstLegOrders(market);
+      await this._simulatePendingFills(market);
       return;
     }
 
     if (market.state === 'WAIT_DOWN') {
+      await this._ensureSecondLegAndExit(market);
+      await this._simulatePendingFills(market);
+      if (market.state !== 'WAIT_DOWN') return;
       if (this._shouldImmediateExitStrandedLeg(market, 'Up', upBook)) {
+        await this._cancelMarketOrders(market, 'immediate-exit');
         await this._handleEndgame(market, 'Up', upBook, 'Down', downBook, { immediate: true });
         return;
       }
       if (timeLeftSec <= VALUE_SECOND_LEG_CUTOFF_SECONDS) {
+        await this._cancelMarketOrders(market, 'second-leg-cutoff');
         await this._handleEndgame(market, 'Up', upBook, 'Down', downBook);
         return;
       }
-      if (!downBook) {
-        this._emitDecision(market, {
-          type: 'buy-skipped',
-          side: 'Down',
-          reason: 'no-book',
-          timeLeftSec,
-          waitingFor: 'Down',
-        });
-      } else if (!this._isSecondLegEligible(market.quote.Down?.bestAsk)) {
-        this._emitDecision(market, {
-          type: 'buy-skipped',
-          side: 'Down',
-          reason: 'second-leg-not-eligible',
-          timeLeftSec,
-          waitingFor: 'Down',
-          quote: sideQuotes(market.quote.Down),
-        });
-      } else {
-        await this._enterLeg(market, 'Down', downBook);
-      }
+      this._emitDecision(market, {
+        type: 'waiting',
+        side: 'Down',
+        reason: market.pendingBuyOrders.Down ? 'second-order-resting' : 'second-order-missing',
+        timeLeftSec,
+        waitingFor: 'Down',
+        quote: sideQuotes(market.quote.Down),
+        exitPlan: market.exitPlan,
+      });
       return;
     }
 
     if (market.state === 'WAIT_UP') {
+      await this._ensureSecondLegAndExit(market);
+      await this._simulatePendingFills(market);
+      if (market.state !== 'WAIT_UP') return;
       if (this._shouldImmediateExitStrandedLeg(market, 'Down', downBook)) {
+        await this._cancelMarketOrders(market, 'immediate-exit');
         await this._handleEndgame(market, 'Down', downBook, 'Up', upBook, { immediate: true });
         return;
       }
       if (timeLeftSec <= VALUE_SECOND_LEG_CUTOFF_SECONDS) {
+        await this._cancelMarketOrders(market, 'second-leg-cutoff');
         await this._handleEndgame(market, 'Down', downBook, 'Up', upBook);
         return;
       }
-      if (!upBook) {
-        this._emitDecision(market, {
-          type: 'buy-skipped',
-          side: 'Up',
-          reason: 'no-book',
-          timeLeftSec,
-          waitingFor: 'Up',
-        });
-      } else if (!this._isSecondLegEligible(market.quote.Up?.bestAsk)) {
-        this._emitDecision(market, {
-          type: 'buy-skipped',
-          side: 'Up',
-          reason: 'second-leg-not-eligible',
-          timeLeftSec,
-          waitingFor: 'Up',
-          quote: sideQuotes(market.quote.Up),
-        });
-      } else {
-        await this._enterLeg(market, 'Up', upBook);
-      }
+      this._emitDecision(market, {
+        type: 'waiting',
+        side: 'Up',
+        reason: market.pendingBuyOrders.Up ? 'second-order-resting' : 'second-order-missing',
+        timeLeftSec,
+        waitingFor: 'Up',
+        quote: sideQuotes(market.quote.Up),
+        exitPlan: market.exitPlan,
+      });
+      return;
+    }
+
+    if (market.state === 'PAIRED') {
+      this._ensureSettlementWatch(market);
     }
   }
 
@@ -454,12 +415,12 @@ export class ValueStrategyEngine extends EventEmitter {
     }
   }
 
-  _isInBand(price) {
-    return Number.isFinite(price) && price >= VALUE_ENTRY_MIN_PRICE && price <= VALUE_ENTRY_MAX_PRICE;
+  _isAtTarget(price) {
+    return Number.isFinite(price) && price > 0 && price <= VALUE_TARGET_PRICE;
   }
 
   _isSecondLegEligible(price) {
-    return Number.isFinite(price) && price <= VALUE_ENTRY_MAX_PRICE;
+    return Number.isFinite(price) && price > 0 && price <= VALUE_TARGET_PRICE;
   }
 
   _updateLastLiveQuote(market, side) {
@@ -517,6 +478,259 @@ export class ValueStrategyEngine extends EventEmitter {
     ).length;
   }
 
+  _targetShares() {
+    if (VALUE_ORDER_MODE === 'SHARES') return VALUE_TARGET_SHARES;
+    if (!Number.isFinite(VALUE_TARGET_PRICE) || VALUE_TARGET_PRICE <= 0) return 0;
+    return VALUE_LEG_USDC / VALUE_TARGET_PRICE;
+  }
+
+  async _ensureFirstLegOrders(market) {
+    await this._ensureRestingBuyOrder(market, 'Up', 'first');
+    await this._ensureRestingBuyOrder(market, 'Down', 'first');
+  }
+
+  async _ensureSecondLegAndExit(market) {
+    const openSide = market.state === 'WAIT_DOWN' ? 'Up' : market.state === 'WAIT_UP' ? 'Down' : null;
+    const secondSide = openSide ? oppositeSide(openSide) : null;
+    if (!openSide || !secondSide) return;
+
+    market.exitPlan ??= {
+      side: openSide,
+      triggerPrice: VALUE_IMMEDIATE_EXIT_BELOW_PRICE,
+      armedAt: Date.now(),
+      mode: 'synthetic-threshold',
+    };
+    await this._ensureRestingBuyOrder(market, secondSide, 'second');
+  }
+
+  async _ensureRestingBuyOrder(market, side, role) {
+    if (market.pendingBuyOrders[side]) return;
+    const leg = market.legs[side];
+    if (leg.entered) return;
+
+    const shares = this._targetShares();
+    if (!Number.isFinite(shares) || shares <= 0) return;
+
+    const tokenId = side === 'Up' ? market.upToken.tokenId : market.downToken.tokenId;
+    const order = {
+      role,
+      side,
+      tokenId,
+      price: VALUE_TARGET_PRICE,
+      shares,
+      usdcBudget: VALUE_ORDER_MODE === 'USDC' ? VALUE_LEG_USDC : shares * VALUE_TARGET_PRICE,
+      orderId: null,
+      placedAt: Date.now(),
+      live: !VALUE_DRY_RUN,
+    };
+
+    try {
+      if (!VALUE_DRY_RUN) {
+        order.orderId = await ClobClient.postLimitBuy(this.wallet, tokenId, order.price, order.shares);
+      }
+      market.pendingBuyOrders[side] = order;
+      market.lastAction = `${VALUE_DRY_RUN ? 'dry-run' : 'resting'} ${role} ${side.toLowerCase()} bid @ ${order.price.toFixed(4)}`;
+      this.emit('action', {
+        type: VALUE_DRY_RUN ? 'dry-run-order-placed' : 'order-placed',
+        slug: market.slug,
+        side,
+        role,
+        state: market.state,
+        price: order.price,
+        shares: order.shares,
+        spent: order.usdcBudget,
+        orderId: order.orderId,
+        timestamp: Date.now(),
+      });
+    } catch (err) {
+      this.failures += 1;
+      logger.warn('value.engine: resting order failed', {
+        slug: market.slug,
+        side,
+        role,
+        err: err.message,
+      });
+      this._emitDecision(market, {
+        type: 'order-skipped',
+        side,
+        reason: 'resting-order-failed',
+        role,
+        error: err.message,
+      });
+    }
+  }
+
+  async _cancelMarketOrders(market, reason) {
+    const hadOrders = Object.values(market.pendingBuyOrders).some(Boolean);
+    market.pendingBuyOrders.Up = null;
+    market.pendingBuyOrders.Down = null;
+    if (!hadOrders) return;
+    if (!VALUE_DRY_RUN) {
+      try {
+        await ClobClient.cancelMarket(market.conditionId);
+      } catch (err) {
+        logger.warn('value.engine: cancel market orders failed', {
+          slug: market.slug,
+          reason,
+          err: err.message,
+        });
+      }
+    }
+    this.emit('action', {
+      type: VALUE_DRY_RUN ? 'dry-run-orders-cancelled' : 'orders-cancelled',
+      slug: market.slug,
+      side: null,
+      state: market.state,
+      reason,
+      timestamp: Date.now(),
+    });
+  }
+
+  async _simulatePendingFills(market) {
+    if (!VALUE_DRY_RUN) return;
+
+    for (const side of ['Up', 'Down']) {
+      const order = market.pendingBuyOrders[side];
+      if (!order) continue;
+      const bestAsk = market.quote?.[side]?.bestAsk;
+      if (!Number.isFinite(bestAsk) || bestAsk > order.price) continue;
+      const fillPrice = bestAsk;
+      const fillShares = order.shares;
+      const spentUsdc = fillPrice * fillShares;
+      market.pendingBuyOrders[side] = null;
+      await this._recordBuyFill(market, side, {
+        role: order.role,
+        price: fillPrice,
+        shares: fillShares,
+        spentUsdc,
+        source: 'simulated-resting-order',
+        orderId: order.orderId,
+      });
+      return;
+    }
+  }
+
+  async handleFill(fill) {
+    const tokenId = String(fill.tokenId);
+    const side = String(fill.side ?? '').toUpperCase();
+    const market = [...this.markets.values()].find((candidate) =>
+      !candidate.settled && (
+        String(candidate.upToken.tokenId) === tokenId ||
+        String(candidate.downToken.tokenId) === tokenId
+      )
+    );
+    if (!market) return;
+
+    const marketSide = String(market.upToken.tokenId) === tokenId ? 'Up' : 'Down';
+    if (side === 'BUY') {
+      const pending = market.pendingBuyOrders[marketSide];
+      await this._recordBuyFill(market, marketSide, {
+        role: pending?.role ?? (market.state === 'NONE' ? 'first' : 'second'),
+        price: Number(fill.price),
+        shares: Number(fill.size),
+        spentUsdc: Number(fill.price) * Number(fill.size),
+        source: 'user-fill',
+        orderId: fill.orderId ?? pending?.orderId ?? null,
+      });
+      return;
+    }
+
+    if (side === 'SELL') {
+      await this._recordSellFill(market, marketSide, {
+        price: Number(fill.price),
+        shares: Number(fill.size),
+        proceedsUsdc: Number(fill.price) * Number(fill.size),
+        source: 'user-fill',
+        orderId: fill.orderId ?? null,
+      });
+    }
+  }
+
+  async _recordBuyFill(market, side, fill) {
+    const leg = market.legs[side];
+    const prevShares = Number(leg.shares ?? 0);
+    const prevSpent = Number(leg.spent ?? 0);
+    const nextShares = prevShares + fill.shares;
+    const nextSpent = prevSpent + fill.spentUsdc;
+
+    leg.entered = true;
+    leg.shares = nextShares;
+    leg.spent = nextSpent;
+    leg.avgPrice = nextShares > 0 ? nextSpent / nextShares : fill.price;
+    leg.enteredAt ??= Date.now();
+    leg.response = fill.orderId ?? leg.response;
+    market.totalCost += fill.spentUsdc;
+    market.hasAnyLeg = true;
+    market.hadAnyTrade = true;
+    if (!market.firstSide) market.firstSide = side;
+    if (fill.role === 'second') market.hadForcePair = market.hadForcePair;
+    market.state = this._computeState(market);
+    this.actions += 1;
+    market.lastAction = `filled ${fill.role} ${side.toLowerCase()} @ ${leg.avgPrice.toFixed(4)}`;
+
+    this.emit('action', {
+      type: VALUE_DRY_RUN ? 'dry-run-buy-filled' : 'buy-filled',
+      slug: market.slug,
+      side,
+      role: fill.role,
+      state: market.state,
+      spent: fill.spentUsdc,
+      shares: fill.shares,
+      price: fill.price,
+      source: fill.source,
+      orderId: fill.orderId ?? null,
+      timestamp: Date.now(),
+    });
+
+    if (fill.role === 'first') {
+      await this._cancelMarketOrders(market, 'first-leg-filled');
+      market.pendingBuyOrders.Up = null;
+      market.pendingBuyOrders.Down = null;
+      market.exitPlan = {
+        side,
+        triggerPrice: VALUE_IMMEDIATE_EXIT_BELOW_PRICE,
+        armedAt: Date.now(),
+        mode: 'synthetic-threshold',
+      };
+      await this._ensureSecondLegAndExit(market);
+    } else if (fill.role === 'second') {
+      market.pendingBuyOrders[side] = null;
+      market.exitPlan = null;
+      await this._cancelMarketOrders(market, 'pair-complete');
+      this._ensureSettlementWatch(market);
+    }
+
+    this.emit('markets-updated', this.snapshotMarkets());
+  }
+
+  async _recordSellFill(market, side, fill) {
+    const leg = market.legs[side];
+    leg.soldShares += fill.shares;
+    leg.soldUsdc += fill.proceedsUsdc;
+    leg.sellAvgPrice = leg.soldShares > 0 ? leg.soldUsdc / leg.soldShares : fill.price;
+    leg.soldAt = Date.now();
+    market.cashProceeds += fill.proceedsUsdc;
+    market.exitPlan = null;
+    market.state = this._computeState(market);
+    market.pnl = market.cashProceeds + market.redeemed - market.totalCost;
+    this.actions += 1;
+    market.lastAction = `filled exit ${side.toLowerCase()} @ ${leg.sellAvgPrice.toFixed(4)}`;
+    await this._cancelMarketOrders(market, 'exit-filled');
+    this.emit('action', {
+      type: VALUE_DRY_RUN ? 'dry-run-sell-filled' : 'sell-filled',
+      slug: market.slug,
+      side,
+      state: market.state,
+      spent: fill.proceedsUsdc,
+      shares: fill.shares,
+      price: fill.price,
+      source: fill.source,
+      orderId: fill.orderId ?? null,
+      timestamp: Date.now(),
+    });
+    this.emit('markets-updated', this.snapshotMarkets());
+  }
+
   async _enterLeg(market, side, book, { force = false } = {}) {
     const leg = market.legs[side];
     if (leg.entered) {
@@ -533,7 +747,7 @@ export class ValueStrategyEngine extends EventEmitter {
     const eligible = force
       ? Number.isFinite(quote?.price) && quote.price > 0
       : market.state === 'NONE'
-      ? this._isInBand(quote?.price)
+      ? this._isAtTarget(quote?.price)
       : this._isSecondLegEligible(quote?.price);
     if (!quote) {
       this._emitDecision(market, {
@@ -681,7 +895,7 @@ export class ValueStrategyEngine extends EventEmitter {
     }
     if (market.state === 'NONE') {
       return Math.min(
-        VALUE_ENTRY_MAX_PRICE,
+        VALUE_TARGET_PRICE,
         Number((bestAsk + VALUE_MAX_SLIPPAGE).toFixed(4)),
       );
     }

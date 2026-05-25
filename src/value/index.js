@@ -6,7 +6,7 @@ import {
   API_SECRET,
 } from '../config.js';
 import logger from '../logger.js';
-import { ClobClient } from '../clob.js';
+import { ClobClient, FillFeed } from '../clob.js';
 import { ensureApprovals, getSigner } from '../onchain.js';
 import { fetchActiveValueMarkets } from './marketScanner.js';
 import {
@@ -17,8 +17,6 @@ import {
   VALUE_DURATIONS,
   VALUE_ENDGAME_EXIT_BELOW_PRICE,
   VALUE_IMMEDIATE_EXIT_BELOW_PRICE,
-  VALUE_ENTRY_MAX_PRICE,
-  VALUE_ENTRY_MIN_PRICE,
   VALUE_FIRST_LEG_CUTOFF_SECONDS,
   VALUE_LEG_USDC,
   VALUE_MARKET_REFRESH_MS,
@@ -29,6 +27,7 @@ import {
   VALUE_POLL_MS,
   VALUE_SECOND_LEG_CUTOFF_SECONDS,
   VALUE_SYMBOLS,
+  VALUE_TARGET_PRICE,
   VALUE_TARGET_SHARES,
 } from './config.js';
 import { ValueDashboardServer } from './dashboard.js';
@@ -46,7 +45,7 @@ export async function main() {
     durations: VALUE_DURATIONS,
     pollMs: VALUE_POLL_MS,
     marketRefreshMs: VALUE_MARKET_REFRESH_MS,
-    entryBand: [VALUE_ENTRY_MIN_PRICE, VALUE_ENTRY_MAX_PRICE],
+    targetPrice: VALUE_TARGET_PRICE,
     maxSlippage: VALUE_MAX_SLIPPAGE,
     orderMode: VALUE_ORDER_MODE,
     legUsdc: VALUE_LEG_USDC,
@@ -64,7 +63,7 @@ export async function main() {
     durations: VALUE_DURATIONS,
     pollMs: VALUE_POLL_MS,
     marketRefreshMs: VALUE_MARKET_REFRESH_MS,
-    entryBand: [VALUE_ENTRY_MIN_PRICE, VALUE_ENTRY_MAX_PRICE],
+    targetPrice: VALUE_TARGET_PRICE,
     maxSlippage: VALUE_MAX_SLIPPAGE,
     orderMode: VALUE_ORDER_MODE,
     legUsdc: VALUE_LEG_USDC,
@@ -89,7 +88,7 @@ export async function main() {
         durations: VALUE_DURATIONS,
         pollMs: VALUE_POLL_MS,
         marketRefreshMs: VALUE_MARKET_REFRESH_MS,
-        entryBand: [VALUE_ENTRY_MIN_PRICE, VALUE_ENTRY_MAX_PRICE],
+        targetPrice: VALUE_TARGET_PRICE,
         maxSlippage: VALUE_MAX_SLIPPAGE,
         orderMode: VALUE_ORDER_MODE,
         legUsdc: VALUE_LEG_USDC,
@@ -122,6 +121,7 @@ export async function main() {
   });
 
   const engine = new ValueStrategyEngine(wallet);
+  const fillFeed = !VALUE_DRY_RUN ? new FillFeed() : null;
   engine.on('markets-updated', (markets) => {
     dashboard?.setMarkets(markets);
     dashboard?.setStats(engine.stats());
@@ -160,6 +160,7 @@ export async function main() {
     });
     clearInterval(refreshTimer);
     clearTimeout(pollTimer);
+    fillFeed?.stop();
     dashboard?.stop();
     traceFile.stop();
     setTimeout(() => process.exit(0), 1_000).unref?.();
@@ -210,6 +211,15 @@ export async function main() {
   await refreshMarkets();
   dashboard?.setMarkets(engine.snapshotMarkets());
   dashboard?.setStats(engine.stats());
+
+  if (fillFeed) {
+    fillFeed.on('fill', (fill) => {
+      void engine.handleFill(fill).catch((err) => {
+        logger.warn('value.main: fill handling failed', { err: err.message });
+      });
+    });
+    fillFeed.start();
+  }
 
   refreshTimer = setInterval(() => {
     void refreshMarkets().catch((err) => {
