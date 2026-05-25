@@ -625,7 +625,7 @@ export class ValueStrategyEngine extends EventEmitter {
     if (openShares <= 1e-9) return false;
 
     const bestBid = bestBidFromBook(book)?.price ?? null;
-    if (!this._isDryRunPriceNear(market.exitPlan.triggerPrice, bestBid)) return false;
+    if (!Number.isFinite(bestBid) || bestBid >= market.exitPlan.triggerPrice) return false;
 
     await this._recordSellFill(market, side, {
       price: bestBid,
