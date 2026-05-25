@@ -1,0 +1,402 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Value Polling Dashboard</title>
+  <style>
+    :root {
+      --bg: #f6f1e8;
+      --panel: rgba(255,255,255,0.84);
+      --text: #1f2328;
+      --muted: #667085;
+      --accent: #0f766e;
+      --profit: #1d4ed8;
+      --loss: #b42318;
+      --warn: #9a6700;
+      --shadow: 0 18px 48px rgba(39, 52, 48, 0.14);
+      --radius: 20px;
+      --border: rgba(15,118,110,0.12);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      color: var(--text);
+      font-family: "Aptos", "Segoe UI Variable", "Trebuchet MS", sans-serif;
+      background:
+        radial-gradient(circle at top left, rgba(15,118,110,0.18), transparent 32%),
+        radial-gradient(circle at top right, rgba(242,153,74,0.18), transparent 28%),
+        linear-gradient(180deg, #fbf8f1 0%, var(--bg) 100%);
+      min-height: 100vh;
+    }
+    .shell { max-width: 1440px; margin: 0 auto; padding: 24px 18px 36px; }
+    .hero, .stat, details.panel {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      box-shadow: var(--shadow);
+      border-radius: var(--radius);
+      backdrop-filter: blur(8px);
+    }
+    .hero { padding: 22px; margin-bottom: 16px; }
+    .hero h1 { margin: 0 0 8px; font-size: clamp(2rem, 4vw, 3rem); letter-spacing: -0.04em; }
+    .hero p { margin: 0; color: var(--muted); }
+    .banner { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; color: var(--muted); }
+    .pill { padding: 6px 12px; border-radius: 999px; background: rgba(15,118,110,0.12); color: var(--accent); font-weight: 700; }
+    .grid { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); margin-bottom: 16px; }
+    .stat { padding: 16px; }
+    .label { font-size: 0.8rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); margin-bottom: 6px; }
+    .value { font-size: 1.9rem; font-weight: 700; letter-spacing: -0.04em; }
+    .sections { display: grid; gap: 14px; }
+    details.panel > summary {
+      list-style: none;
+      cursor: pointer;
+      padding: 18px 20px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-weight: 700;
+    }
+    details.panel > summary::-webkit-details-marker { display: none; }
+    .summary-meta { color: var(--muted); font-weight: 500; font-size: 0.85rem; }
+    .panel-body { padding: 0 20px 20px; }
+    .list { display: grid; gap: 10px; }
+    .item {
+      padding: 14px;
+      border-radius: 16px;
+      background: rgba(255,255,255,0.8);
+      border: 1px solid rgba(15,118,110,0.08);
+    }
+    .item header {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 8px;
+      font-weight: 700;
+    }
+    .state-chip {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 92px;
+      padding: 6px 10px;
+      border-radius: 999px;
+      font-size: 0.78rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      background: rgba(15,118,110,0.12);
+      color: var(--accent);
+    }
+    .state-chip.loss { background: rgba(180,35,24,0.12); color: var(--loss); }
+    .state-chip.profit { background: rgba(29,78,216,0.14); color: var(--profit); }
+    .state-chip.warn { background: rgba(154,103,0,0.14); color: var(--warn); }
+    .market-grid {
+      margin: 0;
+      display: grid;
+      grid-template-columns: repeat(5, minmax(120px, 1fr));
+      gap: 8px 12px;
+    }
+    dt {
+      color: var(--muted);
+      font-size: 0.75rem;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+    dd {
+      margin: 0;
+      font-size: 0.92rem;
+      font-family: "Consolas", "IBM Plex Mono", monospace;
+      overflow-wrap: anywhere;
+    }
+    .span-2 { grid-column: span 2; }
+    .span-3 { grid-column: span 3; }
+    .empty {
+      padding: 18px;
+      color: var(--muted);
+      border: 1px dashed rgba(15,118,110,0.18);
+      border-radius: 16px;
+      background: rgba(255,255,255,0.46);
+    }
+    pre.json {
+      margin: 0;
+      padding: 16px;
+      border-radius: 16px;
+      background: #11201c;
+      color: #e9fff8;
+      overflow: auto;
+      font-size: 0.84rem;
+    }
+    .log-line {
+      padding: 12px 14px;
+      border-radius: 14px;
+      background: rgba(255,255,255,0.7);
+      border: 1px solid rgba(15,118,110,0.08);
+      font-family: "Consolas", "IBM Plex Mono", monospace;
+      font-size: 0.84rem;
+    }
+    @media (max-width: 720px) {
+      .shell { padding: 14px 10px 28px; }
+      .market-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .span-2, .span-3 { grid-column: span 2; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <section class="hero">
+      <div class="banner">
+        <span class="pill" id="connection">Connecting...</span>
+        <span id="runtimeLabel">Value Polling Runtime</span>
+      </div>
+      <h1>Value Polling Strategy</h1>
+      <p>Track short-duration crypto up/down markets, open first leg inside the target band, and wait for the opposite leg to revisit the band before settlement.</p>
+    </section>
+    <section class="grid" id="topStats"></section>
+    <section class="sections" id="sections"></section>
+  </div>
+  <script>
+    const state = {
+      runtime: {},
+      config: {},
+      stats: {},
+      markets: [],
+      recentActions: [],
+      logs: [],
+    };
+    const topStatsEl = document.getElementById('topStats');
+    const sectionsEl = document.getElementById('sections');
+    const connectionEl = document.getElementById('connection');
+    const runtimeLabelEl = document.getElementById('runtimeLabel');
+    const panelState = new Map();
+    const sectionOrder = ['runtime', 'config', 'markets', 'actions', 'logs'];
+    const sectionSlots = new Map();
+    const dirty = new Set(['chrome', 'topStats', ...sectionOrder]);
+    let renderScheduled = false;
+
+    function money(v) {
+      const n = Number(v);
+      return Number.isFinite(n) ? '$' + n.toFixed(2) : String(v ?? '-');
+    }
+    function ts(v) {
+      if (!v) return '-';
+      const d = new Date(v);
+      return Number.isNaN(d.getTime()) ? String(v ?? '-') : d.toLocaleTimeString();
+    }
+    function dash(value) {
+      return value == null || value === '' ? '-' : String(value);
+    }
+    function escapeHtml(value) {
+      return String(value)
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;');
+    }
+    function renderList(items, renderItem) {
+      if (!items.length) return '<div class="empty">No data yet.</div>';
+      return '<div class="list">' + items.map(renderItem).join('') + '</div>';
+    }
+    function panel(key, title, meta, body, open = true) {
+      const isOpen = panelState.has(key) ? panelState.get(key) : open;
+      return `<details class="panel" data-panel-key="${key}" ${isOpen ? 'open' : ''}>
+        <summary><span>${title}</span><span class="summary-meta">${meta}</span></summary>
+        <div class="panel-body">${body}</div>
+      </details>`;
+    }
+    function initializeSections() {
+      sectionsEl.innerHTML = sectionOrder.map((key) => `<div data-section-slot="${key}"></div>`).join('');
+      for (const key of sectionOrder) {
+        sectionSlots.set(key, sectionsEl.querySelector(`[data-section-slot="${key}"]`));
+      }
+    }
+    sectionsEl.addEventListener('toggle', (event) => {
+      const panelEl = event.target.closest('details.panel[data-panel-key]');
+      if (!panelEl) return;
+      panelState.set(panelEl.dataset.panelKey, panelEl.open);
+    }, true);
+
+    function renderTopStats() {
+      const cards = [
+        ['Tracked Markets', state.stats.trackedMarkets ?? 0],
+        ['Open Markets', state.stats.openMarkets ?? 0],
+        ['Paired Open', state.stats.pairedOpenMarkets ?? 0],
+        ['Stranded Open', state.stats.strandedOpenMarkets ?? 0],
+        ['Actions', state.stats.actions ?? 0],
+        ['Settled Markets', state.stats.settledMarkets ?? 0],
+        ['Open Cost', money(state.stats.openCost ?? 0)],
+        ['Settled PnL', money(state.stats.settledPnl ?? 0)],
+      ];
+      topStatsEl.innerHTML = cards.map(([label, value]) => `
+        <article class="stat">
+          <div class="label">${label}</div>
+          <div class="value">${value}</div>
+        </article>
+      `).join('');
+    }
+
+    function renderRuntimeSection() {
+      return panel('runtime', 'Runtime Snapshot', state.runtime.mode || 'value', `
+        <dl class="market-grid">
+          <div><dt>Mode</dt><dd>${dash(state.runtime.mode)}</dd></div>
+          <div class="span-2"><dt>Wallet</dt><dd>${dash(state.runtime.wallet)}</dd></div>
+          <div><dt>Dry Run</dt><dd>${String(state.runtime.dryRun ?? false)}</dd></div>
+          <div><dt>Started</dt><dd>${ts(state.runtime.startedAt)}</dd></div>
+        </dl>
+      `);
+    }
+
+    function renderConfigSection() {
+      return panel('config', 'Config', 'Current strategy parameters',
+        '<pre class="json">' + escapeHtml(JSON.stringify(state.config, null, 2)) + '</pre>', false);
+    }
+
+    function renderMarketsSection() {
+      return panel('markets', 'Markets', `${state.markets.length} tracked`, renderList(state.markets, (item) => `
+        <article class="item">
+          <header>
+            <span>${item.slug}</span>
+            <span class="state-chip ${item.state === 'SETTLED' ? (Number(item.pnl) >= 0 ? 'profit' : 'loss') : (item.state.includes('WAIT') ? 'warn' : '')}">${item.state}</span>
+          </header>
+          <dl class="market-grid">
+            <div class="span-3"><dt>Question</dt><dd>${dash(item.question)}</dd></div>
+            <div><dt>Closes</dt><dd>${ts(item.closeTs * 1000)}</dd></div>
+            <div><dt>Time Left</dt><dd>${dash(item.timeLeftSec)}</dd></div>
+            <div><dt>Up Ask</dt><dd>${dash(item.upAsk)}</dd></div>
+            <div><dt>Down Ask</dt><dd>${dash(item.downAsk)}</dd></div>
+            <div><dt>Band</dt><dd>${dash(item.entryBand)}</dd></div>
+            <div><dt>Chosen Side</dt><dd>${dash(item.firstSide)}</dd></div>
+            <div><dt>Up Status</dt><dd>${dash(item.upStatus)}</dd></div>
+            <div><dt>Up Spend</dt><dd>${money(item.upSpent)}</dd></div>
+            <div><dt>Up Shares</dt><dd>${dash(item.upShares)}</dd></div>
+            <div><dt>Up Avg Px</dt><dd>${dash(item.upPrice)}</dd></div>
+            <div><dt>Down Status</dt><dd>${dash(item.downStatus)}</dd></div>
+            <div><dt>Down Spend</dt><dd>${money(item.downSpent)}</dd></div>
+            <div><dt>Down Shares</dt><dd>${dash(item.downShares)}</dd></div>
+            <div><dt>Down Avg Px</dt><dd>${dash(item.downPrice)}</dd></div>
+            <div><dt>Total Cost</dt><dd>${money(item.totalCost)}</dd></div>
+            <div><dt>Redeemed</dt><dd>${money(item.redeemed)}</dd></div>
+            <div><dt>PnL</dt><dd>${money(item.pnl)}</dd></div>
+            <div class="span-2"><dt>Last Action</dt><dd>${dash(item.lastAction)}</dd></div>
+          </dl>
+        </article>
+      `));
+    }
+
+    function renderActionsSection() {
+      return panel('actions', 'Recent Actions', `${state.recentActions.length} events`, renderList(state.recentActions, (item) => `
+        <article class="item">
+          <header><span>${dash(item.slug)}</span><span>${ts(item.timestamp)}</span></header>
+          <dl class="market-grid">
+            <div><dt>Action</dt><dd>${dash(item.type)}</dd></div>
+            <div><dt>Side</dt><dd>${dash(item.side)}</dd></div>
+            <div><dt>State</dt><dd>${dash(item.state)}</dd></div>
+            <div><dt>Spent</dt><dd>${money(item.spent)}</dd></div>
+            <div><dt>Shares</dt><dd>${dash(item.shares)}</dd></div>
+          </dl>
+        </article>
+      `), false);
+    }
+
+    function renderLogsSection() {
+      return panel('logs', 'Logs', `${state.logs.length} recent`, renderList(state.logs, (item) => `
+        <div class="log-line">
+          [${dash(item.timestamp)}] ${dash(item.level)}: ${escapeHtml(item.message || '')}
+        </div>
+      `), false);
+    }
+
+    const renderers = {
+      runtime: renderRuntimeSection,
+      config: renderConfigSection,
+      markets: renderMarketsSection,
+      actions: renderActionsSection,
+      logs: renderLogsSection,
+    };
+
+    function updateRuntimeChrome() {
+      connectionEl.textContent = state.runtime.connected ? 'Live' : 'Waiting';
+      runtimeLabelEl.textContent = state.runtime.dashboardUrl || 'Value Polling Runtime';
+    }
+
+    function renderSection(key) {
+      const slot = sectionSlots.get(key);
+      if (!slot) return;
+      slot.innerHTML = renderers[key]();
+    }
+
+    function flushRender() {
+      renderScheduled = false;
+      if (dirty.has('chrome')) {
+        updateRuntimeChrome();
+        dirty.delete('chrome');
+      }
+      if (dirty.has('topStats')) {
+        renderTopStats();
+        dirty.delete('topStats');
+      }
+      for (const key of sectionOrder) {
+        if (!dirty.has(key)) continue;
+        renderSection(key);
+        dirty.delete(key);
+      }
+    }
+
+    function scheduleRender(...keys) {
+      if (!keys.length) {
+        dirty.add('chrome');
+        dirty.add('topStats');
+        for (const key of sectionOrder) dirty.add(key);
+      } else {
+        for (const key of keys) dirty.add(key);
+      }
+      if (renderScheduled) return;
+      renderScheduled = true;
+      requestAnimationFrame(flushRender);
+    }
+
+    function applySnapshot(snapshot) {
+      Object.assign(state, snapshot);
+      scheduleRender();
+    }
+
+    function handleEvent(payload) {
+      const { type, data } = payload;
+      if (type === 'runtime') {
+        state.runtime = { ...state.runtime, ...data };
+        scheduleRender('chrome', 'runtime');
+      } else if (type === 'config') {
+        state.config = data;
+        scheduleRender('config');
+      } else if (type === 'stats') {
+        state.stats = { ...data };
+        scheduleRender('topStats');
+      } else if (type === 'markets') {
+        state.markets = data;
+        scheduleRender('markets');
+      } else if (type === 'action') {
+        state.recentActions = [data, ...state.recentActions].slice(0, 150);
+        scheduleRender('actions');
+      } else if (type === 'log') {
+        state.logs = [data, ...state.logs].slice(0, 250);
+        scheduleRender('logs');
+      }
+    }
+
+    const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
+    ws.addEventListener('open', () => {
+      state.runtime.connected = true;
+      scheduleRender('chrome');
+    });
+    ws.addEventListener('close', () => {
+      state.runtime.connected = false;
+      scheduleRender('chrome');
+    });
+    ws.addEventListener('message', (event) => {
+      const payload = JSON.parse(event.data);
+      if (payload.type === 'snapshot') applySnapshot(payload.data);
+      else handleEvent(payload);
+    });
+
+    initializeSections();
+    scheduleRender();
+  </script>
+</body>
+</html>
