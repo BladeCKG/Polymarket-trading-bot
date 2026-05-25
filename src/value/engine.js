@@ -4,7 +4,6 @@ import { ClobClient } from '../clob.js';
 import { waitForResolution } from '../market.js';
 import {
   VALUE_DRY_RUN,
-  VALUE_DRY_RUN_PRICE_DELTA,
   VALUE_ENDGAME_EXIT_BELOW_PRICE,
   VALUE_IMMEDIATE_EXIT_BELOW_PRICE,
   VALUE_FIRST_LEG_CUTOFF_SECONDS,
@@ -110,8 +109,6 @@ export class ValueStrategyEngine extends EventEmitter {
     const settledPnl = closed.reduce((sum, market) => sum + Number(market.pnl ?? 0), 0);
     const profitMarkets = closed.filter((market) => Number(market.pnl ?? 0) > 0).length;
     const lossMarkets = closed.filter((market) => Number(market.pnl ?? 0) < 0).length;
-    const flatMarkets = closed.filter((market) => market.state === 'FLAT').length;
-    const forcePairedMarkets = closed.filter((market) => market.hadForcePair).length;
 
     return {
       trackedMarkets: markets.length,
@@ -121,8 +118,6 @@ export class ValueStrategyEngine extends EventEmitter {
       settledMarkets: closedMarkets,
       profitMarkets,
       lossMarkets,
-      flatMarkets,
-      forcePairedMarkets,
       openCost: openCost.toFixed(2),
       settledPnl: settledPnl.toFixed(2),
       actions: this.actions,
@@ -481,11 +476,6 @@ export class ValueStrategyEngine extends EventEmitter {
     ).length;
   }
 
-  _isDryRunPriceNear(targetPrice, observedPrice) {
-    if (!Number.isFinite(targetPrice) || !Number.isFinite(observedPrice)) return false;
-    return Math.abs(observedPrice - targetPrice) <= VALUE_DRY_RUN_PRICE_DELTA;
-  }
-
   _targetShares() {
     if (VALUE_ORDER_MODE === 'SHARES') return VALUE_TARGET_SHARES;
     if (!Number.isFinite(VALUE_TARGET_PRICE) || VALUE_TARGET_PRICE <= 0) return 0;
@@ -601,7 +591,7 @@ export class ValueStrategyEngine extends EventEmitter {
       const order = market.pendingBuyOrders[side];
       if (!order) continue;
       const bestAsk = market.quote?.[side]?.bestAsk;
-      if (!this._isDryRunPriceNear(order.price, bestAsk)) continue;
+      if (!Number.isFinite(bestAsk) || bestAsk > order.price) continue;
       const fillPrice = bestAsk;
       const fillShares = order.shares;
       const spentUsdc = fillPrice * fillShares;

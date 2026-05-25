@@ -28,7 +28,6 @@ export const VALUE_MARKET_REFRESH_MS = num('VALUE_MARKET_REFRESH_MS', 15_000);
 export const VALUE_SYMBOLS = csv('VALUE_SYMBOLS', 'btc,eth,sol,xrp');
 export const VALUE_DURATIONS = csv('VALUE_DURATIONS', '5m,15m');
 export const VALUE_TARGET_PRICE = num('VALUE_TARGET_PRICE', 0.40);
-export const VALUE_DRY_RUN_PRICE_DELTA = num('VALUE_DRY_RUN_PRICE_DELTA', 0.02);
 export const VALUE_MAX_SLIPPAGE = num('VALUE_MAX_SLIPPAGE', 0.03);
 export const VALUE_ORDER_MODE = opt('VALUE_ORDER_MODE', 'USDC').toUpperCase();
 export const VALUE_LEG_USDC = num('VALUE_LEG_USDC', 1);
