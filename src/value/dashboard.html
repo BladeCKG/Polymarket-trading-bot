@@ -158,10 +158,38 @@
       font-family: "Consolas", "IBM Plex Mono", monospace;
       font-size: 0.84rem;
     }
+    .filters {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(180px, 1fr));
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+    .filter {
+      display: grid;
+      gap: 6px;
+    }
+    .filter label {
+      color: var(--muted);
+      font-size: 0.75rem;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      font-weight: 700;
+    }
+    .filter select {
+      width: 100%;
+      border: 1px solid rgba(15,118,110,0.14);
+      border-radius: 12px;
+      background: rgba(255,255,255,0.92);
+      color: var(--text);
+      padding: 10px 12px;
+      font: inherit;
+    }
     @media (max-width: 720px) {
       .shell { padding: 14px 10px 28px; }
       .market-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .span-2, .span-3 { grid-column: span 2; }
+      .span-5 { grid-column: span 2; }
+      .filters { grid-template-columns: 1fr; }
     }
   </style>
 </head>
@@ -186,6 +214,11 @@
       markets: [],
       recentActions: [],
       logs: [],
+    };
+    const marketFilters = {
+      state: 'ALL',
+      position: 'ALL',
+      pnl: 'ALL',
     };
     const topStatsEl = document.getElementById('topStats');
     const sectionsEl = document.getElementById('sections');
@@ -274,7 +307,31 @@
     }
 
     function renderMarketsSection() {
-      return panel('markets', 'Markets', `${state.markets.length} tracked`, renderList(state.markets, (item) => `
+      const filteredMarkets = state.markets.filter(matchesMarketFilters);
+      const stateOptions = uniqueOptions(state.markets.map((item) => item.state).filter(Boolean));
+      const positionOptions = uniqueOptions(state.markets.map((item) => item.positionType).filter(Boolean));
+      return panel('markets', 'Markets', `${filteredMarkets.length} shown / ${state.markets.length} tracked`, `
+        <div class="filters">
+          <div class="filter">
+            <label for="market-filter-state">State</label>
+            <select id="market-filter-state" data-market-filter="state">
+              ${renderFilterOptions('ALL', stateOptions, marketFilters.state)}
+            </select>
+          </div>
+          <div class="filter">
+            <label for="market-filter-position">Position</label>
+            <select id="market-filter-position" data-market-filter="position">
+              ${renderFilterOptions('ALL', positionOptions, marketFilters.position)}
+            </select>
+          </div>
+          <div class="filter">
+            <label for="market-filter-pnl">PnL Result</label>
+            <select id="market-filter-pnl" data-market-filter="pnl">
+              ${renderFilterOptions('ALL', ['PROFIT', 'LOSS', 'FLAT', 'UNSETTLED'], marketFilters.pnl)}
+            </select>
+          </div>
+        </div>
+        ${renderList(filteredMarkets, (item) => `
         <article class="item">
           <header>
             <span>${item.slug}</span>
@@ -331,7 +388,7 @@
             <div class="span-5"><dt>Last Action</dt><dd>${dash(item.lastAction)}</dd></div>
           </dl>
         </article>
-      `));
+      `)}`, true);
     }
 
     function renderActionsSection() {
@@ -374,6 +431,35 @@
       const slot = sectionSlots.get(key);
       if (!slot) return;
       slot.innerHTML = renderers[key]();
+    }
+
+    function uniqueOptions(values) {
+      return [...new Set(values)].sort((a, b) => String(a).localeCompare(String(b)));
+    }
+
+    function renderFilterOptions(allLabel, values, selected) {
+      const options = [allLabel, ...values];
+      return options.map((value) => {
+        const label = value === 'ALL' ? 'All' : value;
+        const isSelected = value === selected ? 'selected' : '';
+        return `<option value="${escapeHtml(value)}" ${isSelected}>${escapeHtml(label)}</option>`;
+      }).join('');
+    }
+
+    function marketPnlBucket(item) {
+      if (item.state !== 'SETTLED' || item.pnl == null || item.pnl === '') return 'UNSETTLED';
+      const pnl = Number(item.pnl);
+      if (!Number.isFinite(pnl)) return 'UNSETTLED';
+      if (pnl > 0) return 'PROFIT';
+      if (pnl < 0) return 'LOSS';
+      return 'FLAT';
+    }
+
+    function matchesMarketFilters(item) {
+      if (marketFilters.state !== 'ALL' && item.state !== marketFilters.state) return false;
+      if (marketFilters.position !== 'ALL' && item.positionType !== marketFilters.position) return false;
+      if (marketFilters.pnl !== 'ALL' && marketPnlBucket(item) !== marketFilters.pnl) return false;
+      return true;
     }
 
     function flushRender() {
@@ -450,6 +536,12 @@
     });
 
     initializeSections();
+    sectionsEl.addEventListener('change', (event) => {
+      const select = event.target.closest('select[data-market-filter]');
+      if (!select) return;
+      marketFilters[select.dataset.marketFilter] = select.value;
+      scheduleRender('markets');
+    });
     scheduleRender();
   </script>
 </body>
