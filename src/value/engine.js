@@ -7,6 +7,7 @@ import {
   VALUE_ENTRY_MIN_PRICE,
   VALUE_ENTRY_MAX_PRICE,
   VALUE_FIRST_LEG_CUTOFF_SECONDS,
+  VALUE_ENDGAME_HOLD_WINNER_PRICE,
   VALUE_LEG_USDC,
   VALUE_MAX_OPEN_MARKETS,
   VALUE_MAX_SLIPPAGE,
@@ -171,6 +172,7 @@ export class ValueStrategyEngine extends EventEmitter {
       hadAnyTrade: false,
       outcomes: [],
       payouts: [],
+      endgameHoldSide: null,
     };
   }
 
@@ -452,9 +454,56 @@ export class ValueStrategyEngine extends EventEmitter {
   }
 
   async _handleEndgame(market, openSide, openBook, oppositeSide, oppositeBook) {
+    if (this._shouldHoldWinnerIntoSettlement(market, openSide, openBook)) {
+      if (market.endgameHoldSide !== openSide) {
+        const legQuote = market.quote?.[openSide] ?? {};
+        const holdPrice = Number.isFinite(legQuote.bestBid) ? legQuote.bestBid : legQuote.bestAsk;
+        market.endgameHoldSide = openSide;
+        market.lastAction = `${VALUE_DRY_RUN ? 'dry-run' : 'hold'} ${openSide.toLowerCase()} winner @ ${Number(holdPrice).toFixed(4)}`;
+        this.actions += 1;
+        this.emit('action', {
+          type: 'hold-winner',
+          slug: market.slug,
+          side: openSide,
+          state: market.state,
+          spent: 0,
+          shares: this._openShares(market.legs[openSide]),
+          price: holdPrice,
+          threshold: VALUE_ENDGAME_HOLD_WINNER_PRICE,
+          timestamp: Date.now(),
+        });
+        logger.info('value.engine: holding apparent winner into settlement', {
+          slug: market.slug,
+          side: openSide,
+          state: market.state,
+          bestBid: legQuote.bestBid ?? null,
+          bestAsk: legQuote.bestAsk ?? null,
+          threshold: VALUE_ENDGAME_HOLD_WINNER_PRICE,
+          dryRun: VALUE_DRY_RUN,
+        });
+        this.emit('markets-updated', this.snapshotMarkets());
+      }
+      this._ensureSettlementWatch(market);
+      return;
+    }
+
+    market.endgameHoldSide = null;
     const flattened = await this._flattenOpenLeg(market, openSide, openBook);
     if (flattened) return;
     await this._enterLeg(market, oppositeSide, oppositeBook, { force: true });
+  }
+
+  _shouldHoldWinnerIntoSettlement(market, side, book) {
+    const leg = market.legs[side];
+    if (!leg?.entered || this._openShares(leg) <= 1e-9) return false;
+    if (!Number.isFinite(VALUE_ENDGAME_HOLD_WINNER_PRICE) || VALUE_ENDGAME_HOLD_WINNER_PRICE <= 0) {
+      return false;
+    }
+
+    const bestBid = bestBidFromBook(book)?.price ?? null;
+    const bestAsk = bestAskFromBook(book)?.price ?? null;
+    const signalPrice = Number.isFinite(bestBid) ? bestBid : bestAsk;
+    return Number.isFinite(signalPrice) && signalPrice >= VALUE_ENDGAME_HOLD_WINNER_PRICE;
   }
 
   async _flattenOpenLeg(market, side, book) {
