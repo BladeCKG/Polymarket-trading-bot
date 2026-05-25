@@ -4,6 +4,7 @@ import { ClobClient } from '../clob.js';
 import { waitForResolution } from '../market.js';
 import {
   VALUE_DRY_RUN,
+  VALUE_DRY_RUN_PRICE_DELTA,
   VALUE_ENDGAME_EXIT_BELOW_PRICE,
   VALUE_IMMEDIATE_EXIT_BELOW_PRICE,
   VALUE_FIRST_LEG_CUTOFF_SECONDS,
@@ -346,6 +347,7 @@ export class ValueStrategyEngine extends EventEmitter {
       await this._ensureSecondLegAndExit(market);
       await this._simulatePendingFills(market);
       if (market.state !== 'WAIT_DOWN') return;
+      if (await this._simulateExitFill(market, 'Up', upBook)) return;
       if (this._shouldImmediateExitStrandedLeg(market, 'Up', upBook)) {
         await this._cancelMarketOrders(market, 'immediate-exit');
         await this._handleEndgame(market, 'Up', upBook, 'Down', downBook, { immediate: true });
@@ -372,6 +374,7 @@ export class ValueStrategyEngine extends EventEmitter {
       await this._ensureSecondLegAndExit(market);
       await this._simulatePendingFills(market);
       if (market.state !== 'WAIT_UP') return;
+      if (await this._simulateExitFill(market, 'Down', downBook)) return;
       if (this._shouldImmediateExitStrandedLeg(market, 'Down', downBook)) {
         await this._cancelMarketOrders(market, 'immediate-exit');
         await this._handleEndgame(market, 'Down', downBook, 'Up', upBook, { immediate: true });
@@ -476,6 +479,11 @@ export class ValueStrategyEngine extends EventEmitter {
     return [...this.markets.values()].filter((market) =>
       !market.settled && (market.state === 'WAIT_UP' || market.state === 'WAIT_DOWN')
     ).length;
+  }
+
+  _isDryRunPriceNear(targetPrice, observedPrice) {
+    if (!Number.isFinite(targetPrice) || !Number.isFinite(observedPrice)) return false;
+    return Math.abs(observedPrice - targetPrice) <= VALUE_DRY_RUN_PRICE_DELTA;
   }
 
   _targetShares() {
@@ -593,7 +601,7 @@ export class ValueStrategyEngine extends EventEmitter {
       const order = market.pendingBuyOrders[side];
       if (!order) continue;
       const bestAsk = market.quote?.[side]?.bestAsk;
-      if (!Number.isFinite(bestAsk) || bestAsk > order.price) continue;
+      if (!this._isDryRunPriceNear(order.price, bestAsk)) continue;
       const fillPrice = bestAsk;
       const fillShares = order.shares;
       const spentUsdc = fillPrice * fillShares;
@@ -608,6 +616,25 @@ export class ValueStrategyEngine extends EventEmitter {
       });
       return;
     }
+  }
+
+  async _simulateExitFill(market, side, book) {
+    if (!VALUE_DRY_RUN || !market.exitPlan || market.exitPlan.side !== side) return false;
+    const leg = market.legs[side];
+    const openShares = this._openShares(leg);
+    if (openShares <= 1e-9) return false;
+
+    const bestBid = bestBidFromBook(book)?.price ?? null;
+    if (!this._isDryRunPriceNear(market.exitPlan.triggerPrice, bestBid)) return false;
+
+    await this._recordSellFill(market, side, {
+      price: bestBid,
+      shares: openShares,
+      proceedsUsdc: bestBid * openShares,
+      source: 'simulated-exit-order',
+      orderId: null,
+    });
+    return true;
   }
 
   async handleFill(fill) {
