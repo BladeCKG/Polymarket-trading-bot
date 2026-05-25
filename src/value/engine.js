@@ -30,6 +30,15 @@ function nowSec() {
   return Math.floor(Date.now() / 1000);
 }
 
+function bookSnapshot(book) {
+  return {
+    bids: Array.isArray(book?.bids) ? book.bids.map((bid) => ({ price: bid.price, size: bid.size })) : [],
+    asks: Array.isArray(book?.asks) ? book.asks.map((ask) => ({ price: ask.price, size: ask.size })) : [],
+    tickSize: book?.tickSize ?? null,
+    minOrderSize: book?.minOrderSize ?? null,
+  };
+}
+
 export class ValueStrategyEngine extends EventEmitter {
   constructor(wallet) {
     super();
@@ -326,6 +335,7 @@ export class ValueStrategyEngine extends EventEmitter {
     if (!plan || plan.fillShares <= 0 || plan.spentUsdc <= 0) return;
 
     const tokenId = side === 'Up' ? market.upToken.tokenId : market.downToken.tokenId;
+    const snapshot = bookSnapshot(book);
     try {
       let response = null;
       if (!VALUE_DRY_RUN) {
@@ -356,6 +366,12 @@ export class ValueStrategyEngine extends EventEmitter {
         shares: leg.shares,
         price: leg.avgPrice,
         forced: force,
+        tokenId,
+        bestAsk: quote.price,
+        maxPrice,
+        orderMode: VALUE_ORDER_MODE,
+        executionPlan: plan,
+        book: snapshot,
         timestamp: Date.now(),
         response,
       };
@@ -368,6 +384,10 @@ export class ValueStrategyEngine extends EventEmitter {
         shares: leg.shares,
         avgPrice: leg.avgPrice,
         forced: force,
+        tokenId,
+        bestAsk: quote.price,
+        maxPrice,
+        executionPlan: plan,
         dryRun: VALUE_DRY_RUN,
       });
       this.emit('markets-updated', this.snapshotMarkets());
@@ -396,6 +416,11 @@ export class ValueStrategyEngine extends EventEmitter {
         state: market.state,
         spent: plan.spentUsdc,
         shares: plan.fillShares,
+        tokenId,
+        bestAsk: quote?.price ?? null,
+        maxPrice,
+        executionPlan: plan,
+        book: snapshot,
         timestamp: Date.now(),
       });
     }
@@ -446,6 +471,7 @@ export class ValueStrategyEngine extends EventEmitter {
     }
 
     const tokenId = side === 'Up' ? market.upToken.tokenId : market.downToken.tokenId;
+    const snapshot = bookSnapshot(book);
     try {
       let response = null;
       if (!VALUE_DRY_RUN) {
@@ -472,6 +498,11 @@ export class ValueStrategyEngine extends EventEmitter {
         spent: plan.proceedsUsdc,
         shares: plan.soldShares,
         price: leg.sellAvgPrice,
+        tokenId,
+        bestBid: bestBid.price,
+        minPrice,
+        executionPlan: plan,
+        book: snapshot,
         timestamp: Date.now(),
         response,
       });
@@ -482,6 +513,10 @@ export class ValueStrategyEngine extends EventEmitter {
         soldShares: plan.soldShares,
         proceedsUsdc: plan.proceedsUsdc,
         avgPrice: leg.sellAvgPrice,
+        tokenId,
+        bestBid: bestBid.price,
+        minPrice,
+        executionPlan: plan,
         dryRun: VALUE_DRY_RUN,
       });
       this.emit('markets-updated', this.snapshotMarkets());
@@ -500,6 +535,11 @@ export class ValueStrategyEngine extends EventEmitter {
         state: market.state,
         spent: plan.proceedsUsdc,
         shares: plan.soldShares,
+        tokenId,
+        bestBid: bestBid.price,
+        minPrice,
+        executionPlan: plan,
+        book: snapshot,
         timestamp: Date.now(),
       });
       return false;
