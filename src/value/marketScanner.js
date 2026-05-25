@@ -1,5 +1,5 @@
 import axios from 'axios';
-import { GAMMA_API_URL } from '../config.js';
+import { CLOB_API_URL, GAMMA_API_URL } from '../config.js';
 
 const DURATION_SECONDS = {
   '5m': 5 * 60,
@@ -91,6 +91,27 @@ async function fetchMarketBySlug(slug) {
   }
 }
 
+async function hasLiveBook(tokenId) {
+  try {
+    await axios.get(`${CLOB_API_URL}/book`, {
+      timeout: 5_000,
+      params: { token_id: tokenId },
+    });
+    return true;
+  } catch (err) {
+    if (err.response?.status === 404) return false;
+    throw err;
+  }
+}
+
+async function marketHasLiveBooks(market) {
+  const [upLive, downLive] = await Promise.all([
+    hasLiveBook(market.upToken.tokenId),
+    hasLiveBook(market.downToken.tokenId),
+  ]);
+  return upLive && downLive;
+}
+
 export async function fetchActiveValueMarkets({
   symbols,
   durations,
@@ -109,7 +130,7 @@ export async function fetchActiveValueMarkets({
   );
 
   const markets = await Promise.all(candidateSlugs.map((slug) => fetchMarketBySlug(slug)));
-  return markets
+  const normalized = markets
     .map(normalizeMarketRecord)
     .filter(Boolean)
     .filter((market) =>
@@ -118,4 +139,7 @@ export async function fetchActiveValueMarkets({
       market.windowTs <= nowTs &&
       market.closeTs > nowTs
     );
+
+  const liveFlags = await Promise.all(normalized.map((market) => marketHasLiveBooks(market)));
+  return normalized.filter((_, index) => liveFlags[index]);
 }
