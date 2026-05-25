@@ -31,6 +31,7 @@ import {
 } from './config.js';
 import { ValueDashboardServer } from './dashboard.js';
 import { ValueStrategyEngine } from './engine.js';
+import { ValueTraceFile } from './traceFile.js';
 
 export async function main() {
   const wallet = getSigner();
@@ -49,6 +50,23 @@ export async function main() {
     legUsdc: VALUE_LEG_USDC,
     targetShares: VALUE_TARGET_SHARES,
   });
+
+  const traceFile = new ValueTraceFile();
+  const tracePath = traceFile.start();
+  traceFile.write('startup', {
+    wallet: wallet.address,
+    dryRun: VALUE_DRY_RUN,
+    symbols: VALUE_SYMBOLS,
+    durations: VALUE_DURATIONS,
+    pollMs: VALUE_POLL_MS,
+    marketRefreshMs: VALUE_MARKET_REFRESH_MS,
+    entryBand: [VALUE_ENTRY_MIN_PRICE, VALUE_ENTRY_MAX_PRICE],
+    maxSlippage: VALUE_MAX_SLIPPAGE,
+    orderMode: VALUE_ORDER_MODE,
+    legUsdc: VALUE_LEG_USDC,
+    targetShares: VALUE_TARGET_SHARES,
+  });
+  logger.info('value.main: trace file enabled', { path: tracePath });
 
   const dashboard = VALUE_DASHBOARD_ENABLED
     ? new ValueDashboardServer({
@@ -103,6 +121,10 @@ export async function main() {
   engine.on('action', (action) => {
     dashboard?.recordAction(action);
     dashboard?.setStats(engine.stats());
+    traceFile.write('action', {
+      action,
+      stats: engine.stats(),
+    });
   });
 
   let stopping = false;
@@ -113,9 +135,15 @@ export async function main() {
     if (stopping) return;
     stopping = true;
     logger.info(`value.main: ${signal} received, shutting down`);
+    traceFile.write('shutdown', {
+      signal,
+      stats: engine.stats(),
+      markets: engine.snapshotMarkets(),
+    });
     clearInterval(refreshTimer);
     clearTimeout(pollTimer);
     dashboard?.stop();
+    traceFile.stop();
     setTimeout(() => process.exit(0), 1_000).unref?.();
   };
 
@@ -131,6 +159,10 @@ export async function main() {
       count: markets.length,
       slugs: markets.slice(0, 12).map((market) => market.slug),
     });
+    traceFile.write('markets-refreshed', {
+      count: markets.length,
+      slugs: markets.map((market) => market.slug),
+    });
     engine.syncMarkets(markets);
     dashboard?.setStats(engine.stats());
   };
@@ -142,6 +174,9 @@ export async function main() {
       dashboard?.setStats(engine.stats());
     } catch (err) {
       logger.warn('value.main: poll loop error', {
+        err: err.message,
+      });
+      traceFile.write('poll-error', {
         err: err.message,
       });
     } finally {
