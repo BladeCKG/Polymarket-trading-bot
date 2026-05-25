@@ -6,6 +6,14 @@ export function bestAskFromBook(book) {
   return eligible[0] ?? null;
 }
 
+export function bestBidFromBook(book) {
+  const bids = Array.isArray(book?.bids) ? book.bids : [];
+  const eligible = bids
+    .filter((bid) => Number.isFinite(bid.price) && Number.isFinite(bid.size) && bid.price > 0 && bid.size > 0)
+    .sort((a, b) => b.price - a.price);
+  return eligible[0] ?? null;
+}
+
 export function estimateBuyCostForSharesFromBook(book, targetShares, maxPrice) {
   const asks = Array.isArray(book?.asks) ? [...book.asks] : [];
   const remainingTarget = Number(targetShares ?? 0);
@@ -51,6 +59,55 @@ export function estimateBuyCostForSharesFromBook(book, targetShares, maxPrice) {
     unfilledShares: Math.max(0, remainingShares),
     fullyFilled: remainingShares <= 1e-9,
     askLevelsConsidered: eligible.length,
+    fills,
+  };
+}
+
+export function estimateSellProceedsForSharesFromBook(book, targetShares, minPrice) {
+  const bids = Array.isArray(book?.bids) ? [...book.bids] : [];
+  const remainingTarget = Number(targetShares ?? 0);
+  const min = Number(minPrice ?? 0);
+  if (!Number.isFinite(remainingTarget) || !Number.isFinite(min) || remainingTarget <= 0 || min <= 0) {
+    return null;
+  }
+
+  bids.sort((a, b) => b.price - a.price);
+  const eligible = bids.filter((bid) =>
+    Number.isFinite(bid.price) &&
+    Number.isFinite(bid.size) &&
+    bid.price > 0 &&
+    bid.size > 0 &&
+    bid.price >= min
+  );
+
+  let remainingShares = remainingTarget;
+  let proceedsUsdc = 0;
+  let soldShares = 0;
+  const fills = [];
+
+  for (const bid of eligible) {
+    if (remainingShares <= 0) break;
+    const fillShares = Math.min(remainingShares, bid.size);
+    const fillProceeds = fillShares * bid.price;
+    soldShares += fillShares;
+    proceedsUsdc += fillProceeds;
+    remainingShares -= fillShares;
+    fills.push({
+      price: bid.price,
+      shares: fillShares,
+      proceedsUsdc: fillProceeds,
+    });
+  }
+
+  if (soldShares <= 0) return null;
+  return {
+    bestBid: eligible[0]?.price ?? bids[0]?.price ?? null,
+    avgFillPrice: proceedsUsdc / soldShares,
+    soldShares,
+    proceedsUsdc,
+    unfilledShares: Math.max(0, remainingShares),
+    fullyFilled: remainingShares <= 1e-9,
+    bidLevelsConsidered: eligible.length,
     fills,
   };
 }

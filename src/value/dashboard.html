@@ -345,6 +345,8 @@
             <div><dt>Chosen Side</dt><dd>${dash(item.firstSide)}</dd></div>
             <div><dt>Up Ask</dt><dd>${dash(item.upAsk)}</dd></div>
             <div><dt>Down Ask</dt><dd>${dash(item.downAsk)}</dd></div>
+            <div><dt>Up Bid</dt><dd>${dash(item.upBid)}</dd></div>
+            <div><dt>Down Bid</dt><dd>${dash(item.downBid)}</dd></div>
             <div><dt>Position</dt><dd>${dash(item.positionType)}</dd></div>
             <div><dt>Entered Legs</dt><dd>${item.enteredLegs?.length ? item.enteredLegs.join(', ') : '-'}</dd></div>
             <div><dt>Winner</dt><dd>${dash(item.winningOutcome)}</dd></div>
@@ -358,6 +360,7 @@
                       <th>Status</th>
                       <th>Spend</th>
                       <th>Shares</th>
+                      <th>Sold</th>
                       <th>Avg Px</th>
                     </tr>
                   </thead>
@@ -367,6 +370,7 @@
                       <td>${dash(item.upStatus)}</td>
                       <td>${money(item.upSpent)}</td>
                       <td>${dash(item.upShares)}</td>
+                      <td>${dash(item.upSoldShares)}</td>
                       <td>${dash(item.upPrice)}</td>
                     </tr>
                     <tr>
@@ -374,6 +378,7 @@
                       <td>${dash(item.downStatus)}</td>
                       <td>${money(item.downSpent)}</td>
                       <td>${dash(item.downShares)}</td>
+                      <td>${dash(item.downSoldShares)}</td>
                       <td>${dash(item.downPrice)}</td>
                     </tr>
                   </tbody>
@@ -382,6 +387,7 @@
             </div>
             <div><dt>Summary</dt><dd>Totals</dd></div>
             <div><dt>Total Cost</dt><dd>${money(item.totalCost)}</dd></div>
+            <div><dt>Cash Out</dt><dd>${money(item.cashProceeds)}</dd></div>
             <div><dt>Redeemed</dt><dd>${money(item.redeemed)}</dd></div>
             <div><dt>PnL</dt><dd>${money(item.pnl)}</dd></div>
             <div><dt>State</dt><dd>${dash(item.state)}</dd></div>

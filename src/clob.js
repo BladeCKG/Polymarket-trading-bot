@@ -243,6 +243,47 @@ async function buildMarketBuyOrder(wallet, tokenId, maxPrice, amountUsdc, expiry
   return { orderData, signature };
 }
 
+async function buildMarketSellOrder(wallet, tokenId, minPrice, shares, expiry = 0, negRisk = true, feeRateBps = '0', tickSize = '0.01') {
+  const roundConfig = getRoundConfig(tickSize);
+  const rawPrice = roundUp(minPrice, roundConfig.price);
+  const rawMakerAmt = roundDown(shares, roundConfig.size);
+
+  let rawTakerAmt = rawMakerAmt * rawPrice;
+  if (decimalPlaces(rawTakerAmt) > roundConfig.amount) {
+    rawTakerAmt = roundDown(rawTakerAmt, roundConfig.amount);
+  }
+
+  const makerAmt = toTokenDecimals(rawMakerAmt);
+  const takerAmt = toTokenDecimals(rawTakerAmt);
+  const saltInt  = Math.floor(Math.random() * Number.MAX_SAFE_INTEGER);
+
+  const signData = {
+    salt:          saltInt,
+    maker:         PROXY_WALLET,
+    signer:        wallet.address,
+    taker:         ethers.ZeroAddress,
+    tokenId:       tokenId,
+    makerAmount:   makerAmt,
+    takerAmount:   takerAmt,
+    expiration:    expiry.toString(),
+    nonce:         '0',
+    feeRateBps:    feeRateBps.toString(),
+    side:          1,
+    signatureType: SIGNATURE_TYPE,
+  };
+
+  const domain = negRisk ? ORDER_DOMAIN : ORDER_DOMAIN_BINARY;
+  const signature = await wallet.signTypedData(domain, ORDER_TYPES, signData);
+
+  const orderData = {
+    ...signData,
+    side: SIDE_SELL,
+    salt: saltInt,
+  };
+
+  return { orderData, signature };
+}
+
 // ── Public API ────────────────────────────────────────────────────────────────
 export class ClobClient {
   static _creds = null;
@@ -600,6 +641,27 @@ export class ClobClient {
       logger.warn('CLOB: FOK buy rejected', { tokenId, errorMsg: res.errorMsg, status: res.status });
     } else {
       logger.debug('CLOB: FOK buy posted', { tokenId, maxPrice, amountUsdc, status: res.status });
+    }
+    return res;
+  }
+
+  static async postFOKSell(wallet, tokenId, minPrice, shares, negRisk = true) {
+    const feeRateBps = await ClobClient.getTakerFeeBps(tokenId);
+    const { tickSize } = await ClobClient.getBook(tokenId);
+    const { orderData, signature } = await buildMarketSellOrder(
+      wallet, tokenId, minPrice, shares, 0, negRisk, feeRateBps, tickSize,
+    );
+    const body = {
+      order: { ...orderData, signature },
+      owner:     ClobClient._creds.apiKey,
+      orderType: 'FOK',
+    };
+    const path = '/order';
+    const res  = await restCall('POST', path, body);
+    if (res.success === false) {
+      logger.warn('CLOB: FOK sell rejected', { tokenId, errorMsg: res.errorMsg, status: res.status });
+    } else {
+      logger.debug('CLOB: FOK sell posted', { tokenId, minPrice, shares, status: res.status });
     }
     return res;
   }
