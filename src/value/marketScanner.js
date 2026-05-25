@@ -1,4 +1,5 @@
 import axios from 'axios';
+import logger from '../logger.js';
 import { CLOB_API_URL, GAMMA_API_URL } from '../config.js';
 
 const DURATION_SECONDS = {
@@ -89,6 +90,15 @@ async function fetchMarketBySlug(slug) {
     return res.data;
   } catch (err) {
     if (err.response?.status === 404) return null;
+    const message = String(err.message ?? '');
+    const isTransientTimeout =
+      message.includes('timeout of') ||
+      message === 'aborted' ||
+      err.code === 'ECONNABORTED';
+    if (isTransientTimeout) {
+      logger.debug('value.marketScanner: slug fetch timed out', { slug, err: message });
+      return null;
+    }
     throw err;
   }
 }
@@ -102,6 +112,15 @@ async function hasLiveBook(tokenId) {
     return true;
   } catch (err) {
     if (err.response?.status === 404) return false;
+    const message = String(err.message ?? '');
+    const isTransientTimeout =
+      message.includes('timeout of') ||
+      message === 'aborted' ||
+      err.code === 'ECONNABORTED';
+    if (isTransientTimeout) {
+      logger.debug('value.marketScanner: book probe timed out', { tokenId, err: message });
+      return false;
+    }
     throw err;
   }
 }
@@ -131,7 +150,12 @@ export async function fetchActiveValueMarkets({
     )
   );
 
-  const markets = await Promise.all(candidateSlugs.map((slug) => fetchMarketBySlug(slug)));
+  const marketResults = await Promise.allSettled(candidateSlugs.map((slug) => fetchMarketBySlug(slug)));
+  const markets = marketResults.flatMap((result) => {
+    if (result.status === 'fulfilled') return [result.value];
+    logger.debug('value.marketScanner: slug fetch failed', { err: result.reason?.message ?? String(result.reason) });
+    return [];
+  });
   const normalized = markets
     .map(normalizeMarketRecord)
     .filter(Boolean)
@@ -143,6 +167,14 @@ export async function fetchActiveValueMarkets({
       market.closeTs > nowTs
     );
 
-  const liveFlags = await Promise.all(normalized.map((market) => marketHasLiveBooks(market)));
-  return normalized.filter((_, index) => liveFlags[index]);
+  const liveFlagResults = await Promise.allSettled(normalized.map((market) => marketHasLiveBooks(market)));
+  return normalized.filter((_, index) => {
+    const result = liveFlagResults[index];
+    if (result?.status === 'fulfilled') return result.value;
+    logger.debug('value.marketScanner: live book check failed', {
+      slug: normalized[index]?.slug ?? null,
+      err: result?.reason?.message ?? String(result?.reason),
+    });
+    return false;
+  });
 }

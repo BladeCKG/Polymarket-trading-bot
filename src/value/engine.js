@@ -90,8 +90,16 @@ export class ValueStrategyEngine extends EventEmitter {
 
   async pollOnce() {
     const openMarkets = [...this.markets.values()].filter((market) => !market.settled);
-    for (const market of openMarkets) {
-      await this._pollMarket(market);
+    const results = await Promise.allSettled(
+      openMarkets.map((market) => this._pollMarket(market))
+    );
+    for (let i = 0; i < results.length; i += 1) {
+      const result = results[i];
+      if (result.status === 'fulfilled') continue;
+      logger.debug('value.engine: market poll failed', {
+        slug: openMarkets[i]?.slug ?? null,
+        err: result.reason?.message ?? String(result.reason),
+      });
     }
     this.emit('markets-updated', this.snapshotMarkets());
   }

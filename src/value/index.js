@@ -188,6 +188,7 @@ export async function main() {
 
   const pollLoop = async () => {
     if (stopping) return;
+    const cycleStartedAt = Date.now();
     try {
       await engine.pollOnce();
       dashboard?.setStats(engine.stats());
@@ -200,9 +201,11 @@ export async function main() {
       });
     } finally {
       if (!stopping) {
+        const elapsedMs = Date.now() - cycleStartedAt;
+        const delayMs = Math.max(0, VALUE_POLL_MS - elapsedMs);
         pollTimer = setTimeout(() => {
           void pollLoop();
-        }, VALUE_POLL_MS);
+        }, delayMs);
         pollTimer.unref?.();
       }
     }

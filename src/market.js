@@ -424,10 +424,14 @@ export async function waitForResolution(target, timeoutMs = 400_000, pollMs = 10
       }
     } catch (err) {
       const message = String(err.message ?? '');
+      const isTransientTimeout =
+        message.includes('timeout of') ||
+        message === 'aborted' ||
+        err.code === 'ECONNABORTED';
       const notFound =
         message.startsWith('Market not found:') ||
         message.startsWith('Market not found for conditionId:');
-      const log = notFound ? logger.debug.bind(logger) : logger.warn.bind(logger);
+      const log = (notFound || isTransientTimeout) ? logger.debug.bind(logger) : logger.warn.bind(logger);
       log('market.js: poll error', {
         slug: slug ?? null,
         conditionId: conditionId || null,
