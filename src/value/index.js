@@ -129,6 +129,16 @@ export async function main() {
       action,
       stats: engine.stats(),
     });
+    traceFile.writeMarket(action.slug, 'action', {
+      action,
+      stats: engine.stats(),
+    });
+  });
+  engine.on('quote', (quote) => {
+    traceFile.writeMarket(quote.slug, 'quote', quote);
+  });
+  engine.on('decision', (decision) => {
+    traceFile.writeMarket(decision.slug, 'decision', decision);
   });
 
   let stopping = false;

@@ -11,14 +11,20 @@ function jsonSafe(value) {
 }
 
 export class ValueTraceFile {
-  constructor({ filename = path.join('logs', 'value-trace.ndjson') } = {}) {
+  constructor({
+    filename = path.join('logs', 'value-trace.ndjson'),
+    marketsDir = path.join('logs', 'value-markets'),
+  } = {}) {
     this.filename = filename;
+    this.marketsDir = marketsDir;
     this.stream = null;
+    this.marketStreams = new Map();
   }
 
   start() {
     if (this.stream) return this.filename;
     mkdirSync(path.dirname(this.filename), { recursive: true });
+    mkdirSync(this.marketsDir, { recursive: true });
     this.stream = createWriteStream(this.filename, { flags: 'a' });
     return this.filename;
   }
@@ -33,9 +39,32 @@ export class ValueTraceFile {
     this.stream.write(line + '\n');
   }
 
+  writeMarket(slug, type, payload) {
+    if (!this.stream || !slug) return;
+    const stream = this._marketStream(slug);
+    const line = JSON.stringify({
+      ts: new Date().toISOString(),
+      type,
+      payload: jsonSafe(payload),
+    });
+    stream.write(line + '\n');
+  }
+
+  _marketStream(slug) {
+    let stream = this.marketStreams.get(slug);
+    if (stream) return stream;
+    const filename = path.join(this.marketsDir, `${slug}.ndjson`);
+    stream = createWriteStream(filename, { flags: 'a' });
+    this.marketStreams.set(slug, stream);
+    return stream;
+  }
+
   stop() {
-    if (!this.stream) return;
-    this.stream.end();
+    if (this.stream) this.stream.end();
+    for (const stream of this.marketStreams.values()) {
+      stream.end();
+    }
+    this.marketStreams.clear();
     this.stream = null;
   }
 }

@@ -40,6 +40,13 @@ function bookSnapshot(book) {
   };
 }
 
+function sideQuotes(quote) {
+  return {
+    bestAsk: quote?.bestAsk ?? null,
+    bestBid: quote?.bestBid ?? null,
+  };
+}
+
 export class ValueStrategyEngine extends EventEmitter {
   constructor(wallet) {
     super();
@@ -269,20 +276,89 @@ export class ValueStrategyEngine extends EventEmitter {
     };
 
     const timeLeftSec = market.closeTs - nowSec();
+    this._emitQuote(market, {
+      timeLeftSec,
+      upBookLive: Boolean(upBook),
+      downBookLive: Boolean(downBook),
+    });
     if (timeLeftSec <= 0) {
       if (this._hasOpenExposure(market)) this._ensureSettlementWatch(market);
+      this._emitDecision(market, {
+        type: 'poll-skip',
+        side: null,
+        reason: 'awaiting-settlement',
+        timeLeftSec,
+      });
       return;
     }
 
     if (market.state === 'NONE') {
-      if (this._countOpenMarkets() >= VALUE_MAX_OPEN_MARKETS) return;
-      if (this._countStrandedLegs() >= VALUE_MAX_STRANDED_LEGS) return;
-      if (timeLeftSec <= VALUE_FIRST_LEG_CUTOFF_SECONDS) return;
+      if (this._countOpenMarkets() >= VALUE_MAX_OPEN_MARKETS) {
+        this._emitDecision(market, {
+          type: 'poll-skip',
+          side: null,
+          reason: 'max-open-markets',
+          timeLeftSec,
+        });
+        return;
+      }
+      if (this._countStrandedLegs() >= VALUE_MAX_STRANDED_LEGS) {
+        this._emitDecision(market, {
+          type: 'poll-skip',
+          side: null,
+          reason: 'max-stranded-legs',
+          timeLeftSec,
+        });
+        return;
+      }
+      if (timeLeftSec <= VALUE_FIRST_LEG_CUTOFF_SECONDS) {
+        this._emitDecision(market, {
+          type: 'poll-skip',
+          side: null,
+          reason: 'first-leg-cutoff',
+          timeLeftSec,
+        });
+        return;
+      }
 
       const upInBand = upBook && this._isInBand(market.quote.Up?.bestAsk);
       const downInBand = downBook && this._isInBand(market.quote.Down?.bestAsk);
+      if (!upBook) {
+        this._emitDecision(market, {
+          type: 'buy-skipped',
+          side: 'Up',
+          reason: 'no-book',
+          timeLeftSec,
+        });
+      } else if (!upInBand) {
+        this._emitDecision(market, {
+          type: 'buy-skipped',
+          side: 'Up',
+          reason: 'not-in-band',
+          timeLeftSec,
+          quote: sideQuotes(market.quote.Up),
+        });
+      }
       if (upInBand) await this._enterLeg(market, 'Up', upBook);
-      if (downInBand && market.state === 'NONE') await this._enterLeg(market, 'Down', downBook);
+      if (market.state === 'NONE') {
+        if (!downBook) {
+          this._emitDecision(market, {
+            type: 'buy-skipped',
+            side: 'Down',
+            reason: 'no-book',
+            timeLeftSec,
+          });
+        } else if (!downInBand) {
+          this._emitDecision(market, {
+            type: 'buy-skipped',
+            side: 'Down',
+            reason: 'not-in-band',
+            timeLeftSec,
+            quote: sideQuotes(market.quote.Down),
+          });
+        }
+        if (downInBand) await this._enterLeg(market, 'Down', downBook);
+      }
       return;
     }
 
@@ -291,7 +367,24 @@ export class ValueStrategyEngine extends EventEmitter {
         await this._handleEndgame(market, 'Up', upBook, 'Down', downBook);
         return;
       }
-      if (downBook && this._isSecondLegEligible(market.quote.Down?.bestAsk)) {
+      if (!downBook) {
+        this._emitDecision(market, {
+          type: 'buy-skipped',
+          side: 'Down',
+          reason: 'no-book',
+          timeLeftSec,
+          waitingFor: 'Down',
+        });
+      } else if (!this._isSecondLegEligible(market.quote.Down?.bestAsk)) {
+        this._emitDecision(market, {
+          type: 'buy-skipped',
+          side: 'Down',
+          reason: 'second-leg-not-eligible',
+          timeLeftSec,
+          waitingFor: 'Down',
+          quote: sideQuotes(market.quote.Down),
+        });
+      } else {
         await this._enterLeg(market, 'Down', downBook);
       }
       return;
@@ -302,7 +395,24 @@ export class ValueStrategyEngine extends EventEmitter {
         await this._handleEndgame(market, 'Down', downBook, 'Up', upBook);
         return;
       }
-      if (upBook && this._isSecondLegEligible(market.quote.Up?.bestAsk)) {
+      if (!upBook) {
+        this._emitDecision(market, {
+          type: 'buy-skipped',
+          side: 'Up',
+          reason: 'no-book',
+          timeLeftSec,
+          waitingFor: 'Up',
+        });
+      } else if (!this._isSecondLegEligible(market.quote.Up?.bestAsk)) {
+        this._emitDecision(market, {
+          type: 'buy-skipped',
+          side: 'Up',
+          reason: 'second-leg-not-eligible',
+          timeLeftSec,
+          waitingFor: 'Up',
+          quote: sideQuotes(market.quote.Up),
+        });
+      } else {
         await this._enterLeg(market, 'Up', upBook);
       }
     }
@@ -344,7 +454,15 @@ export class ValueStrategyEngine extends EventEmitter {
 
   async _enterLeg(market, side, book, { force = false } = {}) {
     const leg = market.legs[side];
-    if (leg.entered) return;
+    if (leg.entered) {
+      this._emitDecision(market, {
+        type: 'buy-skipped',
+        side,
+        reason: 'already-entered',
+        force,
+      });
+      return;
+    }
 
     const quote = bestAskFromBook(book);
     const eligible = force
@@ -352,14 +470,43 @@ export class ValueStrategyEngine extends EventEmitter {
       : market.state === 'NONE'
       ? this._isInBand(quote?.price)
       : this._isSecondLegEligible(quote?.price);
-    if (!quote || !eligible) return;
+    if (!quote) {
+      this._emitDecision(market, {
+        type: 'buy-skipped',
+        side,
+        reason: 'no-best-ask',
+        force,
+      });
+      return;
+    }
+    if (!eligible) {
+      this._emitDecision(market, {
+        type: 'buy-skipped',
+        side,
+        reason: force ? 'force-not-eligible' : 'not-eligible',
+        force,
+        quote: sideQuotes({ bestAsk: quote.price }),
+      });
+      return;
+    }
 
     const maxPrice = this._entryMaxPrice(market, quote.price, force);
 
     const plan = VALUE_ORDER_MODE === 'SHARES'
       ? estimateBuyCostForSharesFromBook(book, VALUE_TARGET_SHARES, maxPrice)
       : ClobClient.estimateMarketBuyFillFromBook(book, maxPrice, VALUE_LEG_USDC, 0);
-    if (!plan || plan.fillShares <= 0 || plan.spentUsdc <= 0) return;
+    if (!plan || plan.fillShares <= 0 || plan.spentUsdc <= 0) {
+      this._emitDecision(market, {
+        type: 'buy-skipped',
+        side,
+        reason: 'no-fill-plan',
+        force,
+        maxPrice,
+        bestAsk: quote.price,
+        executionPlan: plan ?? null,
+      });
+      return;
+    }
 
     const tokenId = side === 'Up' ? market.upToken.tokenId : market.downToken.tokenId;
     const snapshot = bookSnapshot(book);
@@ -479,6 +626,13 @@ export class ValueStrategyEngine extends EventEmitter {
   async _handleEndgame(market, openSide, openBook, oppositeSide, oppositeBook) {
     if (!openBook) {
       market.lastAction = `endgame skipped - no ${openSide.toLowerCase()} book`;
+      this._emitDecision(market, {
+        type: 'endgame',
+        side: openSide,
+        reason: 'open-leg-book-unavailable',
+        openSide,
+        oppositeSide,
+      });
       this._ensureSettlementWatch(market);
       this.emit('markets-updated', this.snapshotMarkets());
       logger.info('value.engine: endgame skipped, open-leg book unavailable', {
@@ -494,6 +648,15 @@ export class ValueStrategyEngine extends EventEmitter {
       const legQuote = market.quote?.[openSide] ?? {};
       const holdPrice = Number.isFinite(legQuote.bestBid) ? legQuote.bestBid : legQuote.bestAsk;
       market.lastAction = `holding ${openSide.toLowerCase()} into settlement @ ${Number(holdPrice).toFixed(4)}`;
+      this._emitDecision(market, {
+        type: 'endgame',
+        side: openSide,
+        reason: 'hold-into-settlement',
+        openSide,
+        oppositeSide,
+        holdPrice,
+        exitBelowPrice: VALUE_ENDGAME_EXIT_BELOW_PRICE,
+      });
       logger.info('value.engine: keeping stranded leg into settlement', {
         slug: market.slug,
         side: openSide,
@@ -512,6 +675,13 @@ export class ValueStrategyEngine extends EventEmitter {
     if (flattened) return;
     if (!oppositeBook) {
       market.lastAction = `endgame no ${oppositeSide.toLowerCase()} book after flatten failed`;
+      this._emitDecision(market, {
+        type: 'endgame',
+        side: oppositeSide,
+        reason: 'force-pair-no-opposite-book',
+        openSide,
+        oppositeSide,
+      });
       this._ensureSettlementWatch(market);
       this.emit('markets-updated', this.snapshotMarkets());
       logger.info('value.engine: force-pair skipped, opposite-leg book unavailable', {
@@ -541,16 +711,36 @@ export class ValueStrategyEngine extends EventEmitter {
   async _flattenOpenLeg(market, side, book) {
     const leg = market.legs[side];
     const openShares = this._openShares(leg);
-    if (openShares <= 1e-9) return true;
+    if (openShares <= 1e-9) {
+      this._emitDecision(market, {
+        type: 'flatten-skipped',
+        side,
+        reason: 'already-flat',
+      });
+      return true;
+    }
 
     const bestBid = bestBidFromBook(book);
     if (!bestBid || !Number.isFinite(bestBid.price) || bestBid.price <= 0) {
+      this._emitDecision(market, {
+        type: 'flatten-skipped',
+        side,
+        reason: 'no-best-bid',
+      });
       return false;
     }
 
     const minPrice = Math.max(0.01, Number((bestBid.price - VALUE_MAX_SLIPPAGE).toFixed(4)));
     const plan = estimateSellProceedsForSharesFromBook(book, openShares, minPrice);
     if (!plan || !plan.fullyFilled || plan.soldShares <= 0 || plan.proceedsUsdc <= 0) {
+      this._emitDecision(market, {
+        type: 'flatten-skipped',
+        side,
+        reason: 'no-sell-plan',
+        bestBid: bestBid.price,
+        minPrice,
+        executionPlan: plan ?? null,
+      });
       return false;
     }
 
@@ -690,5 +880,39 @@ export class ValueStrategyEngine extends EventEmitter {
       pnl: market.pnl,
     });
     this.emit('markets-updated', this.snapshotMarkets());
+  }
+
+  _emitQuote(market, extra = {}) {
+    this.emit('quote', {
+      slug: market.slug,
+      conditionId: market.conditionId,
+      state: market.state,
+      marketState: market.settled ? 'SETTLED' : 'OPEN',
+      timeLeftSec: extra.timeLeftSec ?? Math.max(0, market.closeTs - nowSec()),
+      up: {
+        ...sideQuotes(market.quote.Up),
+        bookLive: extra.upBookLive ?? null,
+      },
+      down: {
+        ...sideQuotes(market.quote.Down),
+        bookLive: extra.downBookLive ?? null,
+      },
+      timestamp: Date.now(),
+    });
+  }
+
+  _emitDecision(market, payload) {
+    this.emit('decision', {
+      slug: market.slug,
+      conditionId: market.conditionId,
+      state: market.state,
+      marketState: market.settled ? 'SETTLED' : 'OPEN',
+      firstSide: market.firstSide,
+      positionType: this._positionType(market),
+      up: sideQuotes(market.quote.Up),
+      down: sideQuotes(market.quote.Down),
+      timestamp: Date.now(),
+      ...payload,
+    });
   }
 }
