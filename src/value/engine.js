@@ -110,8 +110,8 @@ export class ValueStrategyEngine extends EventEmitter {
     const settledPnl = closed.reduce((sum, market) => sum + Number(market.pnl ?? 0), 0);
     const profitMarkets = closed.filter((market) => Number(market.pnl ?? 0) > 0).length;
     const lossMarkets = closed.filter((market) => Number(market.pnl ?? 0) < 0).length;
-    const flatMarkets = closed.filter((market) => Number(market.pnl ?? 0) === 0).length;
-    const forcePairedMarkets = markets.filter((market) => market.hadForcePair).length;
+    const flatMarkets = closed.filter((market) => market.state === 'FLAT').length;
+    const forcePairedMarkets = closed.filter((market) => market.hadForcePair).length;
 
     return {
       trackedMarkets: markets.length,
@@ -170,6 +170,7 @@ export class ValueStrategyEngine extends EventEmitter {
         cashProceeds: market.cashProceeds,
         redeemed: market.redeemed,
         pnl: market.pnl,
+        settlementSource: market.settlementSource,
         lastAction: market.lastAction,
       }));
   }
@@ -190,6 +191,7 @@ export class ValueStrategyEngine extends EventEmitter {
       firstSide: null,
       lastAction: null,
       quote: { Up: null, Down: null },
+      lastLiveQuote: { Up: null, Down: null },
       legs: {
         Up: this._emptyLeg(market.upToken.tokenId),
         Down: this._emptyLeg(market.downToken.tokenId),
@@ -200,8 +202,10 @@ export class ValueStrategyEngine extends EventEmitter {
       pnl: null,
       settled: false,
       settledAt: null,
+      settlementSource: null,
       hasAnyLeg: false,
       hadAnyTrade: false,
+      hadImmediateExit: false,
       hadForcePair: false,
       outcomes: [],
       payouts: [],
@@ -275,6 +279,8 @@ export class ValueStrategyEngine extends EventEmitter {
       bestAsk: downBook ? (bestAskFromBook(downBook)?.price ?? null) : null,
       bestBid: downBook ? (bestBidFromBook(downBook)?.price ?? null) : null,
     };
+    this._updateLastLiveQuote(market, 'Up');
+    this._updateLastLiveQuote(market, 'Down');
 
     const timeLeftSec = market.closeTs - nowSec();
     this._emitQuote(market, {
@@ -283,11 +289,16 @@ export class ValueStrategyEngine extends EventEmitter {
       downBookLive: Boolean(downBook),
     });
     if (timeLeftSec <= 0) {
+      const estimated = this._estimateCloseResolution(market);
+      if (estimated) {
+        this._settleMarket(market, estimated, { source: 'close-price-estimate' });
+        return;
+      }
       if (this._hasOpenExposure(market)) this._ensureSettlementWatch(market);
       this._emitDecision(market, {
         type: 'poll-skip',
         side: null,
-        reason: 'awaiting-settlement',
+        reason: 'awaiting-resolution-fallback',
         timeLeftSec,
       });
       return;
@@ -449,6 +460,51 @@ export class ValueStrategyEngine extends EventEmitter {
 
   _isSecondLegEligible(price) {
     return Number.isFinite(price) && price <= VALUE_ENTRY_MAX_PRICE;
+  }
+
+  _updateLastLiveQuote(market, side) {
+    const quote = market.quote?.[side];
+    if (!quote) return;
+    const bestAsk = Number.isFinite(quote.bestAsk) ? quote.bestAsk : null;
+    const bestBid = Number.isFinite(quote.bestBid) ? quote.bestBid : null;
+    if (bestAsk == null && bestBid == null) return;
+    market.lastLiveQuote[side] = {
+      bestAsk,
+      bestBid,
+      observedAt: Date.now(),
+    };
+  }
+
+  _signalPrice(quote) {
+    if (!quote) return null;
+    if (Number.isFinite(quote.bestBid)) return Number(quote.bestBid);
+    if (Number.isFinite(quote.bestAsk)) return Number(quote.bestAsk);
+    return null;
+  }
+
+  _estimateCloseResolution(market) {
+    const upPrice = this._signalPrice(market.quote?.Up) ?? this._signalPrice(market.lastLiveQuote?.Up);
+    const downPrice = this._signalPrice(market.quote?.Down) ?? this._signalPrice(market.lastLiveQuote?.Down);
+
+    let winner = null;
+    if (Number.isFinite(upPrice) && Number.isFinite(downPrice)) {
+      if (upPrice > downPrice) winner = 'Up';
+      else if (downPrice > upPrice) winner = 'Down';
+    } else if (Number.isFinite(upPrice)) {
+      winner = upPrice >= 0.5 ? 'Up' : 'Down';
+    } else if (Number.isFinite(downPrice)) {
+      winner = downPrice >= 0.5 ? 'Down' : 'Up';
+    }
+
+    if (!winner) return null;
+    return {
+      outcomes: ['Up', 'Down'],
+      resolvedPayouts: winner === 'Up' ? [1, 0] : [0, 1],
+      derivedFrom: {
+        upPrice: Number.isFinite(upPrice) ? upPrice : null,
+        downPrice: Number.isFinite(downPrice) ? downPrice : null,
+      },
+    };
   }
 
   _countOpenMarkets() {
@@ -633,6 +689,9 @@ export class ValueStrategyEngine extends EventEmitter {
   }
 
   async _handleEndgame(market, openSide, openBook, oppositeSide, oppositeBook, { immediate = false } = {}) {
+    if (immediate) {
+      market.hadImmediateExit = true;
+    }
     if (!openBook) {
       market.lastAction = `${immediate ? 'immediate-exit' : 'endgame'} skipped - no ${openSide.toLowerCase()} book`;
       this._emitDecision(market, {
@@ -865,7 +924,7 @@ export class ValueStrategyEngine extends EventEmitter {
     this.settlementTasks.set(market.slug, task);
   }
 
-  _settleMarket(market, resolved) {
+  _settleMarket(market, resolved, { source = 'gamma' } = {}) {
     if (market.settled) return;
 
     const outcomes = resolved.outcomes ?? [];
@@ -880,10 +939,11 @@ export class ValueStrategyEngine extends EventEmitter {
     market.pnl = market.cashProceeds + market.redeemed - market.totalCost;
     market.settled = true;
     market.settledAt = Date.now();
+    market.settlementSource = source;
     market.state = 'SETTLED';
     market.outcomes = outcomes;
     market.payouts = payouts;
-    market.lastAction = `settled pnl ${market.pnl.toFixed(4)}`;
+    market.lastAction = `settled (${source}) pnl ${market.pnl.toFixed(4)}`;
 
     this.emit('action', {
       type: 'settled',
@@ -892,6 +952,7 @@ export class ValueStrategyEngine extends EventEmitter {
       state: market.state,
       spent: market.totalCost,
       shares: market.legs.Up.shares + market.legs.Down.shares,
+      settlementSource: source,
       timestamp: Date.now(),
     });
     logger.info('value.engine: market settled', {
@@ -900,6 +961,7 @@ export class ValueStrategyEngine extends EventEmitter {
       totalCost: market.totalCost,
       redeemed: market.redeemed,
       pnl: market.pnl,
+      settlementSource: source,
     });
     this.emit('markets-updated', this.snapshotMarkets());
   }
