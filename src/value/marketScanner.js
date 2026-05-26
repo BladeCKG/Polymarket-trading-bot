@@ -19,6 +19,7 @@ function parseArrayField(value) {
 }
 
 function normalizeMarketRecord(market) {
+  if (!market || typeof market !== 'object') return null;
   const tokens = parseArrayField(market.tokens ?? market.clobTokenIds);
   const outcomes = parseArrayField(market.outcomes);
   const normTokens = tokens.map((token, index) => {
@@ -152,7 +153,7 @@ export async function fetchActiveValueMarkets({
 
   const marketResults = await Promise.allSettled(candidateSlugs.map((slug) => fetchMarketBySlug(slug)));
   const markets = marketResults.flatMap((result) => {
-    if (result.status === 'fulfilled') return [result.value];
+    if (result.status === 'fulfilled') return result.value ? [result.value] : [];
     logger.debug('value.marketScanner: slug fetch failed', { err: result.reason?.message ?? String(result.reason) });
     return [];
   });

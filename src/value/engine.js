@@ -270,6 +270,10 @@ export class ValueStrategyEngine extends EventEmitter {
     return Math.max(0, Number(leg.shares ?? 0) - Number(leg.soldShares ?? 0));
   }
 
+  _valueOpenShares(market, side) {
+    return this._openShares(market.legs[side]);
+  }
+
   _hasOpenExposure(market) {
     return !market.settled && ['WAIT_UP', 'WAIT_DOWN', 'PAIRED', 'FORCED_PAIRED'].includes(market.state);
   }
