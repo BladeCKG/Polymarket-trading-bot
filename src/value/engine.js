@@ -3,18 +3,24 @@ import logger from '../logger.js';
 import { ClobClient } from '../clob.js';
 import { waitForResolution } from '../market.js';
 import {
+  VALUE_ABSOLUTE_FIRST_LEG_MAX_PRICE,
   VALUE_DRY_RUN,
   VALUE_ENDGAME_EXIT_BELOW_PRICE,
   VALUE_IMMEDIATE_EXIT_BELOW_PRICE,
   VALUE_FIRST_LEG_CUTOFF_SECONDS,
   VALUE_LEG_USDC,
+  VALUE_MAX_SPREAD,
   VALUE_MAX_OPEN_MARKETS,
   VALUE_MAX_SLIPPAGE,
   VALUE_MAX_STRANDED_LEGS,
   VALUE_ORDER_MODE,
+  VALUE_OPEN_WAIT_SECONDS,
+  VALUE_REQUIRED_DEPTH_MULTIPLIER,
   VALUE_SECOND_LEG_CUTOFF_SECONDS,
+  VALUE_STABLE_SNAPSHOTS_REQUIRED,
   VALUE_TARGET_PRICE,
   VALUE_TARGET_SHARES,
+  VALUE_EXTREME_SPREAD,
 } from './config.js';
 import {
   bestAskFromBook,
@@ -59,6 +65,7 @@ export class ValueStrategyEngine extends EventEmitter {
     this.actions = 0;
     this.failures = 0;
     this.settlementTasks = new Map();
+    this._processedOrderIds = new Set();
   }
 
   syncMarkets(activeMarkets) {
@@ -201,6 +208,7 @@ export class ValueStrategyEngine extends EventEmitter {
       lastLiveQuote: { Up: null, Down: null },
       pendingBuyOrders: { Up: null, Down: null },
       exitPlan: null,
+      stableSnapshotCount: 0,
       legs: {
         Up: this._emptyLeg(market.upToken.tokenId),
         Down: this._emptyLeg(market.downToken.tokenId),
@@ -319,8 +327,21 @@ export class ValueStrategyEngine extends EventEmitter {
     }
 
     if (market.state === 'NONE') {
+      const timeSinceOpenSec = nowSec() - market.windowTs;
+      if (timeSinceOpenSec < VALUE_OPEN_WAIT_SECONDS) {
+        this._resetStability(market);
+        this._emitDecision(market, {
+          type: 'poll-skip',
+          side: null,
+          reason: 'open-wait',
+          timeLeftSec,
+          timeSinceOpenSec,
+        });
+        return;
+      }
       if (this._countOpenMarkets() >= VALUE_MAX_OPEN_MARKETS) {
         await this._cancelMarketOrders(market, 'max-open-markets');
+        this._resetStability(market);
         this._emitDecision(market, {
           type: 'poll-skip',
           side: null,
@@ -331,6 +352,7 @@ export class ValueStrategyEngine extends EventEmitter {
       }
       if (this._countStrandedLegs() >= VALUE_MAX_STRANDED_LEGS) {
         await this._cancelMarketOrders(market, 'max-stranded-legs');
+        this._resetStability(market);
         this._emitDecision(market, {
           type: 'poll-skip',
           side: null,
@@ -341,6 +363,7 @@ export class ValueStrategyEngine extends EventEmitter {
       }
       if (timeLeftSec <= VALUE_FIRST_LEG_CUTOFF_SECONDS) {
         await this._cancelMarketOrders(market, 'first-leg-cutoff');
+        this._resetStability(market);
         this._emitDecision(market, {
           type: 'poll-skip',
           side: null,
@@ -349,8 +372,7 @@ export class ValueStrategyEngine extends EventEmitter {
         });
         return;
       }
-      await this._ensureFirstLegOrders(market);
-      await this._simulatePendingFills(market);
+      await this._tryEnterFirstLeg(market, upBook, downBook, timeLeftSec);
       return;
     }
 
@@ -498,6 +520,147 @@ export class ValueStrategyEngine extends EventEmitter {
     return VALUE_LEG_USDC / VALUE_TARGET_PRICE;
   }
 
+  _requiredDepthShares() {
+    return this._targetShares() * VALUE_REQUIRED_DEPTH_MULTIPLIER;
+  }
+
+  _spread(book) {
+    const bestAsk = bestAskFromBook(book)?.price ?? null;
+    const bestBid = bestBidFromBook(book)?.price ?? null;
+    if (!Number.isFinite(bestAsk) || !Number.isFinite(bestBid)) return null;
+    return bestAsk - bestBid;
+  }
+
+  _bookDepthAtOrBelowPrice(book, maxPrice) {
+    const asks = Array.isArray(book?.asks) ? book.asks : [];
+    return asks
+      .filter((ask) => Number.isFinite(ask.price) && Number.isFinite(ask.size) && ask.price > 0 && ask.size > 0 && ask.price <= maxPrice)
+      .reduce((sum, ask) => sum + ask.size, 0);
+  }
+
+  _bookIsHealthy(book) {
+    if (!book) return false;
+    const bestAsk = bestAskFromBook(book);
+    const bestBid = bestBidFromBook(book);
+    if (!bestAsk || !bestBid) return false;
+
+    const spread = bestAsk.price - bestBid.price;
+    const orderSize = this._targetShares();
+    if (!Number.isFinite(orderSize) || orderSize <= 0) return false;
+    if (spread > VALUE_EXTREME_SPREAD) return false;
+    if (!Number.isFinite(bestAsk.size) || bestAsk.size < orderSize) return false;
+    if (!Number.isFinite(bestBid.size) || bestBid.size < orderSize) return false;
+    return true;
+  }
+
+  _resetStability(market) {
+    market.stableSnapshotCount = 0;
+  }
+
+  _advanceStability(market, upBook, downBook) {
+    if (!this._bookIsHealthy(upBook) || !this._bookIsHealthy(downBook)) {
+      this._resetStability(market);
+      return false;
+    }
+    const upSpread = this._spread(upBook);
+    const downSpread = this._spread(downBook);
+    if (!Number.isFinite(upSpread) || !Number.isFinite(downSpread)) {
+      this._resetStability(market);
+      return false;
+    }
+    if (upSpread > VALUE_MAX_SPREAD || downSpread > VALUE_MAX_SPREAD) {
+      this._resetStability(market);
+      return false;
+    }
+    market.stableSnapshotCount = Number(market.stableSnapshotCount ?? 0) + 1;
+    return market.stableSnapshotCount >= VALUE_STABLE_SNAPSHOTS_REQUIRED;
+  }
+
+  _evaluateFirstLegCandidate(side, book) {
+    const bestAsk = bestAskFromBook(book);
+    const bestBid = bestBidFromBook(book);
+    if (!bestAsk || !bestBid) return { allowed: false, reason: 'missing-best-level' };
+
+    const spread = bestAsk.price - bestBid.price;
+    if (!Number.isFinite(spread) || spread > VALUE_MAX_SPREAD) {
+      return { allowed: false, reason: 'spread-too-wide', spread };
+    }
+    if (bestAsk.price > VALUE_ABSOLUTE_FIRST_LEG_MAX_PRICE) {
+      return { allowed: false, reason: 'best-ask-too-high', bestAsk: bestAsk.price };
+    }
+
+    const targetShares = this._targetShares();
+    const requiredDepth = this._requiredDepthShares();
+    const depth = this._bookDepthAtOrBelowPrice(book, VALUE_TARGET_PRICE);
+    if (depth < requiredDepth) {
+      return { allowed: false, reason: 'insufficient-depth', depth, requiredDepth };
+    }
+
+    const plan = estimateBuyCostForSharesFromBook(book, targetShares, VALUE_TARGET_PRICE);
+    if (!plan || !plan.fullyFilled || plan.fillShares + 1e-9 < targetShares) {
+      return { allowed: false, reason: 'cannot-fill-full-size', targetShares, plan: plan ?? null };
+    }
+    if (!Number.isFinite(plan.avgFillPrice) || plan.avgFillPrice > VALUE_TARGET_PRICE) {
+      return { allowed: false, reason: 'vwap-too-expensive', avgFillPrice: plan?.avgFillPrice ?? null };
+    }
+
+    return {
+      allowed: true,
+      side,
+      targetShares,
+      requiredDepth,
+      depth,
+      bestAsk: bestAsk.price,
+      bestBid: bestBid.price,
+      spread,
+      plan,
+    };
+  }
+
+  async _tryEnterFirstLeg(market, upBook, downBook, timeLeftSec) {
+    const stableEnough = this._advanceStability(market, upBook, downBook);
+    if (!stableEnough) {
+      this._emitDecision(market, {
+        type: 'poll-skip',
+        side: null,
+        reason: 'market-not-stable',
+        timeLeftSec,
+        stableSnapshotCount: market.stableSnapshotCount,
+        requiredStableSnapshots: VALUE_STABLE_SNAPSHOTS_REQUIRED,
+        upSpread: this._spread(upBook),
+        downSpread: this._spread(downBook),
+      });
+      return;
+    }
+
+    const upCandidate = this._evaluateFirstLegCandidate('Up', upBook);
+    const downCandidate = this._evaluateFirstLegCandidate('Down', downBook);
+    const allowedCandidates = [upCandidate, downCandidate].filter((candidate) => candidate.allowed);
+    if (!allowedCandidates.length) {
+      this._emitDecision(market, {
+        type: 'poll-skip',
+        side: null,
+        reason: 'no-first-leg-candidate',
+        timeLeftSec,
+        upCandidate,
+        downCandidate,
+      });
+      return;
+    }
+
+    allowedCandidates.sort((a, b) => a.plan.avgFillPrice - b.plan.avgFillPrice);
+    const chosen = allowedCandidates[0];
+    const chosenBook = chosen.side === 'Up' ? upBook : downBook;
+    const entered = await this._enterLeg(market, chosen.side, chosenBook, {
+      exactPlan: chosen.plan,
+      entryRole: 'first',
+      useFok: true,
+    });
+    if (entered) {
+      this._resetStability(market);
+    }
+  }
+
   async _ensureFirstLegOrders(market) {
     await this._ensureRestingBuyOrder(market, 'Up', 'first');
     await this._ensureRestingBuyOrder(market, 'Down', 'first');
@@ -642,6 +805,8 @@ export class ValueStrategyEngine extends EventEmitter {
   }
 
   async handleFill(fill) {
+    const orderId = fill.orderId ?? null;
+    if (orderId && this._processedOrderIds.has(orderId)) return;
     const tokenId = String(fill.tokenId);
     const side = String(fill.side ?? '').toUpperCase();
     const market = [...this.markets.values()].find((candidate) =>
@@ -678,6 +843,7 @@ export class ValueStrategyEngine extends EventEmitter {
   }
 
   async _recordBuyFill(market, side, fill) {
+    if (fill.orderId) this._processedOrderIds.add(fill.orderId);
     const leg = market.legs[side];
     const prevShares = Number(leg.shares ?? 0);
     const prevSpent = Number(leg.spent ?? 0);
@@ -735,6 +901,7 @@ export class ValueStrategyEngine extends EventEmitter {
   }
 
   async _recordSellFill(market, side, fill) {
+    if (fill.orderId) this._processedOrderIds.add(fill.orderId);
     const leg = market.legs[side];
     leg.soldShares += fill.shares;
     leg.soldUsdc += fill.proceedsUsdc;
@@ -762,7 +929,7 @@ export class ValueStrategyEngine extends EventEmitter {
     this.emit('markets-updated', this.snapshotMarkets());
   }
 
-  async _enterLeg(market, side, book, { force = false, targetSharesOverride = null } = {}) {
+  async _enterLeg(market, side, book, { force = false, targetSharesOverride = null, exactPlan = null, entryRole = null, useFok = false } = {}) {
     const leg = market.legs[side];
     if (leg.entered) {
       this._emitDecision(market, {
@@ -802,11 +969,11 @@ export class ValueStrategyEngine extends EventEmitter {
 
     const maxPrice = this._entryMaxPrice(market, quote.price, force);
 
-    const plan = Number.isFinite(targetSharesOverride) && targetSharesOverride > 0
+    const plan = exactPlan ?? (Number.isFinite(targetSharesOverride) && targetSharesOverride > 0
       ? estimateBuyCostForSharesFromBook(book, targetSharesOverride, maxPrice)
       : VALUE_ORDER_MODE === 'SHARES'
       ? estimateBuyCostForSharesFromBook(book, VALUE_TARGET_SHARES, maxPrice)
-      : ClobClient.estimateMarketBuyFillFromBook(book, maxPrice, VALUE_LEG_USDC, 0);
+      : ClobClient.estimateMarketBuyFillFromBook(book, maxPrice, VALUE_LEG_USDC, 0));
     if (!plan || plan.fillShares <= 0 || plan.spentUsdc <= 0) {
       this._emitDecision(market, {
         type: 'buy-skipped',
@@ -826,7 +993,23 @@ export class ValueStrategyEngine extends EventEmitter {
     try {
       let response = null;
       if (!VALUE_DRY_RUN) {
-        response = await ClobClient.postIOCBuy(this.wallet, tokenId, maxPrice, plan.spentUsdc);
+        if (useFok) {
+          response = await ClobClient.postFOKLimitBuy(this.wallet, tokenId, maxPrice, plan.fillShares);
+          if (response?.success === false) {
+            this._emitDecision(market, {
+              type: 'buy-skipped',
+              side,
+              reason: 'fok-rejected',
+              force,
+              bestAsk: quote.price,
+              maxPrice,
+              executionPlan: plan,
+            });
+            return false;
+          }
+        } else {
+          response = await ClobClient.postIOCBuy(this.wallet, tokenId, maxPrice, plan.spentUsdc);
+        }
       }
 
       leg.entered = true;
@@ -845,6 +1028,11 @@ export class ValueStrategyEngine extends EventEmitter {
       this.actions += 1;
       if (isPairedState(market.state)) this._ensureSettlementWatch(market);
 
+      const responseOrderId = response?.orderID ?? response?.orderId ?? null;
+      if (!VALUE_DRY_RUN && responseOrderId) {
+        this._processedOrderIds.add(responseOrderId);
+      }
+
       const action = {
         type: VALUE_DRY_RUN ? 'dry-run-buy' : 'buy',
         slug: market.slug,
@@ -854,6 +1042,8 @@ export class ValueStrategyEngine extends EventEmitter {
         shares: leg.shares,
         price: leg.avgPrice,
         forced: force,
+        useFok,
+        role: entryRole,
         targetSharesOverride,
         tokenId,
         bestAsk: quote.price,
@@ -873,6 +1063,8 @@ export class ValueStrategyEngine extends EventEmitter {
         shares: leg.shares,
         avgPrice: leg.avgPrice,
         forced: force,
+        useFok,
+        role: entryRole,
         targetSharesOverride,
         tokenId,
         bestAsk: quote.price,

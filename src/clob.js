@@ -582,6 +582,27 @@ export class ClobClient {
     return res.orderId;
   }
 
+  static async postFOKLimitBuy(wallet, tokenId, price, shares, negRisk = true) {
+    const feeRateBps = await ClobClient.getTakerFeeBps(tokenId);
+    const { tickSize } = await ClobClient.getBook(tokenId);
+    const { orderData, signature } = await buildLimitBuyOrder(
+      wallet, tokenId, price, shares, 0, negRisk, feeRateBps, tickSize,
+    );
+    const body = {
+      order: { ...orderData, signature },
+      owner: ClobClient._creds.apiKey,
+      orderType: 'FOK',
+    };
+    const path = '/order';
+    const res = await restCall('POST', path, body);
+    if (res.success === false) {
+      logger.warn('CLOB: FOK limit buy rejected', { tokenId, price, shares, errorMsg: res.errorMsg, status: res.status });
+    } else {
+      logger.debug('CLOB: FOK limit buy posted', { tokenId, price, shares, status: res.status });
+    }
+    return res;
+  }
+
   static async postLimitSell(wallet, tokenId, price, shares, negRisk = true) {
     const feeRateBps = await ClobClient.getTakerFeeBps(tokenId);
     const { tickSize } = await ClobClient.getBook(tokenId);
