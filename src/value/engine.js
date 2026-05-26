@@ -220,8 +220,8 @@ export class ValueStrategyEngine extends EventEmitter {
       correctexitMarkets: correctexitMarkets.length,
       lossSumFromMisexitMarkets: misexitMarkets.reduce((sum, item) => sum + Math.min(0, item.actualPnl), 0).toFixed(2),
       lossSumFromCorrectexitMarkets: correctexitMarkets.reduce((sum, item) => sum + Math.min(0, item.actualPnl), 0).toFixed(2),
-      missedProfitSumFromMisexitMarkets: misexitMarkets.reduce((sum, item) => sum + Math.max(0, item.holdPnl - item.actualPnl), 0).toFixed(2),
-      missedLossSumFromCorrectexitMarkets: correctexitMarkets.reduce((sum, item) => sum + Math.max(0, item.actualPnl - item.holdPnl), 0).toFixed(2),
+      missedProfitSumFromMisexitMarkets: misexitMarkets.reduce((sum, item) => sum + Math.max(0, item.counterfactualPnl - item.actualPnl), 0).toFixed(2),
+      missedLossSumFromCorrectexitMarkets: correctexitMarkets.reduce((sum, item) => sum + Math.max(0, item.actualPnl - item.settlementPnl), 0).toFixed(2),
       openCost: openCost.toFixed(2),
       settledPnl: settledPnl.toFixed(2),
       actions: this.actions,
@@ -239,14 +239,51 @@ export class ValueStrategyEngine extends EventEmitter {
     const winner = this._winningOutcome(market);
     if (!winner) return null;
 
-    const leg = market.legs[firstSide];
     const actualPnl = Number(market.pnl ?? 0);
-    const holdPnl = (Number(leg.shares ?? 0) * (winner === firstSide ? 1 : 0)) - Number(market.totalCost ?? 0);
+    const settlementPnl = this._settlementOnlySingleLegPnl(market, firstSide, winner);
+    const counterfactualPnl = this._counterfactualSingleLegPnl(market, firstSide, winner);
     return {
       kind: winner === firstSide ? 'misexit' : 'correctexit',
       actualPnl,
-      holdPnl,
+      settlementPnl,
+      counterfactualPnl,
     };
+  }
+
+  _settlementOnlySingleLegPnl(market, firstSide, winner) {
+    const firstLeg = market.legs?.[firstSide];
+    const shares = Number(firstLeg?.shares ?? 0);
+    const firstCost = Number(firstLeg?.spent ?? 0);
+    if (shares <= 1e-9) return 0;
+    return (winner === firstSide ? shares : 0) - firstCost;
+  }
+
+  _counterfactualSingleLegPnl(market, firstSide, winner) {
+    const firstLeg = market.legs?.[firstSide];
+    const shares = Number(firstLeg?.shares ?? 0);
+    const firstCost = Number(firstLeg?.spent ?? 0);
+    if (shares <= 1e-9) return 0;
+
+    const secondSide = oppositeSide(firstSide);
+    const exitCutoff = Number(market.exitReview?.exitedAt ?? 0);
+    const replayHistory = Array.isArray(market.replayHistory) ? market.replayHistory : [];
+    for (const snapshot of replayHistory) {
+      if (Number(snapshot?.timestamp ?? 0) < exitCutoff) continue;
+      const secondBook = snapshot?.books?.[secondSide];
+      if (!secondBook) continue;
+      const candidate = this._evaluateReplaySecondLegCandidate(
+        market,
+        secondSide,
+        secondBook,
+        shares,
+        firstCost,
+        Number(snapshot?.timeLeftSec ?? 0),
+      );
+      if (!candidate.allowed) continue;
+      return shares - (firstCost + candidate.plan.spentUsdc);
+    }
+
+    return this._settlementOnlySingleLegPnl(market, firstSide, winner);
   }
 
   snapshotMarkets() {
@@ -341,6 +378,7 @@ export class ValueStrategyEngine extends EventEmitter {
       exitPlan: null,
       extendedHold: null,
       exitReview: null,
+      replayHistory: [],
       stableSnapshotCount: 0,
       firstFee: 0,
       secondFee: 0,
@@ -414,6 +452,21 @@ export class ValueStrategyEngine extends EventEmitter {
     return Math.max(0, Number(leg.shares ?? 0) - Number(leg.soldShares ?? 0));
   }
 
+  _recordReplaySnapshot(market, timeLeftSec, upBook, downBook) {
+    if (!Array.isArray(market.replayHistory)) market.replayHistory = [];
+    market.replayHistory.push({
+      timestamp: Date.now(),
+      timeLeftSec,
+      books: {
+        Up: upBook ? bookSnapshot(upBook) : null,
+        Down: downBook ? bookSnapshot(downBook) : null,
+      },
+    });
+    if (market.replayHistory.length > 4096) {
+      market.replayHistory.splice(0, market.replayHistory.length - 4096);
+    }
+  }
+
   _valueOpenShares(market, side) {
     return this._openShares(market.legs[side]);
   }
@@ -444,6 +497,7 @@ export class ValueStrategyEngine extends EventEmitter {
     });
 
     const timeLeftSec = market.closeTs - nowSec();
+    this._recordReplaySnapshot(market, timeLeftSec, upBook, downBook);
     this._emitQuote(market, {
       timeLeftSec,
       upBookLive: Boolean(upBook),
@@ -661,6 +715,11 @@ export class ValueStrategyEngine extends EventEmitter {
 
   _dynamicSecondLegMinLockProfitPerShare(market) {
     const timeToExpiryMs = Math.max(0, (market.closeTs * 1000) - Date.now());
+    return this._dynamicSecondLegMinLockProfitPerShareAtTimeLeft(market, Math.floor(timeToExpiryMs / 1000));
+  }
+
+  _dynamicSecondLegMinLockProfitPerShareAtTimeLeft(market, timeLeftSec) {
+    const timeToExpiryMs = Math.max(0, Number(timeLeftSec ?? 0) * 1000);
     if (market.duration === '5m') {
       if (timeToExpiryMs > 180_000) return VALUE_SECOND_LEG_MIN_LOCK_PROFIT_EARLY_PER_SHARE;
       if (timeToExpiryMs > 90_000) return VALUE_SECOND_LEG_MIN_LOCK_PROFIT_MID_PER_SHARE;
@@ -671,6 +730,56 @@ export class ValueStrategyEngine extends EventEmitter {
     if (timeToExpiryMs > 180_000) return VALUE_SECOND_LEG_MIN_LOCK_PROFIT_MID_PER_SHARE;
     if (timeToExpiryMs > 120_000) return VALUE_SECOND_LEG_MIN_LOCK_PROFIT_LATE_PER_SHARE;
     return VALUE_SECOND_LEG_MIN_LOCK_PROFIT_PER_SHARE;
+  }
+
+  _evaluateReplaySecondLegCandidate(market, secondSide, secondBook, shares, firstCost, timeLeftSec) {
+    const bestBid = bestBidFromBook(secondBook);
+    const bestAsk = bestAskFromBook(secondBook);
+    if (!bestBid || !bestAsk) {
+      return { allowed: false, reason: 'SECOND_BOOK_EMPTY' };
+    }
+
+    const spread = bestAsk.price - bestBid.price;
+    if (spread > VALUE_SECOND_LEG_EXTREME_SPREAD) {
+      return { allowed: false, reason: 'SECOND_SPREAD_EXTREME', spread };
+    }
+    if (spread > VALUE_SECOND_LEG_MAX_SPREAD) {
+      return { allowed: false, reason: 'SECOND_SPREAD_TOO_WIDE', spread };
+    }
+
+    const maxLimitPrice = Math.min(VALUE_TARGET_PRICE, VALUE_SECOND_LEG_HARD_MAX_PRICE);
+    const depth = this._bookDepthAtOrBelowPrice(secondBook, maxLimitPrice);
+    const requiredDepth = shares * VALUE_SECOND_LEG_MIN_DEPTH_MULTIPLIER;
+    if (depth + 1e-9 < requiredDepth) {
+      return { allowed: false, reason: 'NOT_ENOUGH_SECOND_DEPTH', depth, requiredDepth, spread };
+    }
+
+    const plan = estimateBuyCostForSharesFromBook(secondBook, shares, maxLimitPrice);
+    if (!plan || !plan.fullyFilled || plan.fillShares + 1e-9 < shares) {
+      return { allowed: false, reason: 'CANNOT_FILL_SECOND_SIZE', depth, spread, plan: plan ?? null };
+    }
+
+    const lockProfit = shares - (firstCost + plan.spentUsdc);
+    const minLockProfit = shares * this._dynamicSecondLegMinLockProfitPerShareAtTimeLeft(market, timeLeftSec);
+    if (lockProfit < minLockProfit) {
+      return {
+        allowed: false,
+        reason: 'LOCK_PROFIT_TOO_SMALL',
+        depth,
+        spread,
+        plan,
+        estimatedLockProfit: lockProfit,
+      };
+    }
+
+    return {
+      allowed: true,
+      spread,
+      depth,
+      plan,
+      estimatedLockProfit: lockProfit,
+      maxLimitPrice,
+    };
   }
 
   _spread(book) {
