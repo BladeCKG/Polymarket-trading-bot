@@ -515,7 +515,7 @@
     }
 
     function marketPnlBucket(item) {
-      if (item.marketState !== 'SETTLED' && item.positionType !== 'Flat' && item.positionType !== 'Merged') return 'UNSETTLED';
+      if (item.marketState !== 'SETTLED' && item.positionType !== 'Flat') return 'UNSETTLED';
       if (item.pnl == null || item.pnl === '') return 'UNSETTLED';
       const pnl = Number(item.pnl);
       if (!Number.isFinite(pnl)) return 'UNSETTLED';
