@@ -7,7 +7,13 @@ import {
   VALUE_ABSOLUTE_FIRST_LEG_MAX_PRICE,
   VALUE_DRY_RUN,
   VALUE_ENDGAME_EXIT_BELOW_PRICE,
+  VALUE_EXTENDED_HOLD_MAX_MS_15M,
+  VALUE_EXTENDED_HOLD_MAX_MS_5M,
+  VALUE_FINAL_EXIT_BEFORE_EXPIRY_MS_15M,
+  VALUE_FINAL_EXIT_BEFORE_EXPIRY_MS_5M,
   VALUE_IMMEDIATE_EXIT_BELOW_PRICE,
+  VALUE_CONTINUE_MIN_PROFIT_PER_SHARE,
+  VALUE_DIRECT_TAKE_PROFIT_PER_SHARE,
   VALUE_FIRST_LEG_CUTOFF_SECONDS,
   VALUE_LEG_USDC,
   VALUE_MAX_BOOK_AGE_MS,
@@ -33,6 +39,8 @@ import {
   VALUE_STABLE_SNAPSHOTS_REQUIRED,
   VALUE_TARGET_PRICE,
   VALUE_TARGET_SHARES,
+  VALUE_TRAILING_DRAWDOWN_PER_SHARE_15M,
+  VALUE_TRAILING_DRAWDOWN_PER_SHARE_5M,
   VALUE_EXTREME_SPREAD,
 } from './config.js';
 import {
@@ -221,6 +229,7 @@ export class ValueStrategyEngine extends EventEmitter {
       lastLiveQuote: { Up: null, Down: null },
       pendingBuyOrders: { Up: null, Down: null },
       exitPlan: null,
+      extendedHold: null,
       stableSnapshotCount: 0,
       firstFee: 0,
       secondFee: 0,
@@ -595,13 +604,50 @@ export class ValueStrategyEngine extends EventEmitter {
     if (market.duration === '5m') {
       return {
         maxOneLegHoldMs: VALUE_MAX_ONE_LEG_HOLD_MS_5M,
+        maxExtendedHoldMs: VALUE_EXTENDED_HOLD_MAX_MS_5M,
+        finalExitBeforeExpiryMs: VALUE_FINAL_EXIT_BEFORE_EXPIRY_MS_5M,
+        trailingDrawdownPerShare: VALUE_TRAILING_DRAWDOWN_PER_SHARE_5M,
         noUnpairedHoldLastMs: VALUE_NO_UNPAIRED_HOLD_LAST_MS_5M,
       };
     }
     return {
       maxOneLegHoldMs: VALUE_MAX_ONE_LEG_HOLD_MS_15M,
+      maxExtendedHoldMs: VALUE_EXTENDED_HOLD_MAX_MS_15M,
+      finalExitBeforeExpiryMs: VALUE_FINAL_EXIT_BEFORE_EXPIRY_MS_15M,
+      trailingDrawdownPerShare: VALUE_TRAILING_DRAWDOWN_PER_SHARE_15M,
       noUnpairedHoldLastMs: VALUE_NO_UNPAIRED_HOLD_LAST_MS_15M,
     };
+  }
+
+  _averageEntryPrice(leg) {
+    if (Number.isFinite(leg?.avgPrice)) return Number(leg.avgPrice);
+    const shares = Number(leg?.shares ?? 0);
+    if (shares <= 1e-9) return 0;
+    return Number(leg?.spent ?? 0) / shares;
+  }
+
+  _entryFeeEstimateUsdc(leg, feeRateBps) {
+    if (!leg?.entered) return 0;
+    const shares = Number(leg?.shares ?? 0);
+    const price = this._averageEntryPrice(leg);
+    if (shares <= 1e-9 || !Number.isFinite(price) || price <= 0) return 0;
+    return ClobClient.estimateTakerFeeUsdc({
+      shares,
+      price,
+      feeRateBps,
+    });
+  }
+
+  _entryAllInCostUsdc(market, side, feeRateBps) {
+    const leg = market.legs[side];
+    return Number(leg?.spent ?? 0) + this._entryFeeEstimateUsdc(leg, feeRateBps);
+  }
+
+  _netExitProfitPerShare(market, side, directExit, feeRateBps) {
+    const shares = this._valueOpenShares(market, side);
+    if (shares <= 1e-9 || !directExit?.allowed) return null;
+    const costBasis = this._entryAllInCostUsdc(market, side, feeRateBps);
+    return (directExit.netRecovery - costBasis) / shares;
   }
 
   async _getFeeRateBps(tokenId) {
@@ -735,8 +781,9 @@ export class ValueStrategyEngine extends EventEmitter {
     const feeRateBps = await this._getFeeRateBps(tokenId);
     const directExit = this._evaluateDirectSellExit(openBook, shares, feeRateBps);
     if (!directExit.allowed) return false;
-    const avgEntry = Number(market.legs[openSide].avgPrice ?? 0);
-    const lossPerShare = avgEntry - directExit.vwap;
+    const netProfitPerShare = this._netExitProfitPerShare(market, openSide, directExit, feeRateBps);
+    if (!Number.isFinite(netProfitPerShare)) return false;
+    const lossPerShare = -netProfitPerShare;
     return lossPerShare >= VALUE_MAX_UNPAIRED_LOSS_PER_SHARE;
   }
 
@@ -785,6 +832,156 @@ export class ValueStrategyEngine extends EventEmitter {
     }
   }
 
+  async _evaluateOneLegCheckpoint(market, openSide, openBook, secondSide, secondBook) {
+    const { finalExitBeforeExpiryMs } = this._oneLegHoldLimits(market);
+    const timeToExpiryMs = Math.max(0, (market.closeTs * 1000) - Date.now());
+    if (timeToExpiryMs <= finalExitBeforeExpiryMs) {
+      return {
+        action: 'EXIT',
+        reason: 'CHECKPOINT_TOO_CLOSE_TO_EXPIRY',
+      };
+    }
+
+    const secondCandidate = await this._evaluateSecondLegCandidate(market, secondSide, secondBook);
+    if (secondCandidate.allowed) {
+      return {
+        action: 'COMPLETE_SECOND_LEG',
+        reason: 'SECOND_LEG_AVAILABLE_AT_CHECKPOINT',
+        candidate: secondCandidate,
+      };
+    }
+
+    const openTokenId = openSide === 'Up' ? market.upToken.tokenId : market.downToken.tokenId;
+    const feeRateBps = await this._getFeeRateBps(openTokenId);
+    const shares = this._valueOpenShares(market, openSide);
+    const directExit = this._evaluateDirectSellExit(openBook, shares, feeRateBps);
+    if (!directExit.allowed) {
+      return {
+        action: 'EXIT',
+        reason: 'NO_FIRST_LEG_EXIT_DEPTH_AT_CHECKPOINT',
+        directExit,
+      };
+    }
+
+    const netProfitPerShare = this._netExitProfitPerShare(market, openSide, directExit, feeRateBps);
+    if (!Number.isFinite(netProfitPerShare) || netProfitPerShare <= 0) {
+      return {
+        action: 'EXIT',
+        reason: 'FIRST_LEG_NOT_PROFITABLE_AT_CHECKPOINT',
+        directExit,
+        netProfitPerShare,
+      };
+    }
+
+    if (netProfitPerShare >= VALUE_DIRECT_TAKE_PROFIT_PER_SHARE) {
+      return {
+        action: 'DIRECT_PROFIT_EXIT',
+        reason: 'FIRST_LEG_DIRECT_PROFIT_TARGET_REACHED',
+        directExit,
+        netProfitPerShare,
+      };
+    }
+
+    if (netProfitPerShare >= VALUE_CONTINUE_MIN_PROFIT_PER_SHARE) {
+      return {
+        action: 'EXTENDED_HOLD',
+        reason: 'FIRST_LEG_PROFITABLE_ALLOW_EXTENDED_HOLD',
+        directExit,
+        netProfitPerShare,
+      };
+    }
+
+    return {
+      action: 'EXIT',
+      reason: 'FIRST_LEG_PROFIT_TOO_SMALL_TO_EXTEND',
+      directExit,
+      netProfitPerShare,
+    };
+  }
+
+  async _manageExtendedHoldState(market, openSide, openBook, secondSide, secondBook, timeLeftSec) {
+    const hold = market.extendedHold;
+    if (!hold?.active) return false;
+
+    const { maxExtendedHoldMs, finalExitBeforeExpiryMs, trailingDrawdownPerShare } = this._oneLegHoldLimits(market);
+    const nowMs = Date.now();
+    const timeToExpiryMs = Math.max(0, (market.closeTs * 1000) - nowMs);
+    const extendedElapsedMs = nowMs - Number(hold.startedAt ?? nowMs);
+
+    if (extendedElapsedMs >= maxExtendedHoldMs) {
+      await this._exitUnpairedFirstLeg(market, openSide, openBook, secondSide, secondBook, 'EXTENDED_HOLD_TIME_EXCEEDED');
+      return true;
+    }
+
+    if (timeToExpiryMs <= finalExitBeforeExpiryMs) {
+      await this._exitUnpairedFirstLeg(market, openSide, openBook, secondSide, secondBook, 'EXTENDED_HOLD_TOO_CLOSE_TO_EXPIRY');
+      return true;
+    }
+
+    const candidate = await this._evaluateSecondLegCandidate(market, secondSide, secondBook);
+    if (candidate.allowed) {
+      const entered = await this._enterLeg(market, secondSide, secondBook, {
+        exactPlan: candidate.plan,
+        entryRole: 'second',
+        useFok: true,
+        maxPriceOverride: candidate.maxLimitPrice,
+      });
+      if (entered && VALUE_MERGE_ON_SECOND_LEG) {
+        await this._mergeMatchedPair(market, this._targetShares(), 'extended-hold-second-leg-merge');
+      }
+      return true;
+    }
+
+    const openTokenId = openSide === 'Up' ? market.upToken.tokenId : market.downToken.tokenId;
+    const feeRateBps = await this._getFeeRateBps(openTokenId);
+    const shares = this._valueOpenShares(market, openSide);
+    const directExit = this._evaluateDirectSellExit(openBook, shares, feeRateBps);
+    const netProfitPerShare = directExit.allowed
+      ? this._netExitProfitPerShare(market, openSide, directExit, feeRateBps)
+      : null;
+
+    if (Number.isFinite(netProfitPerShare)) {
+      hold.bestNetExitProfitPerShare = Math.max(
+        Number(hold.bestNetExitProfitPerShare ?? Number.NEGATIVE_INFINITY),
+        netProfitPerShare,
+      );
+      if (netProfitPerShare >= VALUE_DIRECT_TAKE_PROFIT_PER_SHARE) {
+        const sold = await this._sellShares(market, openSide, openBook, shares, {
+          actionType: 'extended-hold-profit-exit',
+          minPrice: directExit.minPrice,
+        });
+        if (sold) {
+          market.lastAction = `extended hold profit exited ${openSide.toLowerCase()}`;
+          this.emit('markets-updated', this.snapshotMarkets());
+        }
+        return true;
+      }
+      if (netProfitPerShare <= 0) {
+        await this._exitUnpairedFirstLeg(market, openSide, openBook, secondSide, secondBook, 'EXTENDED_HOLD_LOST_PROFIT');
+        return true;
+      }
+      if (netProfitPerShare <= Number(hold.bestNetExitProfitPerShare) - trailingDrawdownPerShare) {
+        await this._exitUnpairedFirstLeg(market, openSide, openBook, secondSide, secondBook, 'EXTENDED_HOLD_TRAILING_STOP_TRIGGERED');
+        return true;
+      }
+    }
+
+    this._emitDecision(market, {
+      type: 'extended-hold',
+      side: secondSide,
+      reason: candidate.reason ?? 'EXTENDED_HOLD_WAITING',
+      timeLeftSec,
+      waitingFor: secondSide,
+      quote: sideQuotes(market.quote[secondSide]),
+      exitPlan: market.exitPlan,
+      candidate,
+      netProfitPerShare,
+      bestNetExitProfitPerShare: hold.bestNetExitProfitPerShare ?? null,
+      trailingDrawdownPerShare,
+    });
+    return true;
+  }
+
   async _manageSecondLegState(market, openSide, openBook, secondSide, secondBook, timeLeftSec) {
     if (market.state !== `WAIT_${secondSide.toUpperCase()}` && market.state !== `WAIT_${secondSide === 'Up' ? 'UP' : 'DOWN'}`) {
       // no-op; kept defensive against state changes during async work
@@ -796,8 +993,58 @@ export class ValueStrategyEngine extends EventEmitter {
     const timeToExpiryMs = Math.max(0, (market.closeTs * 1000) - Date.now());
     const { maxOneLegHoldMs, noUnpairedHoldLastMs } = this._oneLegHoldLimits(market);
 
+    if (await this._manageExtendedHoldState(market, openSide, openBook, secondSide, secondBook, timeLeftSec)) {
+      return;
+    }
+
     if (elapsedSinceFirstFill >= maxOneLegHoldMs) {
-      await this._exitUnpairedFirstLeg(market, openSide, openBook, secondSide, secondBook, 'MAX_ONE_LEG_HOLD_EXCEEDED');
+      const checkpoint = await this._evaluateOneLegCheckpoint(market, openSide, openBook, secondSide, secondBook);
+      if (checkpoint.action === 'COMPLETE_SECOND_LEG') {
+        const entered = await this._enterLeg(market, secondSide, secondBook, {
+          exactPlan: checkpoint.candidate.plan,
+          entryRole: 'second',
+          useFok: true,
+          maxPriceOverride: checkpoint.candidate.maxLimitPrice,
+        });
+        if (entered && VALUE_MERGE_ON_SECOND_LEG) {
+          await this._mergeMatchedPair(market, this._targetShares(), 'checkpoint-second-leg-merge');
+        }
+        return;
+      }
+      if (checkpoint.action === 'DIRECT_PROFIT_EXIT') {
+        const sold = await this._sellShares(market, openSide, openBook, this._valueOpenShares(market, openSide), {
+          actionType: 'checkpoint-profit-exit',
+          minPrice: checkpoint.directExit.minPrice,
+        });
+        if (sold) {
+          market.lastAction = `checkpoint profit exited ${openSide.toLowerCase()}`;
+          this.emit('markets-updated', this.snapshotMarkets());
+        }
+        return;
+      }
+      if (checkpoint.action === 'EXTENDED_HOLD') {
+        market.extendedHold = {
+          active: true,
+          startedAt: Date.now(),
+          bestNetExitProfitPerShare: checkpoint.netProfitPerShare,
+          activatedReason: checkpoint.reason,
+        };
+        market.lastAction = `extended hold armed for ${openSide.toLowerCase()}`;
+        this._emitDecision(market, {
+          type: 'checkpoint',
+          side: secondSide,
+          reason: checkpoint.reason,
+          timeLeftSec,
+          waitingFor: secondSide,
+          quote: sideQuotes(market.quote[secondSide]),
+          exitPlan: market.exitPlan,
+          directExit: checkpoint.directExit,
+          netProfitPerShare: checkpoint.netProfitPerShare,
+        });
+        this.emit('markets-updated', this.snapshotMarkets());
+        return;
+      }
+      await this._exitUnpairedFirstLeg(market, openSide, openBook, secondSide, secondBook, checkpoint.reason ?? 'MAX_ONE_LEG_HOLD_EXCEEDED');
       return;
     }
 
@@ -1065,6 +1312,7 @@ export class ValueStrategyEngine extends EventEmitter {
       await this._cancelMarketOrders(market, 'first-leg-filled');
       market.pendingBuyOrders.Up = null;
       market.pendingBuyOrders.Down = null;
+      market.extendedHold = null;
       market.exitPlan = {
         side,
         triggerPrice: VALUE_IMMEDIATE_EXIT_BELOW_PRICE,
@@ -1074,6 +1322,7 @@ export class ValueStrategyEngine extends EventEmitter {
       await this._ensureSecondLegAndExit(market);
     } else if (fill.role === 'second') {
       market.pendingBuyOrders[side] = null;
+      market.extendedHold = null;
       market.exitPlan = null;
       await this._cancelMarketOrders(market, 'pair-complete');
       this._ensureSettlementWatch(market);
@@ -1090,6 +1339,7 @@ export class ValueStrategyEngine extends EventEmitter {
     leg.sellAvgPrice = leg.soldShares > 0 ? leg.soldUsdc / leg.soldShares : fill.price;
     leg.soldAt = Date.now();
     market.cashProceeds += fill.proceedsUsdc;
+    market.extendedHold = null;
     market.exitPlan = null;
     market.state = this._computeState(market);
     market.pnl = market.cashProceeds + market.redeemed - market.totalCost;
@@ -1205,6 +1455,7 @@ export class ValueStrategyEngine extends EventEmitter {
       market.totalCost += leg.spent;
       market.hasAnyLeg = true;
       market.hadAnyTrade = true;
+      market.extendedHold = null;
       if (force) market.hadForcePair = true;
       if (!market.firstSide) market.firstSide = side;
       market.lastAction = `${VALUE_DRY_RUN ? 'dry-run' : 'buy'} ${side.toLowerCase()} @ ${leg.avgPrice.toFixed(4)}`;
@@ -1580,6 +1831,7 @@ export class ValueStrategyEngine extends EventEmitter {
 
     market.legs.Up.soldShares += mergeShares;
     market.legs.Down.soldShares += mergeShares;
+    market.extendedHold = null;
     market.cashProceeds += mergeShares;
     market.mergedUsdc += mergeShares;
     market.state = this._computeState(market);
