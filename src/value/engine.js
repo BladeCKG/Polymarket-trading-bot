@@ -47,6 +47,10 @@ function sideQuotes(quote) {
   };
 }
 
+function isPairedState(state) {
+  return state === 'PAIRED' || state === 'FORCED_PAIRED';
+}
+
 export class ValueStrategyEngine extends EventEmitter {
   constructor(wallet) {
     super();
@@ -107,7 +111,7 @@ export class ValueStrategyEngine extends EventEmitter {
   stats() {
     const markets = [...this.markets.values()];
     const openMarkets = markets.filter((market) => this._hasOpenExposure(market));
-    const pairedOpen = openMarkets.filter((market) => market.state === 'PAIRED').length;
+    const pairedOpen = openMarkets.filter((market) => isPairedState(market.state)).length;
     const strandedOpen = openMarkets.filter((market) =>
       market.state === 'WAIT_UP' || market.state === 'WAIT_DOWN'
     ).length;
@@ -220,7 +224,7 @@ export class ValueStrategyEngine extends EventEmitter {
   _positionType(market) {
     const up = this._openShares(market.legs.Up) > 1e-9;
     const down = this._openShares(market.legs.Down) > 1e-9;
-    if (up && down) return 'Paired';
+    if (up && down) return market.state === 'FORCED_PAIRED' ? 'Forced Paired' : 'Paired';
     if (up) return 'Up only';
     if (down) return 'Down only';
     return market.hadAnyTrade ? 'Flat' : 'None';
@@ -267,7 +271,7 @@ export class ValueStrategyEngine extends EventEmitter {
   }
 
   _hasOpenExposure(market) {
-    return !market.settled && ['WAIT_UP', 'WAIT_DOWN', 'PAIRED'].includes(market.state);
+    return !market.settled && ['WAIT_UP', 'WAIT_DOWN', 'PAIRED', 'FORCED_PAIRED'].includes(market.state);
   }
 
   async _pollMarket(market) {
@@ -350,7 +354,7 @@ export class ValueStrategyEngine extends EventEmitter {
       await this._ensureSecondLegAndExit(market);
       await this._simulatePendingFills(market);
       if (market.state !== 'WAIT_DOWN') return;
-      if (await this._simulateExitFill(market, 'Up', upBook)) return;
+      if (await this._simulateExitFill(market, 'Up', upBook, downBook)) return;
       if (this._shouldImmediateExitStrandedLeg(market, 'Up', upBook)) {
         await this._cancelMarketOrders(market, 'immediate-exit');
         await this._handleEndgame(market, 'Up', upBook, 'Down', downBook, { immediate: true });
@@ -377,7 +381,7 @@ export class ValueStrategyEngine extends EventEmitter {
       await this._ensureSecondLegAndExit(market);
       await this._simulatePendingFills(market);
       if (market.state !== 'WAIT_UP') return;
-      if (await this._simulateExitFill(market, 'Down', downBook)) return;
+      if (await this._simulateExitFill(market, 'Down', downBook, upBook)) return;
       if (this._shouldImmediateExitStrandedLeg(market, 'Down', downBook)) {
         await this._cancelMarketOrders(market, 'immediate-exit');
         await this._handleEndgame(market, 'Down', downBook, 'Up', upBook, { immediate: true });
@@ -400,7 +404,7 @@ export class ValueStrategyEngine extends EventEmitter {
       return;
     }
 
-    if (market.state === 'PAIRED') {
+    if (isPairedState(market.state)) {
       this._ensureSettlementWatch(market);
     }
   }
@@ -616,21 +620,19 @@ export class ValueStrategyEngine extends EventEmitter {
     }
   }
 
-  async _simulateExitFill(market, side, book) {
+  async _simulateExitFill(market, side, book, oppositeBook) {
     if (!VALUE_DRY_RUN || !market.exitPlan || market.exitPlan.side !== side) return false;
     const leg = market.legs[side];
-    const openShares = this._openShares(leg);
+    const openShares = this._valueOpenShares(market, side);
     if (openShares <= 1e-9) return false;
 
     const bestBid = bestBidFromBook(book)?.price ?? null;
     if (!Number.isFinite(bestBid) || bestBid >= market.exitPlan.triggerPrice) return false;
 
-    await this._recordSellFill(market, side, {
-      price: bestBid,
-      shares: openShares,
-      proceedsUsdc: bestBid * openShares,
+    await this._cancelMarketOrders(market, 'immediate-exit');
+    await this._forcePairThenFlat(market, side, book, oppositeSide(side), oppositeBook, {
+      immediate: true,
       source: 'simulated-exit-order',
-      orderId: null,
     });
     return true;
   }
@@ -756,7 +758,7 @@ export class ValueStrategyEngine extends EventEmitter {
     this.emit('markets-updated', this.snapshotMarkets());
   }
 
-  async _enterLeg(market, side, book, { force = false } = {}) {
+  async _enterLeg(market, side, book, { force = false, targetSharesOverride = null } = {}) {
     const leg = market.legs[side];
     if (leg.entered) {
       this._emitDecision(market, {
@@ -765,7 +767,7 @@ export class ValueStrategyEngine extends EventEmitter {
         reason: 'already-entered',
         force,
       });
-      return;
+      return false;
     }
 
     const quote = bestAskFromBook(book);
@@ -781,7 +783,7 @@ export class ValueStrategyEngine extends EventEmitter {
         reason: 'no-best-ask',
         force,
       });
-      return;
+      return false;
     }
     if (!eligible) {
       this._emitDecision(market, {
@@ -791,12 +793,14 @@ export class ValueStrategyEngine extends EventEmitter {
         force,
         quote: sideQuotes({ bestAsk: quote.price }),
       });
-      return;
+      return false;
     }
 
     const maxPrice = this._entryMaxPrice(market, quote.price, force);
 
-    const plan = VALUE_ORDER_MODE === 'SHARES'
+    const plan = Number.isFinite(targetSharesOverride) && targetSharesOverride > 0
+      ? estimateBuyCostForSharesFromBook(book, targetSharesOverride, maxPrice)
+      : VALUE_ORDER_MODE === 'SHARES'
       ? estimateBuyCostForSharesFromBook(book, VALUE_TARGET_SHARES, maxPrice)
       : ClobClient.estimateMarketBuyFillFromBook(book, maxPrice, VALUE_LEG_USDC, 0);
     if (!plan || plan.fillShares <= 0 || plan.spentUsdc <= 0) {
@@ -805,11 +809,12 @@ export class ValueStrategyEngine extends EventEmitter {
         side,
         reason: 'no-fill-plan',
         force,
+        targetSharesOverride,
         maxPrice,
         bestAsk: quote.price,
         executionPlan: plan ?? null,
       });
-      return;
+      return false;
     }
 
     const tokenId = side === 'Up' ? market.upToken.tokenId : market.downToken.tokenId;
@@ -834,7 +839,7 @@ export class ValueStrategyEngine extends EventEmitter {
       market.lastAction = `${VALUE_DRY_RUN ? 'dry-run' : 'buy'} ${side.toLowerCase()} @ ${leg.avgPrice.toFixed(4)}`;
       market.state = this._computeState(market);
       this.actions += 1;
-      if (market.state === 'PAIRED') this._ensureSettlementWatch(market);
+      if (isPairedState(market.state)) this._ensureSettlementWatch(market);
 
       const action = {
         type: VALUE_DRY_RUN ? 'dry-run-buy' : 'buy',
@@ -845,6 +850,7 @@ export class ValueStrategyEngine extends EventEmitter {
         shares: leg.shares,
         price: leg.avgPrice,
         forced: force,
+        targetSharesOverride,
         tokenId,
         bestAsk: quote.price,
         maxPrice,
@@ -863,6 +869,7 @@ export class ValueStrategyEngine extends EventEmitter {
         shares: leg.shares,
         avgPrice: leg.avgPrice,
         forced: force,
+        targetSharesOverride,
         tokenId,
         bestAsk: quote.price,
         maxPrice,
@@ -870,17 +877,18 @@ export class ValueStrategyEngine extends EventEmitter {
         dryRun: VALUE_DRY_RUN,
       });
       this.emit('markets-updated', this.snapshotMarkets());
-      if (market.state === 'PAIRED') {
+      if (isPairedState(market.state)) {
         this.emit('action', {
           type: 'paired',
           slug: market.slug,
           side,
           state: market.state,
           spent: market.totalCost,
-          shares: market.legs.Up.shares + market.legs.Down.shares,
-          timestamp: Date.now(),
-        });
-      }
+        shares: market.legs.Up.shares + market.legs.Down.shares,
+        timestamp: Date.now(),
+      });
+    }
+      return true;
     } catch (err) {
       this.failures += 1;
       logger.warn('value.engine: leg entry failed', {
@@ -895,6 +903,8 @@ export class ValueStrategyEngine extends EventEmitter {
         state: market.state,
         spent: plan.spentUsdc,
         shares: plan.fillShares,
+        forced: force,
+        targetSharesOverride,
         tokenId,
         bestAsk: quote?.price ?? null,
         maxPrice,
@@ -902,13 +912,14 @@ export class ValueStrategyEngine extends EventEmitter {
         book: snapshot,
         timestamp: Date.now(),
       });
+      return false;
     }
   }
 
   _computeState(market) {
     const up = this._openShares(market.legs.Up) > 1e-9;
     const down = this._openShares(market.legs.Down) > 1e-9;
-    if (up && down) return 'PAIRED';
+    if (up && down) return market.hadForcePair ? 'FORCED_PAIRED' : 'PAIRED';
     if (up) return 'WAIT_DOWN';
     if (down) return 'WAIT_UP';
     return market.hadAnyTrade ? 'FLAT' : 'NONE';
@@ -978,62 +989,47 @@ export class ValueStrategyEngine extends EventEmitter {
       return;
     }
 
-    const flattened = await this._flattenOpenLeg(market, openSide, openBook);
-    if (flattened) return;
-    if (!oppositeBook) {
-      market.lastAction = `${immediate ? 'immediate-exit' : 'endgame'} no ${oppositeSide.toLowerCase()} book after flatten failed`;
-      this._emitDecision(market, {
-        type: immediate ? 'immediate-exit' : 'endgame',
-        side: oppositeSide,
-        reason: 'force-pair-no-opposite-book',
-        openSide,
-        oppositeSide,
-      });
-      this._ensureSettlementWatch(market);
-      this.emit('markets-updated', this.snapshotMarkets());
-      logger.info(`value.engine: ${immediate ? 'immediate exit' : 'force-pair'} skipped, opposite-leg book unavailable`, {
-        slug: market.slug,
-        openSide,
-        oppositeSide,
-        dryRun: VALUE_DRY_RUN,
-      });
-      return;
-    }
-    await this._enterLeg(market, oppositeSide, oppositeBook, { force: true });
+    await this._forcePairThenFlat(market, openSide, openBook, oppositeSide, oppositeBook, {
+      immediate,
+      source: immediate ? 'immediate-exit' : 'endgame',
+    });
   }
 
   _shouldImmediateExitStrandedLeg(market, side, book) {
     const leg = market.legs[side];
-    if (!leg?.entered || this._openShares(leg) <= 1e-9) return false;
+    if (!leg?.entered || this._valueOpenShares(market, side) <= 1e-9) return false;
     if (!Number.isFinite(VALUE_IMMEDIATE_EXIT_BELOW_PRICE) || VALUE_IMMEDIATE_EXIT_BELOW_PRICE <= 0) {
       return false;
     }
 
     const bestBid = bestBidFromBook(book)?.price ?? null;
-    const bestAsk = bestAskFromBook(book)?.price ?? null;
-    const signalPrice = Number.isFinite(bestBid) ? bestBid : bestAsk;
-    return Number.isFinite(signalPrice) && signalPrice < VALUE_IMMEDIATE_EXIT_BELOW_PRICE;
+    return Number.isFinite(bestBid) && bestBid < VALUE_IMMEDIATE_EXIT_BELOW_PRICE;
   }
 
   _shouldExitStrandedLeg(market, side, book) {
     const leg = market.legs[side];
-    if (!leg?.entered || this._openShares(leg) <= 1e-9) return false;
+    if (!leg?.entered || this._valueOpenShares(market, side) <= 1e-9) return false;
     if (!Number.isFinite(VALUE_ENDGAME_EXIT_BELOW_PRICE) || VALUE_ENDGAME_EXIT_BELOW_PRICE <= 0) {
       return false;
     }
 
     const bestBid = bestBidFromBook(book)?.price ?? null;
-    const bestAsk = bestAskFromBook(book)?.price ?? null;
-    const signalPrice = Number.isFinite(bestBid) ? bestBid : bestAsk;
-    return Number.isFinite(signalPrice) && signalPrice < VALUE_ENDGAME_EXIT_BELOW_PRICE;
+    return Number.isFinite(bestBid) && bestBid < VALUE_ENDGAME_EXIT_BELOW_PRICE;
   }
 
   async _flattenOpenLeg(market, side, book) {
+    return this._sellShares(market, side, book, this._openShares(market.legs[side]), {
+      actionType: 'flatten',
+      minPrice: 0.01,
+    });
+  }
+
+  async _sellShares(market, side, book, targetShares, { actionType = 'sell', minPrice = 0.01 } = {}) {
     const leg = market.legs[side];
-    const openShares = this._openShares(leg);
+    const openShares = Math.min(this._openShares(leg), Number(targetShares ?? 0));
     if (openShares <= 1e-9) {
       this._emitDecision(market, {
-        type: 'flatten-skipped',
+        type: `${actionType}-skipped`,
         side,
         reason: 'already-flat',
       });
@@ -1043,18 +1039,17 @@ export class ValueStrategyEngine extends EventEmitter {
     const bestBid = bestBidFromBook(book);
     if (!bestBid || !Number.isFinite(bestBid.price) || bestBid.price <= 0) {
       this._emitDecision(market, {
-        type: 'flatten-skipped',
+        type: `${actionType}-skipped`,
         side,
         reason: 'no-best-bid',
       });
       return false;
     }
 
-    const minPrice = 0.01;
     const plan = estimateSellProceedsForSharesFromBook(book, openShares, minPrice);
     if (!plan || !plan.fullyFilled || plan.soldShares <= 0 || plan.proceedsUsdc <= 0) {
       this._emitDecision(market, {
-        type: 'flatten-skipped',
+        type: `${actionType}-skipped`,
         side,
         reason: 'no-sell-plan',
         bestBid: bestBid.price,
@@ -1085,7 +1080,7 @@ export class ValueStrategyEngine extends EventEmitter {
       this.actions += 1;
 
       this.emit('action', {
-        type: VALUE_DRY_RUN ? 'dry-run-sell' : 'sell',
+        type: VALUE_DRY_RUN ? `dry-run-${actionType}` : actionType,
         slug: market.slug,
         side,
         state: market.state,
@@ -1100,7 +1095,7 @@ export class ValueStrategyEngine extends EventEmitter {
         timestamp: Date.now(),
         response,
       });
-      logger.info('value.engine: leg flattened', {
+      logger.info(`value.engine: leg ${actionType}`, {
         slug: market.slug,
         side,
         state: market.state,
@@ -1138,6 +1133,73 @@ export class ValueStrategyEngine extends EventEmitter {
       });
       return false;
     }
+  }
+
+  async _forcePairThenFlat(market, openSide, openBook, oppositeSideName, oppositeBook, { immediate = false, source = 'force-pair' } = {}) {
+    const targetShares = this._valueOpenShares(market, openSide);
+    if (targetShares <= 1e-9) {
+      market.lastAction = `${source} skipped - no stranded value shares`;
+      this._emitDecision(market, {
+        type: immediate ? 'immediate-exit' : 'endgame',
+        side: openSide,
+        reason: 'no-stranded-value-shares',
+        openSide,
+        oppositeSide: oppositeSideName,
+      });
+      this._ensureSettlementWatch(market);
+      this.emit('markets-updated', this.snapshotMarkets());
+      return;
+    }
+
+    if (!oppositeBook) {
+      market.lastAction = `${source} no ${oppositeSideName.toLowerCase()} book for force-pair`;
+      this._emitDecision(market, {
+        type: immediate ? 'immediate-exit' : 'endgame',
+        side: oppositeSideName,
+        reason: 'force-pair-no-opposite-book',
+        openSide,
+        oppositeSide: oppositeSideName,
+        targetShares,
+      });
+      this._ensureSettlementWatch(market);
+      this.emit('markets-updated', this.snapshotMarkets());
+      logger.info(`value.engine: ${source} skipped, opposite-leg book unavailable`, {
+        slug: market.slug,
+        openSide,
+        oppositeSide: oppositeSideName,
+        targetShares,
+        dryRun: VALUE_DRY_RUN,
+      });
+      return;
+    }
+
+    const paired = await this._enterLeg(market, oppositeSideName, oppositeBook, {
+      force: true,
+      targetSharesOverride: targetShares,
+    });
+    if (!paired) {
+      this._ensureSettlementWatch(market);
+      return;
+    }
+
+    const openFlattened = await this._sellShares(market, openSide, openBook, targetShares, {
+      actionType: immediate ? 'immediate-flat' : 'force-flat',
+      minPrice: 0.01,
+    });
+    const oppositeFlattened = await this._sellShares(market, oppositeSideName, oppositeBook, targetShares, {
+      actionType: immediate ? 'immediate-flat' : 'force-flat',
+      minPrice: 0.01,
+    });
+
+    if (openFlattened && oppositeFlattened) {
+      market.lastAction = `${source} paired then flattened`;
+      this.emit('markets-updated', this.snapshotMarkets());
+      return;
+    }
+
+    market.lastAction = `${source} paired, partial flatten`;
+    this._ensureSettlementWatch(market);
+    this.emit('markets-updated', this.snapshotMarkets());
   }
 
   _ensureSettlementWatch(market) {
