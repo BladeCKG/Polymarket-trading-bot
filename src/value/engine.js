@@ -11,6 +11,7 @@ import {
   VALUE_EXTENDED_HOLD_MAX_MS_5M,
   VALUE_FINAL_EXIT_BEFORE_EXPIRY_MS_15M,
   VALUE_FINAL_EXIT_BEFORE_EXPIRY_MS_5M,
+  VALUE_FIRST_LEG_MIN_PRICE,
   VALUE_IMMEDIATE_EXIT_BELOW_PRICE,
   VALUE_CONTINUE_MIN_PROFIT_PER_SHARE,
   VALUE_DIRECT_TAKE_PROFIT_PER_SHARE,
@@ -27,12 +28,17 @@ import {
   VALUE_MERGE_ON_SECOND_LEG,
   VALUE_NO_UNPAIRED_HOLD_LAST_MS_15M,
   VALUE_NO_UNPAIRED_HOLD_LAST_MS_5M,
+  VALUE_OPPOSITE_GAP_TO_TARGET_MAX,
+  VALUE_OPPOSITE_MAX_PRICE,
   VALUE_ORDER_MODE,
   VALUE_OPEN_WAIT_SECONDS,
   VALUE_REQUIRED_DEPTH_MULTIPLIER,
   VALUE_SECOND_LEG_CUTOFF_SECONDS,
   VALUE_SECOND_LEG_EXTREME_SPREAD,
   VALUE_SECOND_LEG_HARD_MAX_PRICE,
+  VALUE_SECOND_LEG_MIN_LOCK_PROFIT_EARLY_PER_SHARE,
+  VALUE_SECOND_LEG_MIN_LOCK_PROFIT_LATE_PER_SHARE,
+  VALUE_SECOND_LEG_MIN_LOCK_PROFIT_MID_PER_SHARE,
   VALUE_SECOND_LEG_MAX_SPREAD,
   VALUE_SECOND_LEG_MIN_DEPTH_MULTIPLIER,
   VALUE_SECOND_LEG_MIN_LOCK_PROFIT_PER_SHARE,
@@ -168,7 +174,18 @@ export class ValueStrategyEngine extends EventEmitter {
   snapshotMarkets() {
     return [...this.markets.values()]
       .sort((a, b) => b.closeTs - a.closeTs)
-      .map((market) => ({
+      .map((market) => {
+        const enteredLegs = this._enteredLegs(market);
+        const winningOutcome = this._winningOutcome(market);
+        const onlyFirstLegTraded = enteredLegs.length === 1 && Boolean(market.firstSide);
+        const firstLegEndedUpWinner = Boolean(
+          market.settled
+          && onlyFirstLegTraded
+          && market.firstSide
+          && winningOutcome
+          && market.firstSide === winningOutcome
+        );
+        return ({
         slug: market.slug,
         question: market.question,
         conditionId: market.conditionId,
@@ -179,8 +196,10 @@ export class ValueStrategyEngine extends EventEmitter {
         targetPrice: VALUE_TARGET_PRICE,
         firstSide: market.firstSide,
         positionType: this._positionType(market),
-        enteredLegs: this._enteredLegs(market),
-        winningOutcome: this._winningOutcome(market),
+        enteredLegs,
+        winningOutcome,
+        onlyFirstLegTraded,
+        firstLegEndedUpWinner,
         upFinalValue: this._outcomePayout(market, 'Up'),
         downFinalValue: this._outcomePayout(market, 'Down'),
         upAsk: market.quote.Up?.bestAsk ?? null,
@@ -206,8 +225,21 @@ export class ValueStrategyEngine extends EventEmitter {
         redeemed: market.redeemed,
         pnl: market.pnl,
         settlementSource: market.settlementSource,
+        exitReview: market.exitReview ? {
+          side: market.exitReview.side,
+          actionType: market.exitReview.actionType,
+          exitedAt: market.exitReview.exitedAt,
+          baseNetRecovery: market.exitReview.baseNetRecovery,
+          bestPostExitNetRecovery: market.exitReview.bestPostExitNetRecovery,
+          improvementUsdc: market.exitReview.improvementUsdc,
+          improvementPerShare: market.exitReview.improvementPerShare,
+          bestSeenAt: market.exitReview.bestSeenAt,
+          bestSeenVwap: market.exitReview.bestSeenVwap,
+          couldHaveDoneBetter: market.exitReview.couldHaveDoneBetter,
+        } : null,
         lastAction: market.lastAction,
-      }));
+      });
+      });
   }
 
   _outcomePayout(market, outcomeName) {
@@ -230,6 +262,7 @@ export class ValueStrategyEngine extends EventEmitter {
       pendingBuyOrders: { Up: null, Down: null },
       exitPlan: null,
       extendedHold: null,
+      exitReview: null,
       stableSnapshotCount: 0,
       firstFee: 0,
       secondFee: 0,
@@ -327,6 +360,10 @@ export class ValueStrategyEngine extends EventEmitter {
     };
     this._updateLastLiveQuote(market, 'Up');
     this._updateLastLiveQuote(market, 'Down');
+    await this._updateExitHindsight(market, {
+      Up: upBook,
+      Down: downBook,
+    });
 
     const timeLeftSec = market.closeTs - nowSec();
     this._emitQuote(market, {
@@ -462,6 +499,27 @@ export class ValueStrategyEngine extends EventEmitter {
     return null;
   }
 
+  async _updateExitHindsight(market, booksBySide) {
+    const review = market.exitReview;
+    if (!review?.active || !review.side || review.shares <= 1e-9) return;
+    const book = booksBySide?.[review.side];
+    if (!book) return;
+
+    const tokenId = review.side === 'Up' ? market.upToken.tokenId : market.downToken.tokenId;
+    const feeRateBps = await this._getFeeRateBps(tokenId);
+    const directExit = this._evaluateDirectSellExit(book, review.shares, feeRateBps);
+    if (!directExit.allowed) return;
+
+    if (directExit.netRecovery > Number(review.bestPostExitNetRecovery ?? Number.NEGATIVE_INFINITY)) {
+      review.bestPostExitNetRecovery = directExit.netRecovery;
+      review.bestSeenAt = Date.now();
+      review.bestSeenVwap = directExit.vwap;
+      review.improvementUsdc = directExit.netRecovery - Number(review.baseNetRecovery ?? 0);
+      review.improvementPerShare = review.shares > 1e-9 ? review.improvementUsdc / review.shares : 0;
+      review.couldHaveDoneBetter = review.improvementUsdc > 0.01;
+    }
+  }
+
   _estimateCloseResolution(market) {
     const upPrice = this._signalPrice(market.quote?.Up) ?? this._signalPrice(market.lastLiveQuote?.Up);
     const downPrice = this._signalPrice(market.quote?.Down) ?? this._signalPrice(market.lastLiveQuote?.Down);
@@ -505,6 +563,34 @@ export class ValueStrategyEngine extends EventEmitter {
 
   _requiredDepthShares() {
     return this._targetShares() * VALUE_REQUIRED_DEPTH_MULTIPLIER;
+  }
+
+  _maxFirstLegPrice(market, timeLeftSec) {
+    if (market.duration === '5m') {
+      if (timeLeftSec > 180) return Math.min(VALUE_ABSOLUTE_FIRST_LEG_MAX_PRICE, VALUE_TARGET_PRICE + 0.01);
+      if (timeLeftSec > 120) return Math.min(VALUE_ABSOLUTE_FIRST_LEG_MAX_PRICE, VALUE_TARGET_PRICE);
+      if (timeLeftSec > 90) return Math.max(VALUE_FIRST_LEG_MIN_PRICE, VALUE_TARGET_PRICE - 0.03);
+      return null;
+    }
+
+    if (timeLeftSec > 600) return VALUE_ABSOLUTE_FIRST_LEG_MAX_PRICE;
+    if (timeLeftSec > 300) return Math.min(VALUE_ABSOLUTE_FIRST_LEG_MAX_PRICE, VALUE_TARGET_PRICE + 0.01);
+    if (timeLeftSec > 180) return Math.min(VALUE_ABSOLUTE_FIRST_LEG_MAX_PRICE, VALUE_TARGET_PRICE);
+    return null;
+  }
+
+  _dynamicSecondLegMinLockProfitPerShare(market) {
+    const timeToExpiryMs = Math.max(0, (market.closeTs * 1000) - Date.now());
+    if (market.duration === '5m') {
+      if (timeToExpiryMs > 180_000) return VALUE_SECOND_LEG_MIN_LOCK_PROFIT_EARLY_PER_SHARE;
+      if (timeToExpiryMs > 90_000) return VALUE_SECOND_LEG_MIN_LOCK_PROFIT_MID_PER_SHARE;
+      if (timeToExpiryMs > 60_000) return VALUE_SECOND_LEG_MIN_LOCK_PROFIT_LATE_PER_SHARE;
+      return VALUE_SECOND_LEG_MIN_LOCK_PROFIT_PER_SHARE;
+    }
+    if (timeToExpiryMs > 300_000) return VALUE_SECOND_LEG_MIN_LOCK_PROFIT_EARLY_PER_SHARE;
+    if (timeToExpiryMs > 180_000) return VALUE_SECOND_LEG_MIN_LOCK_PROFIT_MID_PER_SHARE;
+    if (timeToExpiryMs > 120_000) return VALUE_SECOND_LEG_MIN_LOCK_PROFIT_LATE_PER_SHARE;
+    return VALUE_SECOND_LEG_MIN_LOCK_PROFIT_PER_SHARE;
   }
 
   _spread(book) {
@@ -559,7 +645,7 @@ export class ValueStrategyEngine extends EventEmitter {
     return market.stableSnapshotCount >= VALUE_STABLE_SNAPSHOTS_REQUIRED;
   }
 
-  _evaluateFirstLegCandidate(side, book) {
+  _evaluateFirstLegCandidate(market, side, book, oppositeBook, timeLeftSec) {
     const bestAsk = bestAskFromBook(book);
     const bestBid = bestBidFromBook(book);
     if (!bestAsk || !bestBid) return { allowed: false, reason: 'missing-best-level' };
@@ -568,22 +654,42 @@ export class ValueStrategyEngine extends EventEmitter {
     if (!Number.isFinite(spread) || spread > VALUE_MAX_SPREAD) {
       return { allowed: false, reason: 'spread-too-wide', spread };
     }
-    if (bestAsk.price > VALUE_ABSOLUTE_FIRST_LEG_MAX_PRICE) {
-      return { allowed: false, reason: 'best-ask-too-high', bestAsk: bestAsk.price };
+    if (bestAsk.price < VALUE_FIRST_LEG_MIN_PRICE) {
+      return { allowed: false, reason: 'best-ask-too-low', bestAsk: bestAsk.price };
+    }
+
+    const effectiveMaxFirstLegPrice = this._maxFirstLegPrice(market, timeLeftSec);
+    if (!Number.isFinite(effectiveMaxFirstLegPrice)) {
+      return { allowed: false, reason: 'first-leg-window-expired', timeLeftSec };
+    }
+    if (bestAsk.price > effectiveMaxFirstLegPrice) {
+      return { allowed: false, reason: 'best-ask-too-high', bestAsk: bestAsk.price, maxFirstLegPrice: effectiveMaxFirstLegPrice };
+    }
+
+    const oppositeBestAsk = bestAskFromBook(oppositeBook);
+    if (!oppositeBestAsk) {
+      return { allowed: false, reason: 'opposite-missing-best-ask' };
+    }
+    if (oppositeBestAsk.price > VALUE_OPPOSITE_MAX_PRICE) {
+      return { allowed: false, reason: 'opposite-too-expensive', oppositeBestAsk: oppositeBestAsk.price };
+    }
+    const oppositeGapToTarget = oppositeBestAsk.price - VALUE_SECOND_LEG_HARD_MAX_PRICE;
+    if (oppositeGapToTarget > VALUE_OPPOSITE_GAP_TO_TARGET_MAX) {
+      return { allowed: false, reason: 'opposite-too-far-from-target', oppositeBestAsk: oppositeBestAsk.price, oppositeGapToTarget };
     }
 
     const targetShares = this._targetShares();
     const requiredDepth = this._requiredDepthShares();
-    const depth = this._bookDepthAtOrBelowPrice(book, VALUE_TARGET_PRICE);
+    const depth = this._bookDepthAtOrBelowPrice(book, effectiveMaxFirstLegPrice);
     if (depth < requiredDepth) {
       return { allowed: false, reason: 'insufficient-depth', depth, requiredDepth };
     }
 
-    const plan = estimateBuyCostForSharesFromBook(book, targetShares, VALUE_TARGET_PRICE);
+    const plan = estimateBuyCostForSharesFromBook(book, targetShares, effectiveMaxFirstLegPrice);
     if (!plan || !plan.fullyFilled || plan.fillShares + 1e-9 < targetShares) {
       return { allowed: false, reason: 'cannot-fill-full-size', targetShares, plan: plan ?? null };
     }
-    if (!Number.isFinite(plan.avgFillPrice) || plan.avgFillPrice > VALUE_TARGET_PRICE) {
+    if (!Number.isFinite(plan.avgFillPrice) || plan.avgFillPrice > effectiveMaxFirstLegPrice) {
       return { allowed: false, reason: 'vwap-too-expensive', avgFillPrice: plan?.avgFillPrice ?? null };
     }
 
@@ -595,7 +701,9 @@ export class ValueStrategyEngine extends EventEmitter {
       depth,
       bestAsk: bestAsk.price,
       bestBid: bestBid.price,
+      oppositeBestAsk: oppositeBestAsk.price,
       spread,
+      maxFirstLegPrice: effectiveMaxFirstLegPrice,
       plan,
     };
   }
@@ -709,7 +817,7 @@ export class ValueStrategyEngine extends EventEmitter {
     const totalCost = market.totalCost + plan.spentUsdc + secondFee;
     const mergePayout = shares;
     const lockProfit = mergePayout - totalCost;
-    const minLockProfit = shares * VALUE_SECOND_LEG_MIN_LOCK_PROFIT_PER_SHARE;
+    const minLockProfit = shares * this._dynamicSecondLegMinLockProfitPerShare(market);
     if (lockProfit < minLockProfit) {
       return {
         allowed: false,
@@ -803,8 +911,8 @@ export class ValueStrategyEngine extends EventEmitter {
       return;
     }
 
-    const upCandidate = this._evaluateFirstLegCandidate('Up', upBook);
-    const downCandidate = this._evaluateFirstLegCandidate('Down', downBook);
+    const upCandidate = this._evaluateFirstLegCandidate(market, 'Up', upBook, downBook, timeLeftSec);
+    const downCandidate = this._evaluateFirstLegCandidate(market, 'Down', downBook, upBook, timeLeftSec);
     const allowedCandidates = [upCandidate, downCandidate].filter((candidate) => candidate.allowed);
     if (!allowedCandidates.length) {
       this._emitDecision(market, {
@@ -1334,6 +1442,13 @@ export class ValueStrategyEngine extends EventEmitter {
   async _recordSellFill(market, side, fill) {
     if (fill.orderId) this._processedOrderIds.add(fill.orderId);
     const leg = market.legs[side];
+    const tokenId = side === 'Up' ? market.upToken.tokenId : market.downToken.tokenId;
+    const feeRateBps = await this._getFeeRateBps(tokenId);
+    const estimatedFee = ClobClient.estimateTakerFeeUsdc({
+      shares: fill.shares,
+      price: fill.price,
+      feeRateBps,
+    });
     leg.soldShares += fill.shares;
     leg.soldUsdc += fill.proceedsUsdc;
     leg.sellAvgPrice = leg.soldShares > 0 ? leg.soldUsdc / leg.soldShares : fill.price;
@@ -1341,6 +1456,22 @@ export class ValueStrategyEngine extends EventEmitter {
     market.cashProceeds += fill.proceedsUsdc;
     market.extendedHold = null;
     market.exitPlan = null;
+    if (market.state === 'FLAT' || (this._openShares(leg) <= 1e-9 && market.hadAnyTrade)) {
+      market.exitReview = {
+        active: true,
+        side,
+        shares: fill.shares,
+        actionType: 'sell-fill',
+        exitedAt: Date.now(),
+        baseNetRecovery: fill.proceedsUsdc - estimatedFee,
+        bestPostExitNetRecovery: fill.proceedsUsdc - estimatedFee,
+        improvementUsdc: 0,
+        improvementPerShare: 0,
+        bestSeenAt: null,
+        bestSeenVwap: fill.price,
+        couldHaveDoneBetter: false,
+      };
+    }
     market.state = this._computeState(market);
     market.pnl = market.cashProceeds + market.redeemed - market.totalCost;
     this.actions += 1;
@@ -1423,6 +1554,12 @@ export class ValueStrategyEngine extends EventEmitter {
     }
 
     const tokenId = side === 'Up' ? market.upToken.tokenId : market.downToken.tokenId;
+    const feeRateBps = await this._getFeeRateBps(tokenId);
+    const estimatedFee = ClobClient.estimateTakerFeeUsdc({
+      shares: plan.soldShares,
+      price: plan.avgFillPrice ?? bestBid.price,
+      feeRateBps,
+    });
     const snapshot = bookSnapshot(book);
     try {
       let response = null;
@@ -1707,6 +1844,22 @@ export class ValueStrategyEngine extends EventEmitter {
       market.cashProceeds += plan.proceedsUsdc;
       market.lastAction = `${VALUE_DRY_RUN ? 'dry-run' : 'sell'} ${side.toLowerCase()} @ ${leg.sellAvgPrice.toFixed(4)}`;
       market.state = this._computeState(market);
+      if (market.state === 'FLAT') {
+        market.exitReview = {
+          active: true,
+          side,
+          shares: plan.soldShares,
+          actionType,
+          exitedAt: Date.now(),
+          baseNetRecovery: plan.proceedsUsdc - estimatedFee,
+          bestPostExitNetRecovery: plan.proceedsUsdc - estimatedFee,
+          improvementUsdc: 0,
+          improvementPerShare: 0,
+          bestSeenAt: null,
+          bestSeenVwap: leg.sellAvgPrice,
+          couldHaveDoneBetter: false,
+        };
+      }
       market.pnl = market.cashProceeds + market.redeemed - market.totalCost;
       this.actions += 1;
 
