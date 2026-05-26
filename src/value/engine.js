@@ -634,7 +634,7 @@ export class ValueStrategyEngine extends EventEmitter {
     if (!Number.isFinite(bestBid) || bestBid >= market.exitPlan.triggerPrice) return false;
 
     await this._cancelMarketOrders(market, 'immediate-exit');
-    await this._forcePairThenFlat(market, side, book, oppositeSide(side), oppositeBook, {
+    await this._forcePairOnly(market, side, book, oppositeSide(side), oppositeBook, {
       immediate: true,
       source: 'simulated-exit-order',
     });
@@ -993,7 +993,7 @@ export class ValueStrategyEngine extends EventEmitter {
       return;
     }
 
-    await this._forcePairThenFlat(market, openSide, openBook, oppositeSide, oppositeBook, {
+    await this._forcePairOnly(market, openSide, openBook, oppositeSide, oppositeBook, {
       immediate,
       source: immediate ? 'immediate-exit' : 'endgame',
     });
@@ -1139,7 +1139,7 @@ export class ValueStrategyEngine extends EventEmitter {
     }
   }
 
-  async _forcePairThenFlat(market, openSide, openBook, oppositeSideName, oppositeBook, { immediate = false, source = 'force-pair' } = {}) {
+  async _forcePairOnly(market, openSide, openBook, oppositeSideName, oppositeBook, { immediate = false, source = 'force-pair' } = {}) {
     const targetShares = this._valueOpenShares(market, openSide);
     if (targetShares <= 1e-9) {
       market.lastAction = `${source} skipped - no stranded value shares`;
@@ -1185,23 +1185,7 @@ export class ValueStrategyEngine extends EventEmitter {
       this._ensureSettlementWatch(market);
       return;
     }
-
-    const openFlattened = await this._sellShares(market, openSide, openBook, targetShares, {
-      actionType: immediate ? 'immediate-flat' : 'force-flat',
-      minPrice: 0.01,
-    });
-    const oppositeFlattened = await this._sellShares(market, oppositeSideName, oppositeBook, targetShares, {
-      actionType: immediate ? 'immediate-flat' : 'force-flat',
-      minPrice: 0.01,
-    });
-
-    if (openFlattened && oppositeFlattened) {
-      market.lastAction = `${source} paired then flattened`;
-      this.emit('markets-updated', this.snapshotMarkets());
-      return;
-    }
-
-    market.lastAction = `${source} paired, partial flatten`;
+    market.lastAction = `${source} forced paired`;
     this._ensureSettlementWatch(market);
     this.emit('markets-updated', this.snapshotMarkets());
   }
