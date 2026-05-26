@@ -155,6 +155,14 @@ export class ValueStrategyEngine extends EventEmitter {
     const settledPnl = closed.reduce((sum, market) => sum + Number(market.pnl ?? 0), 0);
     const profitMarkets = closed.filter((market) => Number(market.pnl ?? 0) > 0).length;
     const lossMarkets = closed.filter((market) => Number(market.pnl ?? 0) < 0).length;
+    const totalProfitSum = closed.reduce((sum, market) => sum + Math.max(0, Number(market.pnl ?? 0)), 0);
+    const totalLossSum = closed.reduce((sum, market) => sum + Math.min(0, Number(market.pnl ?? 0)), 0);
+
+    const exitQualityMarkets = markets
+      .map((market) => this._singleLegExitOutcome(market))
+      .filter(Boolean);
+    const misexitMarkets = exitQualityMarkets.filter((item) => item.kind === 'misexit');
+    const correctexitMarkets = exitQualityMarkets.filter((item) => item.kind === 'correctexit');
 
     return {
       trackedMarkets: markets.length,
@@ -164,10 +172,38 @@ export class ValueStrategyEngine extends EventEmitter {
       settledMarkets: closedMarkets,
       profitMarkets,
       lossMarkets,
+      totalProfitSum: totalProfitSum.toFixed(2),
+      totalLossSum: totalLossSum.toFixed(2),
+      misexitMarkets: misexitMarkets.length,
+      correctexitMarkets: correctexitMarkets.length,
+      lossSumFromMisexitMarkets: misexitMarkets.reduce((sum, item) => sum + Math.min(0, item.actualPnl), 0).toFixed(2),
+      lossSumFromCorrectexitMarkets: correctexitMarkets.reduce((sum, item) => sum + Math.min(0, item.actualPnl), 0).toFixed(2),
+      missedProfitSumFromMisexitMarkets: misexitMarkets.reduce((sum, item) => sum + Math.max(0, item.holdPnl - item.actualPnl), 0).toFixed(2),
+      missedLossSumFromCorrectexitMarkets: correctexitMarkets.reduce((sum, item) => sum + Math.max(0, item.actualPnl - item.holdPnl), 0).toFixed(2),
       openCost: openCost.toFixed(2),
       settledPnl: settledPnl.toFixed(2),
       actions: this.actions,
       failures: this.failures,
+    };
+  }
+
+  _singleLegExitOutcome(market) {
+    if (!market?.settled || !market.firstSide) return null;
+    const enteredLegs = this._enteredLegs(market);
+    if (enteredLegs.length !== 1) return null;
+    const firstSide = market.firstSide;
+    if (enteredLegs[0] !== firstSide) return null;
+
+    const winner = this._winningOutcome(market);
+    if (!winner) return null;
+
+    const leg = market.legs[firstSide];
+    const actualPnl = Number(market.pnl ?? 0);
+    const holdPnl = (Number(leg.shares ?? 0) * (winner === firstSide ? 1 : 0)) - Number(market.totalCost ?? 0);
+    return {
+      kind: winner === firstSide ? 'misexit' : 'correctexit',
+      actualPnl,
+      holdPnl,
     };
   }
 

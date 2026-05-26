@@ -279,6 +279,14 @@
         ['Stranded Open', state.stats.strandedOpenMarkets ?? 0],
         ['Profit Markets', state.stats.profitMarkets ?? 0],
         ['Loss Markets', state.stats.lossMarkets ?? 0],
+        ['Profit Sum', money(state.stats.totalProfitSum ?? 0)],
+        ['Loss Sum', money(state.stats.totalLossSum ?? 0)],
+        ['Misexit Markets', state.stats.misexitMarkets ?? 0],
+        ['Correctexit Markets', state.stats.correctexitMarkets ?? 0],
+        ['Misexit Loss Sum', money(state.stats.lossSumFromMisexitMarkets ?? 0)],
+        ['Correctexit Loss Sum', money(state.stats.lossSumFromCorrectexitMarkets ?? 0)],
+        ['Missed Profit Sum', money(state.stats.missedProfitSumFromMisexitMarkets ?? 0)],
+        ['Missed Loss Sum', money(state.stats.missedLossSumFromCorrectexitMarkets ?? 0)],
         ['Actions', state.stats.actions ?? 0],
         ['Settled Markets', state.stats.settledMarkets ?? 0],
         ['Open Cost', money(state.stats.openCost ?? 0)],
@@ -414,7 +422,7 @@
     }
 
     function renderMarketsSection() {
-      const filteredMarkets = state.markets.filter(matchesMarketFilters);
+      const filteredMarkets = state.markets.filter(matchesMarketFilters).slice(0, 100);
       const stateOptions = uniqueOptions(state.markets.map((item) => item.marketState).filter(Boolean));
       const positionOptions = uniqueOptions(state.markets.map((item) => item.positionType).filter(Boolean));
       return panel('markets', 'Markets', `${filteredMarkets.length} shown / ${state.markets.length} tracked`, `
@@ -438,7 +446,7 @@
 
     function updateMarketsSection(slot) {
       if (!slot) return;
-      const filteredMarkets = state.markets.filter(matchesMarketFilters);
+      const filteredMarkets = state.markets.filter(matchesMarketFilters).slice(0, 100);
       const stateOptions = uniqueOptions(state.markets.map((item) => item.marketState).filter(Boolean));
       const positionOptions = uniqueOptions(state.markets.map((item) => item.positionType).filter(Boolean));
       const details = slot.querySelector('details.panel[data-panel-key="markets"]');
