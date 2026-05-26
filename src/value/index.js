@@ -269,6 +269,9 @@ export async function main() {
   engine.on('quote', (quote) => {
     traceFile.writeMarket(quote.slug, 'quote', quote);
   });
+  engine.on('market-init', (marketInfo) => {
+    traceFile.writeMarket(marketInfo.slug, 'market-init', marketInfo);
+  });
   engine.on('decision', (decision) => {
     traceFile.writeMarket(decision.slug, 'decision', decision);
   });

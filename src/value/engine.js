@@ -109,6 +109,48 @@ export class ValueStrategyEngine extends EventEmitter {
       }
       const created = this._createMarketState(market);
       this.markets.set(market.slug, created);
+      this.emit('market-init', {
+        slug: created.slug,
+        conditionId: created.conditionId,
+        question: created.question,
+        symbol: created.symbol,
+        duration: created.duration,
+        windowTs: created.windowTs,
+        closeTs: created.closeTs,
+        upTokenId: created.upToken?.tokenId ?? null,
+        downTokenId: created.downToken?.tokenId ?? null,
+        replayConfig: {
+          dryRun: VALUE_DRY_RUN,
+          targetPrice: VALUE_TARGET_PRICE,
+          absoluteFirstLegMaxPrice: VALUE_ABSOLUTE_FIRST_LEG_MAX_PRICE,
+          firstLegMinPrice: VALUE_FIRST_LEG_MIN_PRICE,
+          oppositeMaxPrice: VALUE_OPPOSITE_MAX_PRICE,
+          oppositeGapToTargetMax: VALUE_OPPOSITE_GAP_TO_TARGET_MAX,
+          orderMode: VALUE_ORDER_MODE,
+          legUsdc: VALUE_LEG_USDC,
+          targetShares: VALUE_TARGET_SHARES,
+          maxSpread: VALUE_MAX_SPREAD,
+          extremeSpread: VALUE_EXTREME_SPREAD,
+          requiredDepthMultiplier: VALUE_REQUIRED_DEPTH_MULTIPLIER,
+          firstLegCutoffSeconds: VALUE_FIRST_LEG_CUTOFF_SECONDS,
+          secondLegCutoffSeconds: VALUE_SECOND_LEG_CUTOFF_SECONDS,
+          secondLegHardMaxPrice: VALUE_SECOND_LEG_HARD_MAX_PRICE,
+          secondLegMaxSpread: VALUE_SECOND_LEG_MAX_SPREAD,
+          secondLegExtremeSpread: VALUE_SECOND_LEG_EXTREME_SPREAD,
+          secondLegMinDepthMultiplier: VALUE_SECOND_LEG_MIN_DEPTH_MULTIPLIER,
+          secondLegMinLockProfitPerShare: VALUE_SECOND_LEG_MIN_LOCK_PROFIT_PER_SHARE,
+          maxOneLegHoldMs5m: VALUE_MAX_ONE_LEG_HOLD_MS_5M,
+          maxOneLegHoldMs15m: VALUE_MAX_ONE_LEG_HOLD_MS_15M,
+          noUnpairedHoldLastMs5m: VALUE_NO_UNPAIRED_HOLD_LAST_MS_5M,
+          noUnpairedHoldLastMs15m: VALUE_NO_UNPAIRED_HOLD_LAST_MS_15M,
+          maxBookAgeMs: VALUE_MAX_BOOK_AGE_MS,
+          maxUnpairedLossPerShare: VALUE_MAX_UNPAIRED_LOSS_PER_SHARE,
+          mergeOnSecondLeg: VALUE_MERGE_ON_SECOND_LEG,
+          immediateExitBelowPrice: VALUE_IMMEDIATE_EXIT_BELOW_PRICE,
+          endgameExitBelowPrice: VALUE_ENDGAME_EXIT_BELOW_PRICE,
+        },
+        createdAt: Date.now(),
+      });
       if ((created.closed || created.resolved) && this._hasOpenExposure(created)) {
         this._ensureSettlementWatch(created);
       }
@@ -406,6 +448,8 @@ export class ValueStrategyEngine extends EventEmitter {
       timeLeftSec,
       upBookLive: Boolean(upBook),
       downBookLive: Boolean(downBook),
+      upBook,
+      downBook,
     });
     if (timeLeftSec <= 0) {
       await this._cancelMarketOrders(market, 'market-closed');
@@ -2162,9 +2206,17 @@ export class ValueStrategyEngine extends EventEmitter {
     this.emit('quote', {
       slug: market.slug,
       conditionId: market.conditionId,
+      question: market.question,
+      symbol: market.symbol,
+      duration: market.duration,
+      windowTs: market.windowTs,
+      closeTs: market.closeTs,
       state: market.state,
       marketState: market.settled ? 'SETTLED' : 'OPEN',
       timeLeftSec: extra.timeLeftSec ?? Math.max(0, market.closeTs - nowSec()),
+      firstSide: market.firstSide,
+      positionType: this._positionType(market),
+      enteredLegs: this._enteredLegs(market),
       up: {
         ...sideQuotes(market.quote.Up),
         bookLive: extra.upBookLive ?? null,
@@ -2172,6 +2224,29 @@ export class ValueStrategyEngine extends EventEmitter {
       down: {
         ...sideQuotes(market.quote.Down),
         bookLive: extra.downBookLive ?? null,
+      },
+      books: {
+        up: extra.upBook ? bookSnapshot(extra.upBook) : null,
+        down: extra.downBook ? bookSnapshot(extra.downBook) : null,
+      },
+      strategy: {
+        totalCost: market.totalCost,
+        cashProceeds: market.cashProceeds,
+        redeemed: market.redeemed,
+        pnl: market.pnl,
+        lastAction: market.lastAction,
+        exitPlan: market.exitPlan,
+        extendedHold: market.extendedHold,
+        firstFee: market.firstFee,
+        secondFee: market.secondFee,
+        mergedUsdc: market.mergedUsdc,
+        hadAnyTrade: market.hadAnyTrade,
+        hadImmediateExit: market.hadImmediateExit,
+        hadForcePair: market.hadForcePair,
+      },
+      legs: {
+        up: { ...market.legs.Up },
+        down: { ...market.legs.Down },
       },
       timestamp: Date.now(),
     });
