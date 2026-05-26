@@ -280,9 +280,9 @@
         ['Profit Markets', state.stats.profitMarkets ?? 0],
         ['Loss Markets', state.stats.lossMarkets ?? 0],
         ['Actions', state.stats.actions ?? 0],
-        ['Settled Markets', state.stats.settledMarkets ?? 0],
+        ['Closed Markets', state.stats.settledMarkets ?? 0],
         ['Open Cost', money(state.stats.openCost ?? 0)],
-        ['Settled PnL', money(state.stats.settledPnl ?? 0)],
+        ['Closed PnL', money(state.stats.settledPnl ?? 0)],
       ];
       topStatsEl.innerHTML = cards.map(([label, value]) => `
         <article class="stat">
@@ -368,6 +368,7 @@
                       <th>Bought</th>
                       <th>Buy Avg Px</th>
                       <th>Sold</th>
+                      <th>Merged</th>
                       <th>Sell Avg Px</th>
                       <th>Cash Out</th>
                     </tr>
@@ -380,6 +381,7 @@
                       <td>${dash(item.upShares)}</td>
                       <td>${dash(item.upPrice)}</td>
                       <td>${dash(item.upSoldShares)}</td>
+                      <td>${dash(item.upMergedShares)}</td>
                       <td>${dash(item.upSellPrice)}</td>
                       <td>${money(item.upSoldUsdc)}</td>
                     </tr>
@@ -390,6 +392,7 @@
                       <td>${dash(item.downShares)}</td>
                       <td>${dash(item.downPrice)}</td>
                       <td>${dash(item.downSoldShares)}</td>
+                      <td>${dash(item.downMergedShares)}</td>
                       <td>${dash(item.downSellPrice)}</td>
                       <td>${money(item.downSoldUsdc)}</td>
                     </tr>
@@ -400,6 +403,7 @@
             <div><dt>Summary</dt><dd>Totals</dd></div>
             <div><dt>Total Cost</dt><dd>${money(item.totalCost)}</dd></div>
             <div><dt>Cash Out</dt><dd>${money(item.cashProceeds)}</dd></div>
+            <div><dt>Merged</dt><dd>${money(item.mergedUsdc)}</dd></div>
             <div><dt>Redeemed</dt><dd>${money(item.redeemed)}</dd></div>
             <div><dt>PnL</dt><dd>${money(item.pnl)}</dd></div>
             <div><dt>Strategy State</dt><dd>${dash(item.state)}</dd></div>
@@ -511,7 +515,7 @@
     }
 
     function marketPnlBucket(item) {
-      if (item.marketState !== 'SETTLED' && item.positionType !== 'Flat') return 'UNSETTLED';
+      if (item.marketState !== 'SETTLED' && item.positionType !== 'Flat' && item.positionType !== 'Merged') return 'UNSETTLED';
       if (item.pnl == null || item.pnl === '') return 'UNSETTLED';
       const pnl = Number(item.pnl);
       if (!Number.isFinite(pnl)) return 'UNSETTLED';

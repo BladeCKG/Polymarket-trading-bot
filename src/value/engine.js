@@ -2,8 +2,10 @@ import { EventEmitter } from 'events';
 import logger from '../logger.js';
 import { ClobClient } from '../clob.js';
 import { waitForResolution } from '../market.js';
+import { mergePositions } from '../onchain.js';
 import {
   VALUE_DRY_RUN,
+  VALUE_ENABLE_MERGE,
   VALUE_ENDGAME_EXIT_BELOW_PRICE,
   VALUE_IMMEDIATE_EXIT_BELOW_PRICE,
   VALUE_FIRST_LEG_CUTOFF_SECONDS,
@@ -11,6 +13,7 @@ import {
   VALUE_MAX_OPEN_MARKETS,
   VALUE_MAX_SLIPPAGE,
   VALUE_MAX_STRANDED_LEGS,
+  VALUE_MERGE_THRESHOLD_USDC,
   VALUE_ORDER_MODE,
   VALUE_SECOND_LEG_CUTOFF_SECONDS,
   VALUE_TARGET_PRICE,
@@ -111,9 +114,9 @@ export class ValueStrategyEngine extends EventEmitter {
     const strandedOpen = openMarkets.filter((market) =>
       market.state === 'WAIT_UP' || market.state === 'WAIT_DOWN'
     ).length;
-    const closed = markets.filter((market) => market.settled || market.state === 'FLAT');
+    const closed = markets.filter((market) => market.settled || market.state === 'FLAT' || market.state === 'MERGED');
     const closedMarkets = closed.length;
-    const openCost = openMarkets.reduce((sum, market) => sum + market.totalCost - market.cashProceeds, 0);
+    const openCost = openMarkets.reduce((sum, market) => sum + market.totalCost - market.cashProceeds - market.mergedUsdc, 0);
     const settledPnl = closed.reduce((sum, market) => sum + Number(market.pnl ?? 0), 0);
     const profitMarkets = closed.filter((market) => Number(market.pnl ?? 0) > 0).length;
     const lossMarkets = closed.filter((market) => Number(market.pnl ?? 0) < 0).length;
@@ -162,6 +165,7 @@ export class ValueStrategyEngine extends EventEmitter {
         upSoldShares: market.legs.Up.soldShares,
         upSoldUsdc: market.legs.Up.soldUsdc,
         upSellPrice: market.legs.Up.sellAvgPrice,
+        upMergedShares: market.legs.Up.mergedShares,
         downStatus: this._legStatus(market.legs.Down),
         downSpent: market.legs.Down.spent,
         downShares: market.legs.Down.shares,
@@ -169,8 +173,11 @@ export class ValueStrategyEngine extends EventEmitter {
         downSoldShares: market.legs.Down.soldShares,
         downSoldUsdc: market.legs.Down.soldUsdc,
         downSellPrice: market.legs.Down.sellAvgPrice,
+        downMergedShares: market.legs.Down.mergedShares,
         totalCost: market.totalCost,
         cashProceeds: market.cashProceeds,
+        mergedUsdc: market.mergedUsdc,
+        mergedShares: market.mergedShares,
         redeemed: market.redeemed,
         pnl: market.pnl,
         settlementSource: market.settlementSource,
@@ -203,6 +210,8 @@ export class ValueStrategyEngine extends EventEmitter {
       },
       totalCost: 0,
       cashProceeds: 0,
+      mergedUsdc: 0,
+      mergedShares: 0,
       redeemed: 0,
       pnl: null,
       settled: false,
@@ -210,8 +219,10 @@ export class ValueStrategyEngine extends EventEmitter {
       settlementSource: null,
       hasAnyLeg: false,
       hadAnyTrade: false,
+      hadMerge: false,
       hadImmediateExit: false,
       hadForcePair: false,
+      mergeInFlight: false,
       outcomes: [],
       payouts: [],
     };
@@ -223,6 +234,7 @@ export class ValueStrategyEngine extends EventEmitter {
     if (up && down) return 'Paired';
     if (up) return 'Up only';
     if (down) return 'Down only';
+    if (market.hadMerge) return 'Merged';
     return market.hadAnyTrade ? 'Flat' : 'None';
   }
 
@@ -250,6 +262,7 @@ export class ValueStrategyEngine extends EventEmitter {
       soldShares: 0,
       soldUsdc: 0,
       sellAvgPrice: null,
+      mergedShares: 0,
       enteredAt: null,
       soldAt: null,
       response: null,
@@ -258,12 +271,15 @@ export class ValueStrategyEngine extends EventEmitter {
 
   _legStatus(leg) {
     if (!leg.entered) return 'waiting';
+    if (this._openShares(leg) <= 1e-9 && Number(leg.mergedShares ?? 0) > 1e-9 && Number(leg.soldShares ?? 0) <= 1e-9) {
+      return 'merged';
+    }
     if (this._openShares(leg) <= 1e-9) return 'exited';
     return 'entered';
   }
 
   _openShares(leg) {
-    return Math.max(0, Number(leg.shares ?? 0) - Number(leg.soldShares ?? 0));
+    return Math.max(0, Number(leg.shares ?? 0) - Number(leg.soldShares ?? 0) - Number(leg.mergedShares ?? 0));
   }
 
   _hasOpenExposure(market) {
@@ -401,6 +417,8 @@ export class ValueStrategyEngine extends EventEmitter {
     }
 
     if (market.state === 'PAIRED') {
+      await this._maybeMergePaired(market);
+      if (market.state !== 'PAIRED') return;
       this._ensureSettlementWatch(market);
     }
   }
@@ -722,7 +740,10 @@ export class ValueStrategyEngine extends EventEmitter {
       market.pendingBuyOrders[side] = null;
       market.exitPlan = null;
       await this._cancelMarketOrders(market, 'pair-complete');
-      this._ensureSettlementWatch(market);
+      await this._maybeMergePaired(market, { reason: 'pair-complete' });
+      if (market.state === 'PAIRED') {
+        this._ensureSettlementWatch(market);
+      }
     }
 
     this.emit('markets-updated', this.snapshotMarkets());
@@ -737,7 +758,7 @@ export class ValueStrategyEngine extends EventEmitter {
     market.cashProceeds += fill.proceedsUsdc;
     market.exitPlan = null;
     market.state = this._computeState(market);
-    market.pnl = market.cashProceeds + market.redeemed - market.totalCost;
+    market.pnl = market.cashProceeds + market.mergedUsdc + market.redeemed - market.totalCost;
     this.actions += 1;
     market.lastAction = `filled exit ${side.toLowerCase()} @ ${leg.sellAvgPrice.toFixed(4)}`;
     await this._cancelMarketOrders(market, 'exit-filled');
@@ -834,7 +855,10 @@ export class ValueStrategyEngine extends EventEmitter {
       market.lastAction = `${VALUE_DRY_RUN ? 'dry-run' : 'buy'} ${side.toLowerCase()} @ ${leg.avgPrice.toFixed(4)}`;
       market.state = this._computeState(market);
       this.actions += 1;
-      if (market.state === 'PAIRED') this._ensureSettlementWatch(market);
+      if (market.state === 'PAIRED') {
+        await this._maybeMergePaired(market, { reason: force ? 'force-pair' : 'pair-complete' });
+        if (market.state === 'PAIRED') this._ensureSettlementWatch(market);
+      }
 
       const action = {
         type: VALUE_DRY_RUN ? 'dry-run-buy' : 'buy',
@@ -911,6 +935,7 @@ export class ValueStrategyEngine extends EventEmitter {
     if (up && down) return 'PAIRED';
     if (up) return 'WAIT_DOWN';
     if (down) return 'WAIT_UP';
+    if (market.hadMerge) return 'MERGED';
     return market.hadAnyTrade ? 'FLAT' : 'NONE';
   }
 
@@ -1081,7 +1106,7 @@ export class ValueStrategyEngine extends EventEmitter {
       market.cashProceeds += plan.proceedsUsdc;
       market.lastAction = `${VALUE_DRY_RUN ? 'dry-run' : 'sell'} ${side.toLowerCase()} @ ${leg.sellAvgPrice.toFixed(4)}`;
       market.state = this._computeState(market);
-      market.pnl = market.cashProceeds + market.redeemed - market.totalCost;
+      market.pnl = market.cashProceeds + market.mergedUsdc + market.redeemed - market.totalCost;
       this.actions += 1;
 
       this.emit('action', {
@@ -1163,6 +1188,73 @@ export class ValueStrategyEngine extends EventEmitter {
     this.settlementTasks.set(market.slug, task);
   }
 
+  async _maybeMergePaired(market, { force = false, reason = 'paired' } = {}) {
+    if (!VALUE_ENABLE_MERGE) return false;
+    if (market.settled || market.state !== 'PAIRED' || market.mergeInFlight) return false;
+
+    const pairs = Math.min(this._openShares(market.legs.Up), this._openShares(market.legs.Down));
+    if (!Number.isFinite(pairs) || pairs <= 1e-9) return false;
+    if (!force && pairs < VALUE_MERGE_THRESHOLD_USDC) return false;
+
+    market.mergeInFlight = true;
+    try {
+      let txHash = null;
+      if (!VALUE_DRY_RUN) {
+        txHash = await mergePositions(market.conditionId, pairs);
+      }
+
+      market.legs.Up.mergedShares += pairs;
+      market.legs.Down.mergedShares += pairs;
+      market.mergedShares += pairs;
+      market.mergedUsdc += pairs;
+      market.hadMerge = true;
+      market.state = this._computeState(market);
+      market.pnl = market.cashProceeds + market.mergedUsdc + market.redeemed - market.totalCost;
+      market.lastAction = `${VALUE_DRY_RUN ? 'dry-run' : 'merge'} ${pairs.toFixed(4)} pair${pairs === 1 ? '' : 's'}`;
+      this.actions += 1;
+
+      this.emit('action', {
+        type: VALUE_DRY_RUN ? 'dry-run-merge' : 'merge',
+        slug: market.slug,
+        side: null,
+        state: market.state,
+        spent: pairs,
+        shares: pairs,
+        reason,
+        txHash,
+        timestamp: Date.now(),
+      });
+      logger.info('value.engine: paired position merged', {
+        slug: market.slug,
+        pairs,
+        state: market.state,
+        txHash,
+        dryRun: VALUE_DRY_RUN,
+      });
+      this.emit('markets-updated', this.snapshotMarkets());
+      return true;
+    } catch (err) {
+      this.failures += 1;
+      logger.warn('value.engine: merge failed', {
+        slug: market.slug,
+        err: err.message,
+      });
+      this.emit('action', {
+        type: 'merge-failed',
+        slug: market.slug,
+        side: null,
+        state: market.state,
+        spent: pairs,
+        shares: pairs,
+        reason,
+        timestamp: Date.now(),
+      });
+      return false;
+    } finally {
+      market.mergeInFlight = false;
+    }
+  }
+
   _settleMarket(market, resolved, { source = 'gamma' } = {}) {
     if (market.settled) return;
 
@@ -1175,7 +1267,7 @@ export class ValueStrategyEngine extends EventEmitter {
     const upRedeemed = this._openShares(market.legs.Up) * (payoutByOutcome.get('Up') ?? 0);
     const downRedeemed = this._openShares(market.legs.Down) * (payoutByOutcome.get('Down') ?? 0);
     market.redeemed = upRedeemed + downRedeemed;
-    market.pnl = market.cashProceeds + market.redeemed - market.totalCost;
+    market.pnl = market.cashProceeds + market.mergedUsdc + market.redeemed - market.totalCost;
     market.settled = true;
     market.settledAt = Date.now();
     market.settlementSource = source;
