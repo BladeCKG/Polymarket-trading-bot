@@ -232,7 +232,7 @@ export class ValueStrategyEngine extends EventEmitter {
   _positionType(market) {
     const up = this._openShares(market.legs.Up) > 1e-9;
     const down = this._openShares(market.legs.Down) > 1e-9;
-    if (up && down) return 'Paired';
+    if (up && down) return market.hadForcePair ? 'Forced Paired' : 'Paired';
     if (up) return 'Up only';
     if (down) return 'Down only';
     return market.hadAnyTrade ? 'Flat' : 'None';
