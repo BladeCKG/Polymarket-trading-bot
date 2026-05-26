@@ -2,6 +2,7 @@ import { EventEmitter } from 'events';
 import logger from '../logger.js';
 import { ClobClient } from '../clob.js';
 import { waitForResolution } from '../market.js';
+import { mergePositions } from '../onchain.js';
 import {
   VALUE_ABSOLUTE_FIRST_LEG_MAX_PRICE,
   VALUE_DRY_RUN,
@@ -9,14 +10,26 @@ import {
   VALUE_IMMEDIATE_EXIT_BELOW_PRICE,
   VALUE_FIRST_LEG_CUTOFF_SECONDS,
   VALUE_LEG_USDC,
+  VALUE_MAX_BOOK_AGE_MS,
+  VALUE_MAX_ONE_LEG_HOLD_MS_15M,
+  VALUE_MAX_ONE_LEG_HOLD_MS_5M,
   VALUE_MAX_SPREAD,
   VALUE_MAX_OPEN_MARKETS,
   VALUE_MAX_SLIPPAGE,
   VALUE_MAX_STRANDED_LEGS,
+  VALUE_MAX_UNPAIRED_LOSS_PER_SHARE,
+  VALUE_MERGE_ON_SECOND_LEG,
+  VALUE_NO_UNPAIRED_HOLD_LAST_MS_15M,
+  VALUE_NO_UNPAIRED_HOLD_LAST_MS_5M,
   VALUE_ORDER_MODE,
   VALUE_OPEN_WAIT_SECONDS,
   VALUE_REQUIRED_DEPTH_MULTIPLIER,
   VALUE_SECOND_LEG_CUTOFF_SECONDS,
+  VALUE_SECOND_LEG_EXTREME_SPREAD,
+  VALUE_SECOND_LEG_HARD_MAX_PRICE,
+  VALUE_SECOND_LEG_MAX_SPREAD,
+  VALUE_SECOND_LEG_MIN_DEPTH_MULTIPLIER,
+  VALUE_SECOND_LEG_MIN_LOCK_PROFIT_PER_SHARE,
   VALUE_STABLE_SNAPSHOTS_REQUIRED,
   VALUE_TARGET_PRICE,
   VALUE_TARGET_SHARES,
@@ -209,6 +222,9 @@ export class ValueStrategyEngine extends EventEmitter {
       pendingBuyOrders: { Up: null, Down: null },
       exitPlan: null,
       stableSnapshotCount: 0,
+      firstFee: 0,
+      secondFee: 0,
+      mergedUsdc: 0,
       legs: {
         Up: this._emptyLeg(market.upToken.tokenId),
         Down: this._emptyLeg(market.downToken.tokenId),
@@ -378,55 +394,13 @@ export class ValueStrategyEngine extends EventEmitter {
 
     if (market.state === 'WAIT_DOWN') {
       await this._ensureSecondLegAndExit(market);
-      await this._simulatePendingFills(market);
-      if (market.state !== 'WAIT_DOWN') return;
-      if (await this._simulateExitFill(market, 'Up', upBook, downBook)) return;
-      if (this._shouldImmediateExitStrandedLeg(market, 'Up', upBook)) {
-        await this._cancelMarketOrders(market, 'immediate-exit');
-        await this._handleEndgame(market, 'Up', upBook, 'Down', downBook, { immediate: true });
-        return;
-      }
-      if (timeLeftSec <= VALUE_SECOND_LEG_CUTOFF_SECONDS) {
-        await this._cancelMarketOrders(market, 'second-leg-cutoff');
-        await this._handleEndgame(market, 'Up', upBook, 'Down', downBook);
-        return;
-      }
-      this._emitDecision(market, {
-        type: 'waiting',
-        side: 'Down',
-        reason: market.pendingBuyOrders.Down ? 'second-order-resting' : 'second-order-missing',
-        timeLeftSec,
-        waitingFor: 'Down',
-        quote: sideQuotes(market.quote.Down),
-        exitPlan: market.exitPlan,
-      });
+      await this._manageSecondLegState(market, 'Up', upBook, 'Down', downBook, timeLeftSec);
       return;
     }
 
     if (market.state === 'WAIT_UP') {
       await this._ensureSecondLegAndExit(market);
-      await this._simulatePendingFills(market);
-      if (market.state !== 'WAIT_UP') return;
-      if (await this._simulateExitFill(market, 'Down', downBook, upBook)) return;
-      if (this._shouldImmediateExitStrandedLeg(market, 'Down', downBook)) {
-        await this._cancelMarketOrders(market, 'immediate-exit');
-        await this._handleEndgame(market, 'Down', downBook, 'Up', upBook, { immediate: true });
-        return;
-      }
-      if (timeLeftSec <= VALUE_SECOND_LEG_CUTOFF_SECONDS) {
-        await this._cancelMarketOrders(market, 'second-leg-cutoff');
-        await this._handleEndgame(market, 'Down', downBook, 'Up', upBook);
-        return;
-      }
-      this._emitDecision(market, {
-        type: 'waiting',
-        side: 'Up',
-        reason: market.pendingBuyOrders.Up ? 'second-order-resting' : 'second-order-missing',
-        timeLeftSec,
-        waitingFor: 'Up',
-        quote: sideQuotes(market.quote.Up),
-        exitPlan: market.exitPlan,
-      });
+      await this._manageSecondLegState(market, 'Down', downBook, 'Up', upBook, timeLeftSec);
       return;
     }
 
@@ -617,6 +591,155 @@ export class ValueStrategyEngine extends EventEmitter {
     };
   }
 
+  _oneLegHoldLimits(market) {
+    if (market.duration === '5m') {
+      return {
+        maxOneLegHoldMs: VALUE_MAX_ONE_LEG_HOLD_MS_5M,
+        noUnpairedHoldLastMs: VALUE_NO_UNPAIRED_HOLD_LAST_MS_5M,
+      };
+    }
+    return {
+      maxOneLegHoldMs: VALUE_MAX_ONE_LEG_HOLD_MS_15M,
+      noUnpairedHoldLastMs: VALUE_NO_UNPAIRED_HOLD_LAST_MS_15M,
+    };
+  }
+
+  async _getFeeRateBps(tokenId) {
+    try {
+      return Number(await ClobClient.getTakerFeeBps(tokenId)) || 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  _bookAgeMs(sideQuote) {
+    return Date.now() - Number(sideQuote?.observedAt ?? 0);
+  }
+
+  _secondLegRequiredDepthShares(market) {
+    return this._targetShares() * VALUE_SECOND_LEG_MIN_DEPTH_MULTIPLIER;
+  }
+
+  async _evaluateSecondLegCandidate(market, secondSide, secondBook) {
+    const secondTokenId = secondSide === 'Up' ? market.upToken.tokenId : market.downToken.tokenId;
+    const secondQuote = market.lastLiveQuote?.[secondSide];
+    if (!secondQuote?.observedAt || this._bookAgeMs(secondQuote) > VALUE_MAX_BOOK_AGE_MS) {
+      return { allowed: false, reason: 'SECOND_BOOK_STALE' };
+    }
+
+    const bestBid = bestBidFromBook(secondBook);
+    const bestAsk = bestAskFromBook(secondBook);
+    if (!bestBid || !bestAsk) {
+      return { allowed: false, reason: 'SECOND_BOOK_EMPTY' };
+    }
+
+    const spread = bestAsk.price - bestBid.price;
+    if (spread > VALUE_SECOND_LEG_EXTREME_SPREAD) {
+      return { allowed: false, reason: 'SECOND_SPREAD_EXTREME', spread };
+    }
+    if (spread > VALUE_SECOND_LEG_MAX_SPREAD) {
+      return { allowed: false, reason: 'SECOND_SPREAD_TOO_WIDE', spread };
+    }
+
+    const maxLimitPrice = Math.min(VALUE_TARGET_PRICE, VALUE_SECOND_LEG_HARD_MAX_PRICE);
+    const depth = this._bookDepthAtOrBelowPrice(secondBook, maxLimitPrice);
+    const requiredDepth = this._secondLegRequiredDepthShares(market);
+    if (depth < requiredDepth) {
+      return { allowed: false, reason: 'NOT_ENOUGH_SECOND_DEPTH', depth, requiredDepth, spread };
+    }
+
+    const shares = this._targetShares();
+    const plan = estimateBuyCostForSharesFromBook(secondBook, shares, maxLimitPrice);
+    if (!plan || !plan.fullyFilled || plan.fillShares + 1e-9 < shares) {
+      return { allowed: false, reason: 'CANNOT_FILL_SECOND_SIZE', depth, spread, plan: plan ?? null };
+    }
+
+    const feeRateBps = await this._getFeeRateBps(secondTokenId);
+    const secondFee = ClobClient.estimateTakerFeeUsdc({
+      shares,
+      price: plan.avgFillPrice,
+      feeRateBps,
+    });
+    const totalCost = market.totalCost + plan.spentUsdc + secondFee;
+    const mergePayout = shares;
+    const lockProfit = mergePayout - totalCost;
+    const minLockProfit = shares * VALUE_SECOND_LEG_MIN_LOCK_PROFIT_PER_SHARE;
+    if (lockProfit < minLockProfit) {
+      return {
+        allowed: false,
+        reason: 'LOCK_PROFIT_TOO_SMALL',
+        depth,
+        spread,
+        plan,
+        estimatedSecondFee: secondFee,
+        estimatedLockProfit: lockProfit,
+      };
+    }
+
+    return {
+      allowed: true,
+      spread,
+      depth,
+      plan,
+      feeRateBps,
+      estimatedSecondFee: secondFee,
+      estimatedLockProfit: lockProfit,
+      maxLimitPrice,
+    };
+  }
+
+  _evaluateDirectSellExit(book, shares, feeRateBps) {
+    const plan = estimateSellProceedsForSharesFromBook(book, shares, 0.0001);
+    if (!plan || !plan.fullyFilled || plan.soldShares + 1e-9 < shares) {
+      return { allowed: false, reason: 'NO_DIRECT_SELL_DEPTH', netRecovery: -Infinity };
+    }
+    const fee = ClobClient.estimateTakerFeeUsdc({
+      shares,
+      price: plan.avgFillPrice,
+      feeRateBps,
+    });
+    return {
+      allowed: true,
+      minPrice: plan.avgFillPrice,
+      vwap: plan.avgFillPrice,
+      fee,
+      plan,
+      netRecovery: plan.proceedsUsdc - fee,
+    };
+  }
+
+  _evaluateHedgeMergeExit(book, shares, feeRateBps) {
+    const plan = estimateBuyCostForSharesFromBook(book, shares, 0.99);
+    if (!plan || !plan.fullyFilled || plan.fillShares + 1e-9 < shares) {
+      return { allowed: false, reason: 'NO_HEDGE_BUY_DEPTH', netRecovery: -Infinity };
+    }
+    const fee = ClobClient.estimateTakerFeeUsdc({
+      shares,
+      price: plan.avgFillPrice,
+      feeRateBps,
+    });
+    return {
+      allowed: true,
+      maxPrice: plan.avgFillPrice,
+      vwap: plan.avgFillPrice,
+      fee,
+      plan,
+      netRecovery: shares - (plan.spentUsdc + fee),
+    };
+  }
+
+  async _shouldStopLossUnpairedFirstLeg(market, openSide, openBook) {
+    const shares = this._openShares(market.legs[openSide]);
+    if (shares <= 1e-9) return false;
+    const tokenId = openSide === 'Up' ? market.upToken.tokenId : market.downToken.tokenId;
+    const feeRateBps = await this._getFeeRateBps(tokenId);
+    const directExit = this._evaluateDirectSellExit(openBook, shares, feeRateBps);
+    if (!directExit.allowed) return false;
+    const avgEntry = Number(market.legs[openSide].avgPrice ?? 0);
+    const lossPerShare = avgEntry - directExit.vwap;
+    return lossPerShare >= VALUE_MAX_UNPAIRED_LOSS_PER_SHARE;
+  }
+
   async _tryEnterFirstLeg(market, upBook, downBook, timeLeftSec) {
     const stableEnough = this._advanceStability(market, upBook, downBook);
     if (!stableEnough) {
@@ -655,9 +778,68 @@ export class ValueStrategyEngine extends EventEmitter {
       exactPlan: chosen.plan,
       entryRole: 'first',
       useFok: true,
+      maxPriceOverride: VALUE_TARGET_PRICE,
     });
     if (entered) {
       this._resetStability(market);
+    }
+  }
+
+  async _manageSecondLegState(market, openSide, openBook, secondSide, secondBook, timeLeftSec) {
+    if (market.state !== `WAIT_${secondSide.toUpperCase()}` && market.state !== `WAIT_${secondSide === 'Up' ? 'UP' : 'DOWN'}`) {
+      // no-op; kept defensive against state changes during async work
+    }
+
+    if (await this._simulateExitFill(market, openSide, openBook, secondBook)) return;
+
+    const elapsedSinceFirstFill = Date.now() - Number(market.legs[openSide].enteredAt ?? Date.now());
+    const timeToExpiryMs = Math.max(0, (market.closeTs * 1000) - Date.now());
+    const { maxOneLegHoldMs, noUnpairedHoldLastMs } = this._oneLegHoldLimits(market);
+
+    if (elapsedSinceFirstFill >= maxOneLegHoldMs) {
+      await this._exitUnpairedFirstLeg(market, openSide, openBook, secondSide, secondBook, 'MAX_ONE_LEG_HOLD_EXCEEDED');
+      return;
+    }
+
+    if (timeToExpiryMs <= noUnpairedHoldLastMs) {
+      await this._exitUnpairedFirstLeg(market, openSide, openBook, secondSide, secondBook, 'TOO_CLOSE_TO_EXPIRY_UNPAIRED');
+      return;
+    }
+
+    if (await this._shouldStopLossUnpairedFirstLeg(market, openSide, openBook)) {
+      await this._exitUnpairedFirstLeg(market, openSide, openBook, secondSide, secondBook, 'STOP_LOSS_UNPAIRED_FIRST_LEG');
+      return;
+    }
+
+    const candidate = await this._evaluateSecondLegCandidate(market, secondSide, secondBook);
+    this._emitDecision(market, {
+      type: 'waiting',
+      side: secondSide,
+      reason: candidate.allowed ? 'second-leg-candidate-allowed' : candidate.reason,
+      timeLeftSec,
+      waitingFor: secondSide,
+      quote: sideQuotes(market.quote[secondSide]),
+      exitPlan: market.exitPlan,
+      candidate,
+    });
+
+    if (!candidate.allowed) {
+      if (this._shouldImmediateExitStrandedLeg(market, openSide, openBook)) {
+        await this._exitUnpairedFirstLeg(market, openSide, openBook, secondSide, secondBook, 'IMMEDIATE_EXIT_THRESHOLD');
+      } else if (timeLeftSec <= VALUE_SECOND_LEG_CUTOFF_SECONDS) {
+        await this._exitUnpairedFirstLeg(market, openSide, openBook, secondSide, secondBook, 'SECOND_LEG_CUTOFF');
+      }
+      return;
+    }
+
+    const entered = await this._enterLeg(market, secondSide, secondBook, {
+      exactPlan: candidate.plan,
+      entryRole: 'second',
+      useFok: true,
+      maxPriceOverride: candidate.maxLimitPrice,
+    });
+    if (entered && VALUE_MERGE_ON_SECOND_LEG) {
+      await this._mergeMatchedPair(market, this._targetShares(), 'second-leg-merge');
     }
   }
 
@@ -677,7 +859,6 @@ export class ValueStrategyEngine extends EventEmitter {
       armedAt: Date.now(),
       mode: 'synthetic-threshold',
     };
-    await this._ensureRestingBuyOrder(market, secondSide, 'second');
   }
 
   async _ensureRestingBuyOrder(market, side, role) {
@@ -769,6 +950,7 @@ export class ValueStrategyEngine extends EventEmitter {
     for (const side of ['Up', 'Down']) {
       const order = market.pendingBuyOrders[side];
       if (!order) continue;
+      if (order.role !== 'first') continue;
       const bestAsk = market.quote?.[side]?.bestAsk;
       if (!Number.isFinite(bestAsk) || bestAsk > order.price) continue;
       const fillPrice = bestAsk;
@@ -929,7 +1111,7 @@ export class ValueStrategyEngine extends EventEmitter {
     this.emit('markets-updated', this.snapshotMarkets());
   }
 
-  async _enterLeg(market, side, book, { force = false, targetSharesOverride = null, exactPlan = null, entryRole = null, useFok = false } = {}) {
+  async _enterLeg(market, side, book, { force = false, targetSharesOverride = null, exactPlan = null, entryRole = null, useFok = false, maxPriceOverride = null } = {}) {
     const leg = market.legs[side];
     if (leg.entered) {
       this._emitDecision(market, {
@@ -967,7 +1149,9 @@ export class ValueStrategyEngine extends EventEmitter {
       return false;
     }
 
-    const maxPrice = this._entryMaxPrice(market, quote.price, force);
+    const maxPrice = Number.isFinite(maxPriceOverride)
+      ? Number(maxPriceOverride)
+      : this._entryMaxPrice(market, quote.price, force);
 
     const plan = exactPlan ?? (Number.isFinite(targetSharesOverride) && targetSharesOverride > 0
       ? estimateBuyCostForSharesFromBook(book, targetSharesOverride, maxPrice)
@@ -1378,6 +1562,92 @@ export class ValueStrategyEngine extends EventEmitter {
       return;
     }
     market.lastAction = `${source} forced paired`;
+    this._ensureSettlementWatch(market);
+    this.emit('markets-updated', this.snapshotMarkets());
+  }
+
+  async _mergeMatchedPair(market, shares, source = 'merge') {
+    const mergeShares = Math.min(
+      Number(shares ?? 0),
+      this._openShares(market.legs.Up),
+      this._openShares(market.legs.Down),
+    );
+    if (!Number.isFinite(mergeShares) || mergeShares <= 1e-9) return false;
+
+    if (!VALUE_DRY_RUN) {
+      await mergePositions(market.conditionId, mergeShares);
+    }
+
+    market.legs.Up.soldShares += mergeShares;
+    market.legs.Down.soldShares += mergeShares;
+    market.cashProceeds += mergeShares;
+    market.mergedUsdc += mergeShares;
+    market.state = this._computeState(market);
+    market.pnl = market.cashProceeds + market.redeemed - market.totalCost;
+    market.lastAction = `${source} ${mergeShares.toFixed(4)} merged`;
+    this.actions += 1;
+    this.emit('action', {
+      type: VALUE_DRY_RUN ? 'dry-run-merged' : 'merged',
+      slug: market.slug,
+      side: null,
+      state: market.state,
+      shares: mergeShares,
+      spent: mergeShares,
+      timestamp: Date.now(),
+    });
+    this.emit('markets-updated', this.snapshotMarkets());
+    return true;
+  }
+
+  async _exitUnpairedFirstLeg(market, openSide, openBook, secondSide, secondBook, reason) {
+    await this._cancelMarketOrders(market, reason);
+    const shares = this._openShares(market.legs[openSide]);
+    const openTokenId = openSide === 'Up' ? market.upToken.tokenId : market.downToken.tokenId;
+    const secondTokenId = secondSide === 'Up' ? market.upToken.tokenId : market.downToken.tokenId;
+    const [openFeeRateBps, secondFeeRateBps] = await Promise.all([
+      this._getFeeRateBps(openTokenId),
+      this._getFeeRateBps(secondTokenId),
+    ]);
+
+    const directExit = this._evaluateDirectSellExit(openBook, shares, openFeeRateBps);
+    const hedgeMergeExit = this._evaluateHedgeMergeExit(secondBook, shares, secondFeeRateBps);
+    this._emitDecision(market, {
+      type: 'emergency-exit',
+      side: openSide,
+      reason,
+      openSide,
+      oppositeSide: secondSide,
+      directExit,
+      hedgeMergeExit,
+    });
+
+    if (hedgeMergeExit.allowed && hedgeMergeExit.netRecovery > directExit.netRecovery) {
+      const paired = await this._enterLeg(market, secondSide, secondBook, {
+        exactPlan: hedgeMergeExit.plan,
+        targetSharesOverride: shares,
+        entryRole: 'second',
+        useFok: true,
+        maxPriceOverride: hedgeMergeExit.maxPrice,
+      });
+      if (paired) {
+        await this._mergeMatchedPair(market, shares, 'emergency-hedge-merge');
+        return;
+      }
+    }
+
+    if (directExit.allowed) {
+      const sold = await this._sellShares(market, openSide, openBook, shares, {
+        actionType: 'emergency-exit',
+        minPrice: directExit.minPrice,
+      });
+      if (sold) {
+        market.lastAction = `emergency exited ${openSide.toLowerCase()} (${reason})`;
+        this.emit('markets-updated', this.snapshotMarkets());
+        return;
+      }
+    }
+
+    market.lastAction = `failed to exit ${openSide.toLowerCase()} (${reason})`;
     this._ensureSettlementWatch(market);
     this.emit('markets-updated', this.snapshotMarkets());
   }
