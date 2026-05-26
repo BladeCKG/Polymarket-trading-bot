@@ -344,6 +344,7 @@
             <div><dt>Closes</dt><dd>${ts(item.closeTs * 1000)}</dd></div>
             <div><dt>Time Left</dt><dd>${dash(item.timeLeftSec)}</dd></div>
             <div><dt>Target</dt><dd>${dash(item.targetPrice)}</dd></div>
+            <div><dt>Strategy</dt><dd>${dash(item.strategyType)}</dd></div>
             <div><dt>Chosen Side</dt><dd>${dash(item.firstSide)}</dd></div>
             <div><dt>Up Ask</dt><dd>${dash(item.upAsk)}</dd></div>
             <div><dt>Down Ask</dt><dd>${dash(item.downAsk)}</dd></div>
@@ -352,6 +353,9 @@
             <div><dt>Market State</dt><dd>${dash(item.marketState)}</dd></div>
             <div><dt>Position</dt><dd>${dash(item.positionType)}</dd></div>
             <div><dt>Entered Legs</dt><dd>${item.enteredLegs?.length ? item.enteredLegs.join(', ') : '-'}</dd></div>
+            <div><dt>Arb Pairs</dt><dd>${dash(item.arbPairCount)}</dd></div>
+            <div><dt>Arb Shares</dt><dd>${dash(item.arbPairShares)}</dd></div>
+            <div><dt>Arb Spend</dt><dd>${money(item.arbPairSpent)}</dd></div>
             <div><dt>Winner</dt><dd>${dash(item.winningOutcome)}</dd></div>
             <div><dt>Final Up</dt><dd>${dash(item.upFinalValue)}</dd></div>
             <div><dt>Final Down</dt><dd>${dash(item.downFinalValue)}</dd></div>
@@ -368,7 +372,6 @@
                       <th>Bought</th>
                       <th>Buy Avg Px</th>
                       <th>Sold</th>
-                      <th>Merged</th>
                       <th>Sell Avg Px</th>
                       <th>Cash Out</th>
                     </tr>
@@ -381,7 +384,6 @@
                       <td>${dash(item.upShares)}</td>
                       <td>${dash(item.upPrice)}</td>
                       <td>${dash(item.upSoldShares)}</td>
-                      <td>${dash(item.upMergedShares)}</td>
                       <td>${dash(item.upSellPrice)}</td>
                       <td>${money(item.upSoldUsdc)}</td>
                     </tr>
@@ -392,7 +394,6 @@
                       <td>${dash(item.downShares)}</td>
                       <td>${dash(item.downPrice)}</td>
                       <td>${dash(item.downSoldShares)}</td>
-                      <td>${dash(item.downMergedShares)}</td>
                       <td>${dash(item.downSellPrice)}</td>
                       <td>${money(item.downSoldUsdc)}</td>
                     </tr>

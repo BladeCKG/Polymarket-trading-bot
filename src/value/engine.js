@@ -151,6 +151,10 @@ export class ValueStrategyEngine extends EventEmitter {
         state: market.state,
         targetPrice: VALUE_TARGET_PRICE,
         firstSide: market.firstSide,
+        strategyType: market.arbPairCount > 0 && market.hadAnyTrade ? (market.firstSide === 'Pair' ? 'Arb' : 'Mixed') : 'Value',
+        arbPairCount: market.arbPairCount,
+        arbPairShares: market.arbPairShares,
+        arbPairSpent: market.arbPairSpent,
         positionType: this._positionType(market),
         enteredLegs: this._enteredLegs(market),
         winningOutcome: this._winningOutcome(market),
@@ -215,6 +219,9 @@ export class ValueStrategyEngine extends EventEmitter {
       settlementSource: null,
       hasAnyLeg: false,
       hadAnyTrade: false,
+      arbPairCount: 0,
+      arbPairShares: 0,
+      arbPairSpent: 0,
       hadImmediateExit: false,
       hadForcePair: false,
       outcomes: [],
@@ -251,6 +258,7 @@ export class ValueStrategyEngine extends EventEmitter {
       entered: false,
       spent: 0,
       shares: 0,
+      arbShares: 0,
       avgPrice: null,
       soldShares: 0,
       soldUsdc: 0,
@@ -269,6 +277,11 @@ export class ValueStrategyEngine extends EventEmitter {
 
   _openShares(leg) {
     return Math.max(0, Number(leg.shares ?? 0) - Number(leg.soldShares ?? 0));
+  }
+
+  _valueOpenShares(market, side) {
+    const leg = market.legs[side];
+    return Math.max(0, this._openShares(leg) - Number(leg.arbShares ?? 0));
   }
 
   _hasOpenExposure(market) {
@@ -358,7 +371,7 @@ export class ValueStrategyEngine extends EventEmitter {
       await this._ensureSecondLegAndExit(market);
       await this._simulatePendingFills(market);
       if (market.state !== 'WAIT_DOWN') return;
-      if (await this._simulateExitFill(market, 'Up', upBook)) return;
+      if (await this._simulateExitFill(market, 'Up', upBook, downBook)) return;
       if (this._shouldImmediateExitStrandedLeg(market, 'Up', upBook)) {
         await this._cancelMarketOrders(market, 'immediate-exit');
         await this._handleEndgame(market, 'Up', upBook, 'Down', downBook, { immediate: true });
@@ -385,7 +398,7 @@ export class ValueStrategyEngine extends EventEmitter {
       await this._ensureSecondLegAndExit(market);
       await this._simulatePendingFills(market);
       if (market.state !== 'WAIT_UP') return;
-      if (await this._simulateExitFill(market, 'Down', downBook)) return;
+      if (await this._simulateExitFill(market, 'Down', downBook, upBook)) return;
       if (this._shouldImmediateExitStrandedLeg(market, 'Down', downBook)) {
         await this._cancelMarketOrders(market, 'immediate-exit');
         await this._handleEndgame(market, 'Down', downBook, 'Up', upBook, { immediate: true });
@@ -569,11 +582,13 @@ export class ValueStrategyEngine extends EventEmitter {
       const downLeg = market.legs.Down;
       upLeg.entered = true;
       upLeg.shares += shares;
+      upLeg.arbShares += shares;
       upLeg.spent += upSpendUsdc;
       upLeg.avgPrice = upLeg.shares > 0 ? upLeg.spent / upLeg.shares : upAsk.price;
       upLeg.enteredAt ??= now;
       downLeg.entered = true;
       downLeg.shares += shares;
+      downLeg.arbShares += shares;
       downLeg.spent += downSpendUsdc;
       downLeg.avgPrice = downLeg.shares > 0 ? downLeg.spent / downLeg.shares : downAsk.price;
       downLeg.enteredAt ??= now;
@@ -581,6 +596,9 @@ export class ValueStrategyEngine extends EventEmitter {
       market.totalCost += upSpendUsdc + downSpendUsdc;
       market.hasAnyLeg = true;
       market.hadAnyTrade = true;
+      market.arbPairCount += 1;
+      market.arbPairShares += shares;
+      market.arbPairSpent += upSpendUsdc + downSpendUsdc;
       market.firstSide = 'Pair';
       market.exitPlan = null;
       market.state = 'PAIRED';
@@ -756,21 +774,29 @@ export class ValueStrategyEngine extends EventEmitter {
     }
   }
 
-  async _simulateExitFill(market, side, book) {
+  async _simulateExitFill(market, side, book, oppositeBook) {
     if (!VALUE_DRY_RUN || !market.exitPlan || market.exitPlan.side !== side) return false;
-    const leg = market.legs[side];
-    const openShares = this._openShares(leg);
+    const openShares = this._valueOpenShares(market, side);
     if (openShares <= 1e-9) return false;
 
     const bestBid = bestBidFromBook(book)?.price ?? null;
     if (!Number.isFinite(bestBid) || bestBid >= market.exitPlan.triggerPrice) return false;
 
-    await this._recordSellFill(market, side, {
-      price: bestBid,
-      shares: openShares,
-      proceedsUsdc: bestBid * openShares,
-      source: 'simulated-exit-order',
-      orderId: null,
+    const otherSide = oppositeSide(side);
+    if (!oppositeBook) {
+      this._emitDecision(market, {
+        type: 'immediate-exit',
+        side: otherSide,
+        reason: 'force-pair-no-opposite-book',
+        openSide: side,
+        oppositeSide: otherSide,
+      });
+      return false;
+    }
+
+    await this._enterLeg(market, otherSide, oppositeBook, {
+      force: true,
+      targetSharesOverride: openShares,
     });
     return true;
   }
@@ -896,7 +922,7 @@ export class ValueStrategyEngine extends EventEmitter {
     this.emit('markets-updated', this.snapshotMarkets());
   }
 
-  async _enterLeg(market, side, book, { force = false } = {}) {
+  async _enterLeg(market, side, book, { force = false, targetSharesOverride = null } = {}) {
     const leg = market.legs[side];
     if (leg.entered) {
       this._emitDecision(market, {
@@ -936,7 +962,9 @@ export class ValueStrategyEngine extends EventEmitter {
 
     const maxPrice = this._entryMaxPrice(market, quote.price, force);
 
-    const plan = VALUE_ORDER_MODE === 'SHARES'
+    const plan = Number.isFinite(targetSharesOverride) && targetSharesOverride > 0
+      ? estimateBuyCostForSharesFromBook(book, targetSharesOverride, maxPrice)
+      : VALUE_ORDER_MODE === 'SHARES'
       ? estimateBuyCostForSharesFromBook(book, VALUE_TARGET_SHARES, maxPrice)
       : ClobClient.estimateMarketBuyFillFromBook(book, maxPrice, VALUE_LEG_USDC, 0);
     if (!plan || plan.fillShares <= 0 || plan.spentUsdc <= 0) {
@@ -985,6 +1013,7 @@ export class ValueStrategyEngine extends EventEmitter {
         shares: leg.shares,
         price: leg.avgPrice,
         forced: force,
+        targetSharesOverride,
         tokenId,
         bestAsk: quote.price,
         maxPrice,
@@ -1003,6 +1032,7 @@ export class ValueStrategyEngine extends EventEmitter {
         shares: leg.shares,
         avgPrice: leg.avgPrice,
         forced: force,
+        targetSharesOverride,
         tokenId,
         bestAsk: quote.price,
         maxPrice,
@@ -1035,6 +1065,7 @@ export class ValueStrategyEngine extends EventEmitter {
         state: market.state,
         spent: plan.spentUsdc,
         shares: plan.fillShares,
+        targetSharesOverride,
         tokenId,
         bestAsk: quote?.price ?? null,
         maxPrice,
@@ -1118,10 +1149,21 @@ export class ValueStrategyEngine extends EventEmitter {
       return;
     }
 
-    const flattened = await this._flattenOpenLeg(market, openSide, openBook);
-    if (flattened) return;
+    const targetShares = this._valueOpenShares(market, openSide);
+    if (targetShares <= 1e-9) {
+      this._emitDecision(market, {
+        type: immediate ? 'immediate-exit' : 'endgame',
+        side: openSide,
+        reason: 'no-stranded-value-shares',
+        openSide,
+        oppositeSide,
+      });
+      this._ensureSettlementWatch(market);
+      this.emit('markets-updated', this.snapshotMarkets());
+      return;
+    }
     if (!oppositeBook) {
-      market.lastAction = `${immediate ? 'immediate-exit' : 'endgame'} no ${oppositeSide.toLowerCase()} book after flatten failed`;
+      market.lastAction = `${immediate ? 'immediate-exit' : 'endgame'} no ${oppositeSide.toLowerCase()} book for force-pair`;
       this._emitDecision(market, {
         type: immediate ? 'immediate-exit' : 'endgame',
         side: oppositeSide,
@@ -1139,7 +1181,10 @@ export class ValueStrategyEngine extends EventEmitter {
       });
       return;
     }
-    await this._enterLeg(market, oppositeSide, oppositeBook, { force: true });
+    await this._enterLeg(market, oppositeSide, oppositeBook, {
+      force: true,
+      targetSharesOverride: targetShares,
+    });
   }
 
   _shouldImmediateExitStrandedLeg(market, side, book) {
