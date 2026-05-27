@@ -1,7 +1,7 @@
 import {
-  BEAT_DRY_RUN,
   BEAT_BOOK_POLL_MS,
   BEAT_BUY_COOLDOWN_MS,
+  BEAT_DRY_RUN,
   BEAT_DOWN_MAX_BUY_PRICE,
   BEAT_DOWN_MOVE_MAX_USD,
   BEAT_DOWN_MOVE_MIN_USD,
@@ -31,7 +31,7 @@ const PHASE = {
   CAPTURE_BEAT: 'CAPTURE_BEAT',
   WAITING: 'WAITING',
   LIVE: 'LIVE',
-  CANCELLED: 'CANCELLED',
+  CLOSING: 'CLOSING',
   RESOLVING: 'RESOLVING',
   DONE: 'DONE',
   HALTED: 'HALTED',
@@ -84,11 +84,13 @@ function estimateSharesFromBook(book, maxPrice, targetShares) {
 }
 
 export class BeatTrader {
-  constructor(market, wallet, pnl) {
+  constructor(market, wallet, pnl, { dashboard = null } = {}) {
     this.market = market;
     this.wallet = wallet;
     this.pnl = pnl;
+    this.dashboard = dashboard;
     this.log = marketLogger(market.slug);
+
     this.phase = PHASE.INIT;
     this.halted = false;
     this.balanceUp = 0;
@@ -98,6 +100,9 @@ export class BeatTrader {
     this.lastBuyAt = 0;
     this.beatPrice = null;
     this.latestBtcTick = null;
+    this.latestQuotes = { up: null, down: null };
+    this.tradeSummary = null;
+    this.lastOutcome = null;
     this._btcFeed = null;
   }
 
@@ -138,10 +143,12 @@ export class BeatTrader {
       }
 
       this.phase = PHASE.LIVE;
+      this._publishMarket({ status: 'LIVE', tradeStatus: 'monitoring' });
       await this._syncBalances(upToken.tokenId, downToken.tokenId);
       await this._monitorLoop(windowClose);
 
-      this.phase = PHASE.CANCELLED;
+      this.phase = PHASE.CLOSING;
+      this._publishMarket({ status: 'CLOSING', tradeStatus: 'closed for buying' });
       await this._cancelAllOrders(conditionId);
     } finally {
       this._btcFeed?.stop();
@@ -151,6 +158,10 @@ export class BeatTrader {
     await this._redeemPhase(conditionId, windowClose);
 
     this.phase = PHASE.DONE;
+    this._publishMarket({
+      status: 'SETTLED',
+      tradeStatus: this.tradeSummary?.buyShares > 0 ? 'settled' : 'settled without trade',
+    });
     this.log.info('BeatTrader: market complete', {
       beatPrice: this.beatPrice,
       totalSpent: this.totalSpent.toFixed(4),
@@ -163,6 +174,11 @@ export class BeatTrader {
     this._btcFeed = new BtcPriceFeed();
     this._btcFeed.on('tick', (tick) => {
       this.latestBtcTick = tick;
+      this._publishMarket({
+        btcPrice: tick.price,
+        btcBestBid: tick.bestBid ?? null,
+        btcBestAsk: tick.bestAsk ?? null,
+      });
     });
     this._btcFeed.on('error', (err) => {
       this.log.warn('BeatTrader: BTC feed error', { err: err.message });
@@ -173,6 +189,15 @@ export class BeatTrader {
   async _captureBeatPrice(windowTs) {
     const tick = await this._btcFeed.waitForTickAfter(windowTs * 1000, 20_000);
     this.latestBtcTick = tick;
+    this._publishMarket({
+      status: 'LIVE',
+      phase: PHASE.CAPTURE_BEAT,
+      tradeStatus: 'captured beat price',
+      beatPrice: tick.price,
+      btcPrice: tick.price,
+      btcBestBid: tick.bestBid ?? null,
+      btcBestAsk: tick.bestAsk ?? null,
+    });
     this.log.info('BeatTrader: captured BTC beat price', {
       beatPrice: tick.price,
       btcTime: tick.isoTime,
@@ -193,7 +218,14 @@ export class BeatTrader {
       if (this._checkCircuitBreakers()) break;
 
       try {
-        await this._maybeBuy();
+        const snapshot = await this._snapshotMarketState();
+        this._publishMarket({
+          ...snapshot,
+          status: 'LIVE',
+          phase: this.phase,
+          tradeStatus: this.tradeSummary?.buyShares > 0 ? 'buy placed' : 'monitoring',
+        });
+        await this._maybeBuy(snapshot);
       } catch (err) {
         this.log.warn('BeatTrader: monitor iteration failed', { err: err.message });
       }
@@ -206,7 +238,33 @@ export class BeatTrader {
     }
   }
 
-  async _maybeBuy() {
+  async _snapshotMarketState() {
+    const [upBook, downBook] = await Promise.all([
+      ClobClient.getBook(this.market.upToken.tokenId),
+      ClobClient.getBook(this.market.downToken.tokenId),
+    ]);
+
+    const upBid = bestBid(upBook);
+    const upAsk = bestAsk(upBook);
+    const downBid = bestBid(downBook);
+    const downAsk = bestAsk(downBook);
+
+    this.latestQuotes = {
+      up: { book: upBook, bid: upBid, ask: upAsk },
+      down: { book: downBook, bid: downBid, ask: downAsk },
+    };
+
+    return {
+      upBestBid: upBid?.price ?? null,
+      upBestAsk: upAsk?.price ?? null,
+      downBestBid: downBid?.price ?? null,
+      downBestAsk: downAsk?.price ?? null,
+      beatPrice: this.beatPrice,
+      btcPrice: this.latestBtcTick?.price ?? null,
+    };
+  }
+
+  async _maybeBuy(snapshot = {}) {
     if (!this.beatPrice) return;
     if (Date.now() - this.lastBuyAt < BEAT_BUY_COOLDOWN_MS) return;
 
@@ -223,24 +281,19 @@ export class BeatTrader {
     const signal = this._signalFromDelta(delta);
     if (!signal) return;
 
-    const [upBook, downBook] = await Promise.all([
-      ClobClient.getBook(this.market.upToken.tokenId),
-      ClobClient.getBook(this.market.downToken.tokenId),
-    ]);
-
     const bookState = {
       Up: {
         tokenId: this.market.upToken.tokenId,
-        book: upBook,
-        bid: bestBid(upBook),
-        ask: bestAsk(upBook),
+        book: this.latestQuotes.up?.book ?? null,
+        bid: this.latestQuotes.up?.bid ?? null,
+        ask: this.latestQuotes.up?.ask ?? null,
         maxBuyPrice: BEAT_UP_MAX_BUY_PRICE,
       },
       Down: {
         tokenId: this.market.downToken.tokenId,
-        book: downBook,
-        bid: bestBid(downBook),
-        ask: bestAsk(downBook),
+        book: this.latestQuotes.down?.book ?? null,
+        bid: this.latestQuotes.down?.bid ?? null,
+        ask: this.latestQuotes.down?.ask ?? null,
         maxBuyPrice: BEAT_DOWN_MAX_BUY_PRICE,
       },
     };
@@ -263,15 +316,12 @@ export class BeatTrader {
     });
   }
 
-  // Updated signal logic: only enforce the max move USD thresholds.
   _signalFromDelta(delta) {
-    // Positive move up to the max allowed.
-    if (delta > 0 && delta <= BEAT_UP_MOVE_MAX_USD) {
+    if (delta >= BEAT_UP_MOVE_MIN_USD && delta <= BEAT_UP_MOVE_MAX_USD) {
       return { side: 'Up' };
     }
-    // Negative move (down) up to the max allowed.
     const downMove = Math.abs(delta);
-    if (delta < 0 && downMove <= BEAT_DOWN_MOVE_MAX_USD) {
+    if (delta <= -BEAT_DOWN_MOVE_MIN_USD && downMove <= BEAT_DOWN_MOVE_MAX_USD) {
       return { side: 'Down' };
     }
     return null;
@@ -294,19 +344,26 @@ export class BeatTrader {
       const plan = estimateSharesFromBook(book, maxPrice, requestedShares);
       if (!plan.fullyFilled || plan.fillShares <= 0 || plan.spentUsdc <= 0) return;
 
-      let response;
       if (!BEAT_DRY_RUN) {
         try {
-          response = await ClobClient.postFOKLimitBuy(this.wallet, tokenId, maxPrice, plan.fillShares);
+          const response = await ClobClient.postFOKLimitBuy(this.wallet, tokenId, maxPrice, plan.fillShares);
+          if (response?.success === false) return;
         } catch (err) {
           this.log.warn('BeatTrader: directional share buy failed', { side, err: err.message });
           return;
         }
-        if (response?.success === false) return;
       }
 
       this._recordBuy(side, plan.spentUsdc / plan.fillShares, plan.fillShares);
       this.lastBuyAt = Date.now();
+      this._publishTrade({
+        status: 'LIVE',
+        tradeStatus: BEAT_DRY_RUN ? 'dry-run buy placed' : 'buy placed',
+        chosenSide: this.tradeSummary?.chosenSide ?? side,
+        buyShares: this.tradeSummary?.buyShares ?? plan.fillShares,
+        buyUsdc: this.tradeSummary?.buyUsdc ?? plan.spentUsdc,
+        buyPrice: this.tradeSummary?.buyPrice ?? (plan.spentUsdc / plan.fillShares),
+      });
       this.log.info(`BeatTrader: ${BEAT_DRY_RUN ? 'dry-run buy' : 'bought'} directional shares`, {
         side,
         shares: plan.fillShares,
@@ -328,19 +385,26 @@ export class BeatTrader {
     const plan = ClobClient.estimateMarketBuyFillFromBook(book, maxPrice, amountUsdc, 0);
     if (!plan || plan.fillShares <= 0 || plan.spentUsdc <= 0) return;
 
-    let response;
     if (!BEAT_DRY_RUN) {
       try {
-        response = await ClobClient.postIOCBuy(this.wallet, tokenId, maxPrice, amountUsdc);
+        const response = await ClobClient.postIOCBuy(this.wallet, tokenId, maxPrice, amountUsdc);
+        if (response?.success === false) return;
       } catch (err) {
         this.log.warn('BeatTrader: directional USDC buy failed', { side, err: err.message });
         return;
       }
-      if (response?.success === false) return;
     }
 
     this._recordBuy(side, plan.avgFillPrice ?? bestAsk.price, plan.fillShares, plan.spentUsdc);
     this.lastBuyAt = Date.now();
+    this._publishTrade({
+      status: 'LIVE',
+      tradeStatus: BEAT_DRY_RUN ? 'dry-run buy placed' : 'buy placed',
+      chosenSide: this.tradeSummary?.chosenSide ?? side,
+      buyShares: this.tradeSummary?.buyShares ?? plan.fillShares,
+      buyUsdc: this.tradeSummary?.buyUsdc ?? plan.spentUsdc,
+      buyPrice: this.tradeSummary?.buyPrice ?? (plan.avgFillPrice ?? bestAsk.price),
+    });
     this.log.info(`BeatTrader: ${BEAT_DRY_RUN ? 'dry-run buy' : 'bought'} directional USDC`, {
       side,
       requestedUsdc: amountUsdc,
@@ -362,6 +426,24 @@ export class BeatTrader {
     if (side === 'Up') this.balanceUp += shares;
     else this.balanceDown += shares;
     this.pnl.recordBuy(this.market.slug, side, avgPrice, shares);
+
+    if (!this.tradeSummary) {
+      this.tradeSummary = {
+        chosenSide: side,
+        buyShares: 0,
+        buyUsdc: 0,
+        buyPrice: 0,
+        buyCount: 0,
+      };
+    }
+    if (this.tradeSummary.chosenSide !== side) {
+      this.tradeSummary.chosenSide = 'Mixed';
+    }
+    this.tradeSummary.buyShares += shares;
+    this.tradeSummary.buyUsdc += spentUsdc;
+    this.tradeSummary.buyCount += 1;
+    this.tradeSummary.buyPrice = this.tradeSummary.buyUsdc / this.tradeSummary.buyShares;
+    this.tradeSummary.tradeOccurred = true;
   }
 
   _checkCircuitBreakers() {
@@ -421,18 +503,6 @@ export class BeatTrader {
   }
 
   async _redeemPhase(conditionId, windowClose) {
-    if (BEAT_DRY_RUN) {
-      const estimatedPayout = this._estimateRedeemPayout(null);
-      this.redeemedUsdc += estimatedPayout;
-      this.pnl.recordRedeem(this.market.slug, estimatedPayout, 'dry-run');
-      this.log.info('BeatTrader: dry-run redeem simulated', {
-        estimatedPayout,
-        upHeld: this.balanceUp,
-        downHeld: this.balanceDown,
-      });
-      return;
-    }
-
     const redeemNotBeforeMs = (windowClose + REDEEM_DELAY_AFTER_CLOSE) * 1000;
     const waitMs = redeemNotBeforeMs - Date.now();
     if (waitMs > 0) {
@@ -447,20 +517,53 @@ export class BeatTrader {
       this.log.warn('BeatTrader: resolution poll timed out, redeeming anyway', { err: err.message });
     }
 
+    const outcome = this._resolveOutcome(resolvedMarket);
+    this.lastOutcome = outcome;
+    const estimatedPayout = this._estimateRedeemPayout(resolvedMarket);
+    const marketPnl = estimatedPayout - this.totalSpent;
+    this.redeemedUsdc += estimatedPayout;
+
+    this._publishMarket({
+      status: 'SETTLED',
+      settled: true,
+      settledAt: Date.now(),
+      outcome,
+      pnl: marketPnl,
+      tradeStatus: this.tradeSummary?.buyShares > 0 ? 'settled' : 'settled without trade',
+      chosenSide: this.tradeSummary?.chosenSide ?? null,
+      buyShares: this.tradeSummary?.buyShares ?? 0,
+      buyUsdc: this.tradeSummary?.buyUsdc ?? 0,
+      buyPrice: this.tradeSummary?.buyPrice ?? null,
+      tradeOccurred: Boolean(this.tradeSummary?.buyShares > 0),
+    });
+
+    if (BEAT_DRY_RUN) {
+      this.pnl.recordRedeem(this.market.slug, marketPnl, 'dry-run');
+      this.log.info('BeatTrader: dry-run settlement simulated', {
+        outcome,
+        estimatedPayout,
+        marketPnl,
+        upHeld: this.balanceUp,
+        downHeld: this.balanceDown,
+      });
+      return;
+    }
+
     const totalHeld = this.balanceUp + this.balanceDown;
     if (totalHeld < 0.001) {
       this.log.info('BeatTrader: no tokens to redeem');
+      this.pnl.recordRedeem(this.market.slug, marketPnl, 'none');
       return;
     }
 
     try {
       const txHash = await redeemPositions(conditionId);
-      const estimatedPayout = this._estimateRedeemPayout(resolvedMarket);
-      this.redeemedUsdc += estimatedPayout;
-      this.pnl.recordRedeem(this.market.slug, estimatedPayout, txHash);
+      this.pnl.recordRedeem(this.market.slug, marketPnl, txHash);
       this.log.info('BeatTrader: redeemed winning position', {
         txHash,
         estimatedPayout,
+        outcome,
+        marketPnl,
         upHeld: this.balanceUp,
         downHeld: this.balanceDown,
       });
@@ -469,11 +572,58 @@ export class BeatTrader {
     }
   }
 
+  _resolveOutcome(resolvedMarket) {
+    const payouts = resolvedMarket?.resolvedPayouts;
+    if (Array.isArray(payouts) && payouts.length >= 2) {
+      const up = Number(payouts[0] ?? 0);
+      const down = Number(payouts[1] ?? 0);
+      if (up > down) return 'Up';
+      if (down > up) return 'Down';
+    }
+    return null;
+  }
+
   _estimateRedeemPayout(resolvedMarket) {
     const payouts = resolvedMarket?.resolvedPayouts;
     if (Array.isArray(payouts) && payouts.length >= 2) {
       return (this.balanceUp * Number(payouts[0] ?? 0)) + (this.balanceDown * Number(payouts[1] ?? 0));
     }
     return Math.max(this.balanceUp, this.balanceDown);
+  }
+
+  _publishTrade(patch = {}) {
+    this._publishMarket(patch);
+  }
+
+  _publishMarket(patch = {}) {
+    if (!this.dashboard) return;
+    this.dashboard.recordMarket({
+      slug: this.market.slug,
+      windowTs: this.market.windowTs,
+      windowOpenAt: this.market.windowTs * 1000,
+      windowCloseAt: (this.market.windowTs + MARKET_WINDOW_SECONDS) * 1000,
+      conditionId: this.market.conditionId,
+      status: patch.status ?? (this.phase === PHASE.DONE ? 'SETTLED' : 'LIVE'),
+      phase: patch.phase ?? this.phase,
+      settled: Boolean(patch.settled ?? false),
+      beatPrice: patch.beatPrice ?? this.beatPrice,
+      btcPrice: patch.btcPrice ?? this.latestBtcTick?.price ?? null,
+      btcBestBid: patch.btcBestBid ?? this.latestBtcTick?.bestBid ?? null,
+      btcBestAsk: patch.btcBestAsk ?? this.latestBtcTick?.bestAsk ?? null,
+      upBestBid: patch.upBestBid ?? this.latestQuotes.up?.bid?.price ?? null,
+      upBestAsk: patch.upBestAsk ?? this.latestQuotes.up?.ask?.price ?? null,
+      downBestBid: patch.downBestBid ?? this.latestQuotes.down?.bid?.price ?? null,
+      downBestAsk: patch.downBestAsk ?? this.latestQuotes.down?.ask?.price ?? null,
+      tradeStatus: patch.tradeStatus ?? (this.tradeSummary?.buyShares > 0 ? 'monitoring' : 'watching'),
+      chosenSide: patch.chosenSide ?? this.tradeSummary?.chosenSide ?? null,
+      buyShares: patch.buyShares ?? this.tradeSummary?.buyShares ?? 0,
+      buyUsdc: patch.buyUsdc ?? this.tradeSummary?.buyUsdc ?? 0,
+      buyPrice: patch.buyPrice ?? this.tradeSummary?.buyPrice ?? null,
+      tradeOccurred: patch.tradeOccurred ?? Boolean(this.tradeSummary?.buyShares > 0),
+      outcome: patch.outcome ?? this.lastOutcome ?? null,
+      pnl: patch.pnl ?? (this.redeemedUsdc - this.totalSpent),
+      settledAt: patch.settledAt ?? null,
+      updatedAt: Date.now(),
+    });
   }
 }

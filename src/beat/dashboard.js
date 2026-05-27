@@ -4,16 +4,19 @@ import { WebSocketServer } from 'ws';
 import logger, { subscribeLogs } from '../logger.js';
 
 const MAX_LOGS = 250;
-const MAX_EVENTS = 100;
+const MAX_MARKETS = 80;
 const DASHBOARD_HTML = readFileSync(new URL('./dashboard.html', import.meta.url), 'utf8');
-
-function truncatePush(list, value, max = MAX_EVENTS) {
-  list.unshift(value);
-  if (list.length > max) list.length = max;
-}
 
 function htmlPage() {
   return DASHBOARD_HTML;
+}
+
+function clone(value) {
+  return value == null ? value : JSON.parse(JSON.stringify(value));
+}
+
+function truncate(list, max) {
+  if (list.length > max) list.length = max;
 }
 
 export class BeatDashboardServer {
@@ -27,13 +30,17 @@ export class BeatDashboardServer {
       },
       config,
       stats: {},
-      recentTrades: [],
+      logs: [],
       btcPrice: null,
+      btcBestBid: null,
+      btcBestAsk: null,
+      btcUpdatedAt: null,
       markets: [],
     };
     this._server = null;
     this._wss = null;
     this._unsubscribeLogs = null;
+    this._marketIndex = new Map();
   }
 
   async start() {
@@ -49,7 +56,8 @@ export class BeatDashboardServer {
 
     this._wss = new WebSocketServer({ server: this._server, path: '/ws' });
     this._wss.on('connection', (socket) => {
-      socket.send(JSON.stringify({ type: 'snapshot', data: this.state }));
+      this.state.runtime.connected = true;
+      socket.send(JSON.stringify({ type: 'snapshot', data: clone(this.state) }));
     });
 
     this._unsubscribeLogs = subscribeLogs((entry) => {
@@ -57,9 +65,12 @@ export class BeatDashboardServer {
         timestamp: entry.timestamp,
         level: entry.level,
         message: entry.message,
-        meta: Object.fromEntries(Object.entries(entry).filter(([key]) => !['level', 'message', 'timestamp'].includes(key))),
+        meta: Object.fromEntries(
+          Object.entries(entry).filter(([key]) => !['level', 'message', 'timestamp'].includes(key)),
+        ),
       };
-      truncatePush(this.state.logs, logLine, MAX_LOGS);
+      this.state.logs.unshift(logLine);
+      truncate(this.state.logs, MAX_LOGS);
       this.broadcast('log', logLine);
     });
 
@@ -72,7 +83,7 @@ export class BeatDashboardServer {
     });
 
     const url = `http://${this.host}:${this.port}`;
-    this.setRuntime({ dashboardUrl: url, startedAt: Date.now() });
+    this.setRuntime({ dashboardUrl: url, startedAt: Date.now(), connected: true });
     logger.info('beat.dashboard: started', { url });
     return url;
   }
@@ -94,20 +105,47 @@ export class BeatDashboardServer {
     this.broadcast('stats', this.state.stats);
   }
 
-  recordPrice(price) {
-    this.state.btcPrice = price;
-    this.broadcast('price', price);
+  recordPrice(tick) {
+    if (tick && typeof tick === 'object') {
+      this.state.btcPrice = tick.price ?? null;
+      this.state.btcBestBid = tick.bestBid ?? null;
+      this.state.btcBestAsk = tick.bestAsk ?? null;
+      this.state.btcUpdatedAt = tick.timeMs ?? Date.now();
+      this.broadcast('price', tick);
+      return;
+    }
+    this.state.btcPrice = tick ?? null;
+    this.state.btcUpdatedAt = Date.now();
+    this.broadcast('price', { price: tick });
   }
 
-  recordMarket(market) {
-    // Expect market object with slug, createdAt, price, stats etc.
-    truncatePush(this.state.markets, market);
-    this.broadcast('market', market);
+  recordMarket(patch) {
+    if (!patch?.slug) return;
+    const slug = String(patch.slug);
+    const existing = this._marketIndex.get(slug) ?? { slug };
+    const next = {
+      ...existing,
+      ...clone(patch),
+      slug,
+      updatedAt: patch.updatedAt ?? Date.now(),
+    };
+
+    this._marketIndex.set(slug, next);
+    this.state.markets = [...this._marketIndex.values()]
+      .sort((a, b) => Number(b.updatedAt ?? 0) - Number(a.updatedAt ?? 0))
+      .slice(0, MAX_MARKETS);
+
+    if (Number.isFinite(Number(next.btcPrice))) {
+      this.state.btcPrice = Number(next.btcPrice);
+      this.state.btcUpdatedAt = next.updatedAt;
+    }
+
+    this.broadcast('market', next);
   }
 
   broadcast(type, data) {
     if (!this._wss) return;
-    const payload = JSON.stringify({ type, data });
+    const payload = JSON.stringify({ type, data: clone(data) });
     for (const client of this._wss.clients) {
       if (client.readyState === client.OPEN) {
         client.send(payload);

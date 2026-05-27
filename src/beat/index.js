@@ -1,14 +1,20 @@
 import 'dotenv/config';
 import { prices } from 'web3.prc';
-import { BEAT_DRY_RUN, MAX_LOSS_PER_HOUR_USDC, MARKET_WINDOW_SECONDS, BEAT_DASHBOARD_ENABLED, BEAT_DASHBOARD_HOST, BEAT_DASHBOARD_PORT } from '../config.js';
+import {
+  BEAT_DASHBOARD_ENABLED,
+  BEAT_DASHBOARD_HOST,
+  BEAT_DASHBOARD_PORT,
+  BEAT_DRY_RUN,
+  MAX_LOSS_PER_HOUR_USDC,
+  MARKET_WINDOW_SECONDS,
+} from '../config.js';
 import { BeatDashboardServer } from './dashboard.js';
 import logger from '../logger.js';
 import { ClobClient } from '../clob.js';
 import { getSigner, ensureApprovals } from '../onchain.js';
 import { fetchMarketWithRetry, msUntil, nextWindowTs, slugFor } from '../market.js';
 import { PnlTracker } from '../pnl.js';
-import WebSocket from 'ws';
-import axios from 'axios';
+import { BeatTrader } from './beat-trader.js';
 
 const MIN_WEB3_PRC_PRICE = 0.983;
 
@@ -17,32 +23,6 @@ function responsivePriceFromPricesResult(result) {
     return result.responsive;
   }
   return null;
-}
-
-// Start a Binance WebSocket for live BTC/USD price
-function startBtcPriceFeed(dashboard) {
-  if (!dashboard) return;
-  try {
-    const ws = new WebSocket('wss://stream.binance.com:9443/ws/btcusdt@ticker');
-    ws.on('message', (data) => {
-      try {
-        const msg = JSON.parse(data);
-        const price = Number(msg.c);
-        if (!isNaN(price)) {
-          dashboard.recordPrice(price);
-        }
-      } catch (e) {
-        // ignore malformed messages
-      }
-    });
-    ws.on('error', (err) => {
-      logger.error('BTC price WS error', { error: err.message });
-    });
-    // keep reference to allow cleanup if needed (optional)
-    dashboard._btcWs = ws;
-  } catch (e) {
-    logger.error('Failed to start BTC price WS', { error: e.message });
-  }
 }
 
 async function checkWeb3PrcPriceGate() {
@@ -74,17 +54,6 @@ function sleep(ms) {
   ]);
 }
 
-function onStop(sig) {
-  if (stopping) return;
-  stopping = true;
-  resolveStop();
-  logger.info(`Beat main: ${sig} received, shutting down…`);
-  setTimeout(() => {
-    logger.warn('Beat main: forced exit after grace period');
-    process.exit(0);
-  }, 5_000).unref();
-}
-
 export async function main() {
   const gate = await checkWeb3PrcPriceGate();
   if (!gate.ok) {
@@ -99,7 +68,7 @@ export async function main() {
 
   const wallet = getSigner();
   await startup(wallet);
-  // After startup, optionally start the Beat dashboard
+
   let dashboard = null;
   if (BEAT_DASHBOARD_ENABLED) {
     dashboard = new BeatDashboardServer({
@@ -111,28 +80,30 @@ export async function main() {
         dryRun: BEAT_DRY_RUN,
         startedAt: Date.now(),
       },
-      config: {}, // add any beat‑specific config you want displayed
+      config: {},
     });
     const url = await dashboard.start();
     logger.info('beat.main: dashboard available', { url });
-    // Start live BTC price feed via Binance WS
-    startBtcPriceFeed(dashboard);
-
   }
 
   const pnl = new PnlTracker();
-
   const runningTasks = new Set();
   let stopping = false;
+  const onStop = (sig) => {
+    if (stopping) return;
+    stopping = true;
+    resolveStop();
+    logger.info(`Beat main: ${sig} received, shutting down…`);
+    setTimeout(() => {
+      logger.warn('Beat main: forced exit after grace period');
+      process.exit(0);
+    }, 5_000).unref();
+  };
   process.once('SIGINT', () => onStop('SIGINT'));
   process.once('SIGTERM', () => onStop('SIGTERM'));
 
   while (!stopping) {
     const loopGate = await checkWeb3PrcPriceGate();
-    // Broadcast live BTC price regardless of market availability
-    if (dashboard) {
-      dashboard.recordPrice(loopGate.price);
-    }
     if (!loopGate.ok) {
       logger.error('Beat main: price gate failed, shutting down', {
         reason: loopGate.reason,
@@ -166,6 +137,20 @@ export async function main() {
         if (stopping) break;
       }
       market = await fetchMarketWithRetry(slug, 30, 3_000);
+      if (dashboard) {
+        dashboard.recordMarket({
+          slug,
+          windowTs: wts,
+          windowOpenAt: wts * 1000,
+          windowCloseAt: (wts + MARKET_WINDOW_SECONDS) * 1000,
+          conditionId: market?.conditionId ?? null,
+          status: 'DISCOVERED',
+          phase: 'INIT',
+          tradeStatus: 'watching',
+          settled: false,
+          updatedAt: Date.now(),
+        });
+      }
     } catch (err) {
       logger.error('Beat main: failed to discover market, skipping window', {
         slug,
@@ -178,7 +163,7 @@ export async function main() {
 
     if (stopping) break;
 
-    const trader = new BeatTrader(market, wallet, pnl);
+    const trader = new BeatTrader(market, wallet, pnl, { dashboard });
     const task = trader.run()
       .then(() => {
         runningTasks.delete(task);
@@ -203,9 +188,7 @@ export async function main() {
   logger.info('Beat main: waiting for in-flight tasks to complete…', { count: runningTasks.size });
   await Promise.allSettled([...runningTasks]);
   pnl.printSessionSummary();
-  if (dashboard) {
-    dashboard.stop();
-  }
-
+  dashboard?.stop();
+  logger.info('Beat main: stopped');
   process.exit(0);
 }

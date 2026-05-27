@@ -69,11 +69,13 @@ export class BtcPriceFeed extends EventEmitter {
 
     this._ws.on('open', () => {
       this._reconnectDelayMs = 1_000;
-      this._ws?.send(JSON.stringify({
-        type: 'subscribe',
-        product_ids: [this.productId],
-        channels: ['ticker', 'heartbeat'],
-      }));
+      if (!this._isBinanceUrl()) {
+        this._ws?.send(JSON.stringify({
+          type: 'subscribe',
+          product_ids: [this.productId],
+          channels: ['ticker', 'heartbeat'],
+        }));
+      }
       logger.debug('BtcPriceFeed: connected', {
         url: this.url,
         productId: this.productId,
@@ -104,6 +106,30 @@ export class BtcPriceFeed extends EventEmitter {
   }
 
   _handleMessage(msg) {
+    if (this._isBinanceUrl()) {
+      const price = Number(msg.c);
+      const bestBid = Number(msg.b);
+      const bestAsk = Number(msg.a);
+      const timeMs = Number(msg.E ?? msg.T ?? Date.now());
+      const tick = {
+        price,
+        bestBid,
+        bestAsk,
+        productId: this.productId,
+        timeMs,
+        isoTime: new Date(timeMs).toISOString(),
+      };
+      if (!Number.isFinite(tick.price) || !Number.isFinite(tick.timeMs)) return;
+      this._latest = tick;
+      this.emit('tick', tick);
+      for (const waiter of [...this._waiters]) {
+        if (tick.timeMs >= waiter.timestampMs) {
+          waiter.resolve(tick);
+        }
+      }
+      return;
+    }
+
     if (msg.type !== 'ticker' || msg.product_id !== this.productId) return;
 
     const tick = {
@@ -126,5 +152,9 @@ export class BtcPriceFeed extends EventEmitter {
         waiter.resolve(tick);
       }
     }
+  }
+
+  _isBinanceUrl() {
+    return /binance/i.test(this.url);
   }
 }

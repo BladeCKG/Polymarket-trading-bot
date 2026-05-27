@@ -112,8 +112,8 @@ export const HEARTBEAT_INTERVAL_MS      = Math.max(
 );
 
 // ── BTC beat strategy ────────────────────────────────────────────────────────
-export const BTC_PRICE_WS_URL            = optional('BTC_PRICE_WS_URL', 'wss://ws-feed.exchange.coinbase.com');
-export const BTC_PRICE_PRODUCT_ID        = optional('BTC_PRICE_PRODUCT_ID', 'BTC-USD');
+export const BTC_PRICE_WS_URL            = optional('BTC_PRICE_WS_URL', 'wss://stream.binance.com:9443/ws/btcusdt@ticker');
+export const BTC_PRICE_PRODUCT_ID        = optional('BTC_PRICE_PRODUCT_ID', 'BTCUSDT');
 export const BTC_PRICE_MAX_AGE_MS        = parseInt_('BTC_PRICE_MAX_AGE_MS', 2_000);
 export const BEAT_DRY_RUN                = parseBool_('BEAT_DRY_RUN', true);
 export const BEAT_ENTRY_DELAY_SECONDS    = parseInt_('BEAT_ENTRY_DELAY_SECONDS', 15);
