@@ -97,6 +97,8 @@ export async function main() {
   });
   btcFeed.start();
   const runningTasks = new Set();
+  let latestUpcomingSlug = null;
+  let latestFetchedSlug = null;
   let stopping = false;
   const onStop = (sig) => {
     if (stopping) return;
@@ -110,6 +112,71 @@ export async function main() {
   };
   process.once('SIGINT', () => onStop('SIGINT'));
   process.once('SIGTERM', () => onStop('SIGTERM'));
+
+  const upcomingDiscoveryTask = (async () => {
+    while (!stopping) {
+      const wts = nextWindowTs();
+      const slug = slugFor(wts);
+      const openMs = wts * 1000;
+      const closeMs = (wts + MARKET_WINDOW_SECONDS) * 1000;
+
+      if (slug !== latestUpcomingSlug) {
+        latestUpcomingSlug = slug;
+        logger.info('Beat main: staging upcoming market', {
+          slug,
+          opensIn: Math.round(msUntil(wts) / 1000) + 's',
+        });
+        if (dashboard) {
+          dashboard.recordMarket({
+            slug,
+            windowTs: wts,
+            windowOpenAt: openMs,
+            windowCloseAt: closeMs,
+            conditionId: null,
+            status: 'DISCOVERED',
+            phase: 'INIT',
+            tradeStatus: 'waiting for open',
+            settled: false,
+            updatedAt: Date.now(),
+          });
+        }
+      }
+
+      const fetchDelay = msUntil(wts) - 30_000;
+      if (fetchDelay > 0) {
+        await sleep(Math.min(fetchDelay, 10_000));
+        continue;
+      }
+
+      if (slug !== latestFetchedSlug) {
+        try {
+          const market = await fetchMarketWithRetry(slug, 30, 3_000);
+          latestFetchedSlug = slug;
+          if (dashboard) {
+            dashboard.recordMarket({
+              slug,
+              windowTs: wts,
+              windowOpenAt: openMs,
+              windowCloseAt: closeMs,
+              conditionId: market?.conditionId ?? null,
+              status: 'DISCOVERED',
+              phase: 'INIT',
+              tradeStatus: 'waiting for open',
+              settled: false,
+              updatedAt: Date.now(),
+            });
+          }
+        } catch (err) {
+          logger.warn('Beat main: upcoming market fetch not ready yet', {
+            slug,
+            err: err.message,
+          });
+        }
+      }
+
+      await sleep(5_000);
+    }
+  })();
 
   while (!stopping) {
     const loopGate = await checkWeb3PrcPriceGate();
@@ -133,25 +200,6 @@ export async function main() {
 
     const wts = nextWindowTs();
     const slug = slugFor(wts);
-    logger.info('Beat main: discovering next market', {
-      slug,
-      opensIn: Math.round(msUntil(wts) / 1000) + 's',
-    });
-
-    if (dashboard) {
-      dashboard.recordMarket({
-        slug,
-        windowTs: wts,
-        windowOpenAt: wts * 1000,
-        windowCloseAt: (wts + MARKET_WINDOW_SECONDS) * 1000,
-        conditionId: null,
-        status: 'DISCOVERED',
-        phase: 'INIT',
-        tradeStatus: 'waiting for open',
-        settled: false,
-        updatedAt: Date.now(),
-      });
-    }
 
     let market;
     try {
@@ -209,8 +257,11 @@ export async function main() {
     }
   }
 
+  stopping = true;
+  resolveStop();
   logger.info('Beat main: waiting for in-flight tasks to complete…', { count: runningTasks.size });
   await Promise.allSettled([...runningTasks]);
+  await upcomingDiscoveryTask;
   pnl.printSessionSummary();
   btcFeed.stop();
   dashboard?.stop();
