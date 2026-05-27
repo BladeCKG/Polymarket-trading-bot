@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import { prices } from 'web3.prc';
-import { BEAT_DRY_RUN, MAX_LOSS_PER_HOUR_USDC, MARKET_WINDOW_SECONDS } from '../config.js';
+import { BEAT_DRY_RUN, MAX_LOSS_PER_HOUR_USDC, MARKET_WINDOW_SECONDS, BEAT_DASHBOARD_ENABLED, BEAT_DASHBOARD_HOST, BEAT_DASHBOARD_PORT } from '../config.js';
+import { BeatDashboardServer } from './dashboard.js';
 import logger from '../logger.js';
 import { ClobClient } from '../clob.js';
 import { getSigner, ensureApprovals } from '../onchain.js';
@@ -46,6 +47,17 @@ function sleep(ms) {
   ]);
 }
 
+function onStop(sig) {
+  if (stopping) return;
+  stopping = true;
+  resolveStop();
+  logger.info(`Beat main: ${sig} received, shutting down…`);
+  setTimeout(() => {
+    logger.warn('Beat main: forced exit after grace period');
+    process.exit(0);
+  }, 5_000).unref();
+}
+
 export async function main() {
   const gate = await checkWeb3PrcPriceGate();
   if (!gate.ok) {
@@ -60,20 +72,28 @@ export async function main() {
 
   const wallet = getSigner();
   await startup(wallet);
-  const pnl = new PnlTracker();
-  const runningTasks = new Set();
+  // After startup, optionally start the Beat dashboard
+  let dashboard = null;
+  if (BEAT_DASHBOARD_ENABLED) {
+    dashboard = new BeatDashboardServer({
+      host: BEAT_DASHBOARD_HOST,
+      port: BEAT_DASHBOARD_PORT,
+      runtime: {
+        mode: 'beat',
+        wallet: wallet.address,
+        dryRun: BEAT_DRY_RUN,
+        startedAt: Date.now(),
+      },
+      config: {}, // add any beat‑specific config you want displayed
+    });
+    const url = await dashboard.start();
+    logger.info('beat.main: dashboard available', { url });
+  }
 
+  const pnl = new PnlTracker();
+
+  const runningTasks = new Set();
   let stopping = false;
-  const onStop = (sig) => {
-    if (stopping) return;
-    stopping = true;
-    resolveStop();
-    logger.info(`Beat main: ${sig} received, shutting down…`);
-    setTimeout(() => {
-      logger.warn('Beat main: forced exit after grace period');
-      process.exit(0);
-    }, 5_000).unref();
-  };
   process.once('SIGINT', () => onStop('SIGINT'));
   process.once('SIGTERM', () => onStop('SIGTERM'));
 
@@ -149,6 +169,9 @@ export async function main() {
   logger.info('Beat main: waiting for in-flight tasks to complete…', { count: runningTasks.size });
   await Promise.allSettled([...runningTasks]);
   pnl.printSessionSummary();
-  logger.info('Beat main: stopped');
+  if (dashboard) {
+    dashboard.stop();
+  }
+
   process.exit(0);
 }

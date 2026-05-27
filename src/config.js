@@ -128,7 +128,10 @@ export const BEAT_UP_MOVE_MAX_USD        = parseFloat_('BEAT_UP_MOVE_MAX_USD', 1
 export const BEAT_DOWN_MOVE_MIN_USD      = parseFloat_('BEAT_DOWN_MOVE_MIN_USD', 15);
 export const BEAT_DOWN_MOVE_MAX_USD      = parseFloat_('BEAT_DOWN_MOVE_MAX_USD', 120);
 export const BEAT_UP_MAX_BUY_PRICE       = parseFloat_('BEAT_UP_MAX_BUY_PRICE', 0.46);
-export const BEAT_DOWN_MAX_BUY_PRICE     = parseFloat_('BEAT_DOWN_MAX_BUY_PRICE', 0.46);
+export const BEAT_DOWN_MAX_BUY_PRICE       = parseFloat_('BEAT_DOWN_MAX_BUY_PRICE', 0.46);
+export const BEAT_DASHBOARD_ENABLED = parseBool_('BEAT_DASHBOARD_ENABLED', false);
+export const BEAT_DASHBOARD_HOST = optional('BEAT_DASHBOARD_HOST', '127.0.0.1');
+export const BEAT_DASHBOARD_PORT = parseInt_('BEAT_DASHBOARD_PORT', 8798);
 
 // ── EIP-712 domains for CLOB order signing ───────────────────────────────────
 // Polymarket has TWO exchange contracts. Orders MUST be signed against the
