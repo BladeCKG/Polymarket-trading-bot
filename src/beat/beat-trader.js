@@ -131,6 +131,11 @@ export class BeatTrader {
       }
 
       this.phase = PHASE.CAPTURE_BEAT;
+      this._publishMarket({
+        status: 'OPEN',
+        phase: PHASE.CAPTURE_BEAT,
+        tradeStatus: 'waiting for beat price',
+      });
       this.beatPrice = await this._captureBeatPrice(windowTs);
 
       this.phase = PHASE.WAITING;

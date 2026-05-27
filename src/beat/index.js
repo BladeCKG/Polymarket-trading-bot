@@ -129,6 +129,21 @@ export async function main() {
       opensIn: Math.round(msUntil(wts) / 1000) + 's',
     });
 
+    if (dashboard) {
+      dashboard.recordMarket({
+        slug,
+        windowTs: wts,
+        windowOpenAt: wts * 1000,
+        windowCloseAt: (wts + MARKET_WINDOW_SECONDS) * 1000,
+        conditionId: null,
+        status: 'DISCOVERED',
+        phase: 'INIT',
+        tradeStatus: 'waiting for open',
+        settled: false,
+        updatedAt: Date.now(),
+      });
+    }
+
     let market;
     try {
       const fetchDelay = msUntil(wts) - 30_000;
@@ -146,7 +161,7 @@ export async function main() {
           conditionId: market?.conditionId ?? null,
           status: 'DISCOVERED',
           phase: 'INIT',
-          tradeStatus: 'watching',
+          tradeStatus: 'waiting for open',
           settled: false,
           updatedAt: Date.now(),
         });

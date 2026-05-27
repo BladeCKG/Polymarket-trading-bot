@@ -408,6 +408,13 @@
       return Number.isFinite(n) ? '$' + n.toFixed(4) : '-';
     }
 
+    function signedMoney(v, digits = 2) {
+      const n = Number(v);
+      if (!Number.isFinite(n)) return '-';
+      const sign = n > 0 ? '+' : n < 0 ? '-' : '';
+      return `${sign}$${Math.abs(n).toFixed(digits)}`;
+    }
+
     function ts(v) {
       if (!v) return '-';
       const d = new Date(v);
@@ -446,6 +453,22 @@
       if (text.includes('wait') || text.includes('discover') || text.includes('watch')) return 'waiting';
       if (text.includes('error') || text.includes('fail')) return 'error';
       return 'waiting';
+    }
+
+    function getWindowOpenMs(market) {
+      const openMs = Number(market?.windowOpenAt ?? (market?.windowTs ? market.windowTs * 1000 : null));
+      return Number.isFinite(openMs) ? openMs : null;
+    }
+
+    function getWindowCloseMs(market) {
+      const closeMs = Number(market?.windowCloseAt ?? null);
+      return Number.isFinite(closeMs) ? closeMs : null;
+    }
+
+    function isPreOpenMarket(market) {
+      if (market?.settled) return false;
+      const openMs = getWindowOpenMs(market);
+      return Boolean(openMs && Date.now() < openMs);
     }
 
     function outcomeLabel(market) {
@@ -517,31 +540,39 @@
 
     function renderMarketCard(market) {
       const settled = Boolean(market.settled);
-      const statusText = market.tradeStatus || market.status || (settled ? 'settled' : 'watching');
+      const preOpen = isPreOpenMarket(market);
+      const statusText = settled ? 'settled' : (preOpen ? 'upcoming' : (market.tradeStatus || market.status || 'watching'));
       const beat = market.beatPrice ?? state.btcPrice;
+      const liveBtc = market.btcPrice ?? state.btcPrice;
+      const btcMove = Number.isFinite(Number(liveBtc)) && Number.isFinite(Number(beat))
+        ? Number(liveBtc) - Number(beat)
+        : null;
+      const btcMovePct = Number.isFinite(btcMove) && Number.isFinite(Number(beat)) && Number(beat) !== 0
+        ? (btcMove / Number(beat)) * 100
+        : null;
       return `
         <article class="market-card ${settled ? 'settled' : ''}">
           <div class="market-head">
             <div class="market-name">
-              <div class="eyebrow">${settled ? 'Settled market' : 'Live market'}</div>
+              <div class="eyebrow">${settled ? 'Settled market' : (preOpen ? 'Upcoming market' : 'Live market')}</div>
               <h3>${market.slug || '?'}</h3>
             </div>
             <span class="status-chip ${chipClass(statusText)}">${statusText}</span>
           </div>
           <div class="market-meta">
-            <span>${settled ? `Settled ${ts(market.settledAt)}` : `Settles in ${countdown(market.windowCloseAt)}`}</span>
+            <span>${settled ? `Settled ${ts(market.settledAt)}` : (preOpen ? `Opens in ${countdown(market.windowOpenAt)}` : `Settles in ${countdown(market.windowCloseAt)}`)}</span>
             <span>Updated ${ago(market.updatedAt)}</span>
-            <span>Window open ${ts(market.windowOpenAt || (market.windowTs ? market.windowTs * 1000 : null))}</span>
+            <span>Window open ${ts(getWindowOpenMs(market))}</span>
           </div>
           <div class="metric-grid">
             <div class="metric"><div class="label">Beat BTC</div><div class="value">${money(beat)}</div></div>
-            <div class="metric"><div class="label">Live BTC</div><div class="value">${money(market.btcPrice ?? state.btcPrice)}</div></div>
+            <div class="metric"><div class="label">BTC Move</div><div class="value ${btcMove >= 0 ? 'summary-positive' : 'summary-negative'}">${signedMoney(btcMove)}${btcMovePct != null ? ` (${btcMovePct >= 0 ? '+' : ''}${btcMovePct.toFixed(2)}%)` : ''}</div></div>
             <div class="metric"><div class="label">Up Bid</div><div class="value">${price(market.upBestBid)}</div></div>
             <div class="metric"><div class="label">Up Ask</div><div class="value">${price(market.upBestAsk)}</div></div>
             <div class="metric"><div class="label">Down Bid</div><div class="value">${price(market.downBestBid)}</div></div>
             <div class="metric"><div class="label">Down Ask</div><div class="value">${price(market.downBestAsk)}</div></div>
             <div class="metric"><div class="label">Trade Status</div><div class="value small">${statusText}</div></div>
-            <div class="metric"><div class="label">Settlement</div><div class="value small">${settled ? (market.outcome || '-') : countdown(market.windowCloseAt)}</div></div>
+            <div class="metric"><div class="label">Settlement</div><div class="value small">${settled ? (market.outcome || '-') : (preOpen ? countdown(market.windowOpenAt) : countdown(market.windowCloseAt))}</div></div>
           </div>
           ${settled ? tradeSummary(market) : ''}
         </article>
@@ -565,9 +596,9 @@
           <div class="panel-head">
             <div>
               <h2 class="panel-title">Live Markets</h2>
-              <div class="panel-subtitle">Realtime quote and trade status for the currently monitored BTC up/down windows.</div>
+              <div class="panel-subtitle">Open and pre-open BTC up/down windows, with upcoming markets shown inline.</div>
             </div>
-            <div class="status-chip live">${live.length} open</div>
+            <div class="status-chip live">${live.length} active</div>
           </div>
           <div class="panel-body">
             <div class="market-column">${liveHtml}</div>
