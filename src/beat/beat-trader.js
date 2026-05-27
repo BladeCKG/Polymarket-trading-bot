@@ -169,6 +169,8 @@ export class BeatTrader {
     this.phase = PHASE.DONE;
     this._publishMarket({
       status: 'SETTLED',
+      settled: true,
+      settledAt: this.lastSettledAt ?? Date.now(),
       tradeStatus: this.tradeSummary?.buyShares > 0 ? 'settled' : 'settled without trade',
     });
     this.log.info('BeatTrader: market complete', {
@@ -544,6 +546,7 @@ export class BeatTrader {
 
     const outcome = this._resolveOutcome(resolvedMarket);
     this.lastOutcome = outcome;
+    this.lastSettledAt = Date.now();
     const estimatedPayout = this._estimateRedeemPayout(resolvedMarket);
     const marketPnl = estimatedPayout - this.totalSpent;
     this.redeemedUsdc += estimatedPayout;
@@ -551,7 +554,7 @@ export class BeatTrader {
     this._publishMarket({
       status: 'SETTLED',
       settled: true,
-      settledAt: Date.now(),
+      settledAt: this.lastSettledAt,
       outcome,
       pnl: marketPnl,
       tradeStatus: this.tradeSummary?.buyShares > 0 ? 'settled' : 'settled without trade',
