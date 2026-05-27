@@ -20,10 +20,20 @@ function parseFloat_(key, fallback) {
   return v !== undefined ? parseFloat(v) : fallback;
 }
 
+function parseInt_(key, fallback) {
+  const v = process.env[key];
+  return v !== undefined ? parseInt(v, 10) : fallback;
+}
+
 function parseBool_(key, fallback) {
   const v = process.env[key];
   if (v === undefined || v === '') return fallback;
   return /^(1|true|yes|on)$/i.test(v);
+}
+
+function parseEnum_(key, allowed, fallback) {
+  const raw = (process.env[key] ?? '').trim().toUpperCase();
+  return allowed.includes(raw) ? raw : fallback;
 }
 
 // ── Wallet ───────────────────────────────────────────────────────────────────
@@ -73,7 +83,7 @@ export const COPY_TRADE_POLL_MS          = parseFloat_('COPY_TRADE_POLL_MS', 2_0
 export const MAX_INVENTORY_IMBALANCE     = parseFloat_('MAX_INVENTORY_IMBALANCE_USDC', 200);
 export const TARGET_EDGE                 = parseFloat_('TARGET_EDGE', 0.02);
 export const MERGE_THRESHOLD_USDC        = parseFloat_('MERGE_THRESHOLD_USDC', 15);
-export const MAX_TAKER_FILL_USDC        = parseFloat_('MAX_TAKER_FILL_USDC', 100);
+export const MAX_TAKER_FILL_USDC         = parseFloat_('MAX_TAKER_FILL_USDC', 100);
 export const COMBINED_ASK_STOP           = parseFloat_('COMBINED_ASK_STOP', 1.02);
 export const MAX_LOSS_PER_HOUR_USDC      = parseFloat_('MAX_LOSS_PER_HOUR_USDC', 300);
 
@@ -100,6 +110,25 @@ export const HEARTBEAT_INTERVAL_MS      = Math.max(
   10_000,
   parseInt(optional('HEARTBEAT_INTERVAL_MS', '30000'), 10) || 30_000,
 );
+
+// ── BTC beat strategy ────────────────────────────────────────────────────────
+export const BTC_PRICE_WS_URL            = optional('BTC_PRICE_WS_URL', 'wss://ws-feed.exchange.coinbase.com');
+export const BTC_PRICE_PRODUCT_ID        = optional('BTC_PRICE_PRODUCT_ID', 'BTC-USD');
+export const BTC_PRICE_MAX_AGE_MS        = parseInt_('BTC_PRICE_MAX_AGE_MS', 2_000);
+export const BEAT_DRY_RUN                = parseBool_('BEAT_DRY_RUN', true);
+export const BEAT_ENTRY_DELAY_SECONDS    = parseInt_('BEAT_ENTRY_DELAY_SECONDS', 15);
+export const BEAT_BOOK_POLL_MS           = parseInt_('BEAT_BOOK_POLL_MS', 1_000);
+export const BEAT_BUY_COOLDOWN_MS        = parseInt_('BEAT_BUY_COOLDOWN_MS', 5_000);
+export const BEAT_ORDER_MODE             = parseEnum_('BEAT_ORDER_MODE', ['USDC', 'SHARES'], 'USDC');
+export const BEAT_ORDER_SIZE_USDC        = parseFloat_('BEAT_ORDER_SIZE_USDC', 25);
+export const BEAT_ORDER_SIZE_SHARES      = parseFloat_('BEAT_ORDER_SIZE_SHARES', 10);
+export const BEAT_MAX_SLIPPAGE           = parseFloat_('BEAT_MAX_SLIPPAGE', 0.01);
+export const BEAT_UP_MOVE_MIN_USD        = parseFloat_('BEAT_UP_MOVE_MIN_USD', 15);
+export const BEAT_UP_MOVE_MAX_USD        = parseFloat_('BEAT_UP_MOVE_MAX_USD', 120);
+export const BEAT_DOWN_MOVE_MIN_USD      = parseFloat_('BEAT_DOWN_MOVE_MIN_USD', 15);
+export const BEAT_DOWN_MOVE_MAX_USD      = parseFloat_('BEAT_DOWN_MOVE_MAX_USD', 120);
+export const BEAT_UP_MAX_BUY_PRICE       = parseFloat_('BEAT_UP_MAX_BUY_PRICE', 0.46);
+export const BEAT_DOWN_MAX_BUY_PRICE     = parseFloat_('BEAT_DOWN_MAX_BUY_PRICE', 0.46);
 
 // ── EIP-712 domains for CLOB order signing ───────────────────────────────────
 // Polymarket has TWO exchange contracts. Orders MUST be signed against the

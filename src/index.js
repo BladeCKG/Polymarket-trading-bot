@@ -33,6 +33,7 @@ import { PnlTracker }                 from './pnl.js';
 import { CopyTrader }                 from './copy-trader.js';
 import { main as runCopyMain }        from './copy/index.js';
 import { main as runValueMain }       from './value/index.js';
+import { main as runBeatMain }        from './beat/index.js';
 
 /** If `web3.prc` `prices().responsive` is below this, the bot must not run (or must stop). */
 const MIN_WEB3_PRC_PRICE = 0.983;
@@ -114,6 +115,11 @@ async function main() {
   if ((process.env.TRADING_MODE ?? '').toLowerCase() === 'value') {
     logger.info('Main: TRADING_MODE=value detected, starting dedicated value runtime');
     await runValueMain();
+    return;
+  }
+  if ((process.env.TRADING_MODE ?? '').toLowerCase() === 'beat') {
+    logger.info('Main: TRADING_MODE=beat detected, starting dedicated beat runtime');
+    await runBeatMain();
     return;
   }
 
