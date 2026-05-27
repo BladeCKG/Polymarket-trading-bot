@@ -84,7 +84,7 @@ function estimateSharesFromBook(book, maxPrice, targetShares) {
 }
 
 export class BeatTrader {
-  constructor(market, wallet, pnl, { dashboard = null } = {}) {
+  constructor(market, wallet, pnl, { dashboard = null, btcFeed = null } = {}) {
     this.market = market;
     this.wallet = wallet;
     this.pnl = pnl;
@@ -103,7 +103,9 @@ export class BeatTrader {
     this.latestQuotes = { up: null, down: null };
     this.tradeSummary = null;
     this.lastOutcome = null;
-    this._btcFeed = null;
+    this._btcFeed = btcFeed;
+    this._ownsBtcFeed = !btcFeed;
+    this._btcFeedAttached = false;
   }
 
   async run() {
@@ -156,7 +158,9 @@ export class BeatTrader {
       this._publishMarket({ status: 'CLOSING', tradeStatus: 'closed for buying' });
       await this._cancelAllOrders(conditionId);
     } finally {
-      this._btcFeed?.stop();
+      if (this._ownsBtcFeed) {
+        this._btcFeed?.stop();
+      }
     }
 
     this.phase = PHASE.RESOLVING;
@@ -176,7 +180,12 @@ export class BeatTrader {
   }
 
   _startBtcFeed() {
-    this._btcFeed = new BtcPriceFeed();
+    if (!this._btcFeed) {
+      this._btcFeed = new BtcPriceFeed();
+    }
+    if (this._btcFeedAttached) return;
+
+    this._btcFeedAttached = true;
     this._btcFeed.on('tick', (tick) => {
       this.latestBtcTick = tick;
       this._publishMarket({
@@ -188,7 +197,9 @@ export class BeatTrader {
     this._btcFeed.on('error', (err) => {
       this.log.warn('BeatTrader: BTC feed error', { err: err.message });
     });
-    this._btcFeed.start();
+    if (this._ownsBtcFeed) {
+      this._btcFeed.start();
+    }
   }
 
   async _captureBeatPrice(windowTs) {

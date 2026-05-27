@@ -107,14 +107,22 @@ export class BeatDashboardServer {
 
   recordPrice(tick) {
     if (tick && typeof tick === 'object') {
-      this.state.btcPrice = tick.price ?? null;
-      this.state.btcBestBid = tick.bestBid ?? null;
-      this.state.btcBestAsk = tick.bestAsk ?? null;
+      if (tick.price != null && Number.isFinite(Number(tick.price))) {
+        this.state.btcPrice = Number(tick.price);
+      }
+      if (tick.bestBid != null && Number.isFinite(Number(tick.bestBid))) {
+        this.state.btcBestBid = Number(tick.bestBid);
+      }
+      if (tick.bestAsk != null && Number.isFinite(Number(tick.bestAsk))) {
+        this.state.btcBestAsk = Number(tick.bestAsk);
+      }
       this.state.btcUpdatedAt = tick.timeMs ?? Date.now();
       this.broadcast('price', tick);
       return;
     }
-    this.state.btcPrice = tick ?? null;
+    if (tick != null && Number.isFinite(Number(tick))) {
+      this.state.btcPrice = Number(tick);
+    }
     this.state.btcUpdatedAt = Date.now();
     this.broadcast('price', { price: tick });
   }
@@ -135,7 +143,7 @@ export class BeatDashboardServer {
       .sort((a, b) => Number(b.updatedAt ?? 0) - Number(a.updatedAt ?? 0))
       .slice(0, MAX_MARKETS);
 
-    if (Number.isFinite(Number(next.btcPrice))) {
+    if (next.btcPrice != null && Number.isFinite(Number(next.btcPrice))) {
       this.state.btcPrice = Number(next.btcPrice);
       this.state.btcUpdatedAt = next.updatedAt;
     }

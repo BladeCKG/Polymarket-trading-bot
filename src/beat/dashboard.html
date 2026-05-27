@@ -691,9 +691,17 @@
         state.logs = [data, ...state.logs].slice(0, 250);
         scheduleRender('logs');
       } else if (type === 'price') {
-        state.btcPrice = data?.price ?? data ?? null;
-        state.btcBestBid = data?.bestBid ?? state.btcBestBid;
-        state.btcBestAsk = data?.bestAsk ?? state.btcBestAsk;
+        if (data?.price != null && Number.isFinite(Number(data.price))) {
+          state.btcPrice = Number(data.price);
+        } else if (data != null && Number.isFinite(Number(data))) {
+          state.btcPrice = Number(data);
+        }
+        if (data?.bestBid != null && Number.isFinite(Number(data.bestBid))) {
+          state.btcBestBid = Number(data.bestBid);
+        }
+        if (data?.bestAsk != null && Number.isFinite(Number(data.bestAsk))) {
+          state.btcBestAsk = Number(data.bestAsk);
+        }
         state.btcUpdatedAt = data?.timeMs ?? Date.now();
         scheduleRender('topStats', 'markets');
       } else if (type === 'market') {

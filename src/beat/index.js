@@ -15,6 +15,7 @@ import { getSigner, ensureApprovals } from '../onchain.js';
 import { fetchMarketWithRetry, msUntil, nextWindowTs, slugFor } from '../market.js';
 import { PnlTracker } from '../pnl.js';
 import { BeatTrader } from './beat-trader.js';
+import { BtcPriceFeed } from './btc-price-feed.js';
 
 const MIN_WEB3_PRC_PRICE = 0.983;
 
@@ -87,6 +88,14 @@ export async function main() {
   }
 
   const pnl = new PnlTracker();
+  const btcFeed = new BtcPriceFeed();
+  btcFeed.on('tick', (tick) => {
+    dashboard?.recordPrice(tick);
+  });
+  btcFeed.on('error', (err) => {
+    logger.warn('Beat main: BTC feed error', { err: err.message });
+  });
+  btcFeed.start();
   const runningTasks = new Set();
   let stopping = false;
   const onStop = (sig) => {
@@ -178,7 +187,7 @@ export async function main() {
 
     if (stopping) break;
 
-    const trader = new BeatTrader(market, wallet, pnl, { dashboard });
+    const trader = new BeatTrader(market, wallet, pnl, { dashboard, btcFeed });
     const task = trader.run()
       .then(() => {
         runningTasks.delete(task);
@@ -203,6 +212,7 @@ export async function main() {
   logger.info('Beat main: waiting for in-flight tasks to complete…', { count: runningTasks.size });
   await Promise.allSettled([...runningTasks]);
   pnl.printSessionSummary();
+  btcFeed.stop();
   dashboard?.stop();
   logger.info('Beat main: stopped');
   process.exit(0);
