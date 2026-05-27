@@ -83,7 +83,7 @@
     const sectionsEl=document.getElementById('sections');
     const connectionEl=document.getElementById('connection');
     const runtimeLabelEl=document.getElementById('runtimeLabel');
-    const dirty=new Set(['chrome','topStats','runtime','trades','logs']);
+    const dirty=new Set(['chrome','topStats','runtime','trades','logs','price','markets']);
     let renderScheduled=false;
     function money(v){const n=Number(v);return Number.isFinite(n)?'$'+n.toFixed(2):String(v||'-');}
     function ts(v){if(!v)return'-';const d=new Date(v);return Number.isNaN(d.getTime())?String(v):d.toLocaleTimeString();}
@@ -92,12 +92,14 @@
     function renderRuntime(){return `<details class="panel" open><summary><span>Runtime</span><span class="summary-meta">${state.runtime.mode||''}</span></summary><div class="panel-body"><div class="stat"><div class="label">Wallet</div><div class="value">${state.runtime.wallet||''}</div></div><div class="stat"><div class="label">Dry Run</div><div class="value">${state.runtime.dryRun}</div></div><div class="stat"><div class="label">Started</div><div class="value">${ts(state.runtime.startedAt)}</div></div></div></details>`;}
     function renderTrades(){return `<details class="panel" open><summary><span>Recent Trades</span><span class="summary-meta">${state.recentTrades.length}</span></summary><div class="panel-body">${state.recentTrades.slice(0,100).map(t=>`<div class="item"><header><span>${t.slug||'?'}</span><span>${ts(t.seenAt)}</span></header><div>Price: ${t.price||'-'} USDC: ${t.usdc||'-'}</div></div>`).join('')}</div></details>`;}
     function renderLogs(){return `<details class="panel" open><summary><span>Logs</span><span class="summary-meta">${state.logs.length}</span></summary><div class="panel-body">${state.logs.slice(0,250).map(l=>`<div class="log-line ${l.level||'info'}">[${l.timestamp}] ${l.message||''}</div>`).join('')}</div></details>`;}
-    const renderers={runtime:renderRuntime,trades:renderTrades,logs:renderLogs};
+    function renderPrice(){return `<details class="panel" open><summary><span>BTC Price</span></summary><div class="panel-body"><div class="stat"><div class="label">USD</div><div class="value">${state.btcPrice!==null?`$${Number(state.btcPrice).toFixed(2)}`:'-'}</div></div></div></details>`;}
+    function renderMarkets(){return `<details class="panel" open><summary><span>Markets</span><span class="summary-meta">${state.markets.length}</span></summary><div class="panel-body">${state.markets.slice(0,100).map(m=>`<div class="item"><header><span>${m.slug||'?'}</span><span>${ts(m.createdAt||m.seenAt)}</span></header><div>Price: ${m.price||'-'}</div></div>`).join('')}</div></details>`;}
+    const renderers={runtime:renderRuntime,trades:renderTrades,price:renderPrice,markets:renderMarkets,logs:renderLogs};
     function scheduleRender(...keys){if(keys.length===0){dirty.add('chrome');dirty.add('topStats');for(const k of Object.keys(renderers))dirty.add(k);}else{keys.forEach(k=>dirty.add(k));}if(renderScheduled)return;renderScheduled=true;requestAnimationFrame(flushRender);}
     function flushRender(){renderScheduled=false;if(dirty.has('chrome')){connectionEl.textContent=state.runtime.connected?'Live':'Waiting';runtimeLabelEl.textContent=state.runtime.dashboardUrl||'Beat Runtime Dashboard';dirty.delete('chrome');}if(dirty.has('topStats')){renderTop();dirty.delete('topStats');}for(const k of Object.keys(renderers)){if(dirty.has(k)){sectionsEl.querySelector(`[data-section='${k}']`).innerHTML=renderers[k]();dirty.delete(k);}}
     }
     function initSections(){sectionsEl.innerHTML=Object.keys(renderers).map(k=>`<div data-section='${k}'></div>`).join('');}
-    function handleEvent(type,data){if(type==='runtime'){state.runtime={...state.runtime,...data};scheduleRender('runtime','topStats');}else if(type==='stats'){state.stats={...state.stats,...data};scheduleRender('topStats');}else if(type==='trade'){state.recentTrades=[data,...state.recentTrades].slice(0,100);scheduleRender('trades');}else if(type==='log'){state.logs=[data,...state.logs].slice(0,250);scheduleRender('logs');}}
+    function handleEvent(type,data){if(type==='runtime'){state.runtime={...state.runtime,...data};scheduleRender('runtime','topStats');}else if(type==='stats'){state.stats={...state.stats,...data};scheduleRender('topStats');}else if(type==='trade'){state.recentTrades=[data,...state.recentTrades].slice(0,100);scheduleRender('trades');}else if(type==='log'){state.logs=[data,...state.logs].slice(0,250);scheduleRender('logs');}else if(type==='price'){state.btcPrice=data;scheduleRender('price');}else if(type==='market'){state.markets=[data,...state.markets].slice(0,100);scheduleRender('markets');}}
     const ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws');
     ws.addEventListener('open',()=>{state.runtime.connected=true;scheduleRender();});
     ws.addEventListener('close',()=>{state.runtime.connected=false;scheduleRender();});
