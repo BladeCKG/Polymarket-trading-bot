@@ -1,6 +1,7 @@
+import axios from 'axios';
 import { EventEmitter } from 'events';
 import WebSocket from 'ws';
-import { BTC_PRICE_PRODUCT_ID, BTC_PRICE_WS_URL } from '../config.js';
+import { BTC_PRICE_PRODUCT_ID, BTC_PRICE_REST_URL, BTC_PRICE_WS_URL } from '../config.js';
 import logger from '../logger.js';
 
 export class BtcPriceFeed extends EventEmitter {
@@ -35,6 +36,34 @@ export class BtcPriceFeed extends EventEmitter {
 
   getLatest() {
     return this._latest;
+  }
+
+  async fetchRestTick(timeoutMs = 5_000) {
+    const res = await axios.get(BTC_PRICE_REST_URL, { timeout: timeoutMs });
+    const payload = res?.data ?? {};
+    const price = Number(payload.price);
+    if (!Number.isFinite(price)) {
+      throw new Error('BTC REST price response missing numeric price');
+    }
+
+    const tick = {
+      price,
+      bestBid: this._latest?.bestBid ?? null,
+      bestAsk: this._latest?.bestAsk ?? null,
+      productId: this.productId,
+      timeMs: Date.now(),
+      isoTime: new Date().toISOString(),
+    };
+
+    this._latest = tick;
+    this.emit('tick', tick);
+    for (const waiter of [...this._waiters]) {
+      if (tick.timeMs >= waiter.timestampMs) {
+        waiter.resolve(tick);
+      }
+    }
+
+    return tick;
   }
 
   async waitForTickAfter(timestampMs, timeoutMs = 20_000) {

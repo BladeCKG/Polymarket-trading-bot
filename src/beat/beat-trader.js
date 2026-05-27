@@ -136,7 +136,7 @@ export class BeatTrader {
       this._publishMarket({
         status: 'OPEN',
         phase: PHASE.CAPTURE_BEAT,
-        tradeStatus: 'waiting for beat price',
+        tradeStatus: 'capturing beat price',
       });
       this.beatPrice = await this._captureBeatPrice(windowTs);
 
@@ -203,7 +203,16 @@ export class BeatTrader {
   }
 
   async _captureBeatPrice(windowTs) {
-    const tick = await this._btcFeed.waitForTickAfter(windowTs * 1000, 20_000);
+    let tick = null;
+    try {
+      tick = await this._btcFeed.fetchRestTick();
+    } catch (err) {
+      this.log.warn('BeatTrader: REST beat capture failed, falling back to live BTC tick', { err: err.message });
+      tick = this._btcFeed.getLatest();
+      if (!tick) {
+        tick = await this._btcFeed.waitForTickAfter(windowTs * 1000, 20_000);
+      }
+    }
     this.latestBtcTick = tick;
     this._publishMarket({
       status: 'LIVE',
@@ -630,7 +639,7 @@ export class BeatTrader {
       upBestAsk: patch.upBestAsk ?? this.latestQuotes.up?.ask?.price ?? null,
       downBestBid: patch.downBestBid ?? this.latestQuotes.down?.bid?.price ?? null,
       downBestAsk: patch.downBestAsk ?? this.latestQuotes.down?.ask?.price ?? null,
-      tradeStatus: patch.tradeStatus ?? (this.tradeSummary?.buyShares > 0 ? 'monitoring' : 'watching'),
+      tradeStatus: patch.tradeStatus ?? this._defaultTradeStatus(),
       chosenSide: patch.chosenSide ?? this.tradeSummary?.chosenSide ?? null,
       buyShares: patch.buyShares ?? this.tradeSummary?.buyShares ?? 0,
       buyUsdc: patch.buyUsdc ?? this.tradeSummary?.buyUsdc ?? 0,
@@ -641,5 +650,16 @@ export class BeatTrader {
       settledAt: patch.settledAt ?? null,
       updatedAt: Date.now(),
     });
+  }
+
+  _defaultTradeStatus() {
+    if (this.phase === PHASE.CAPTURE_BEAT) return 'capturing beat price';
+    if (this.phase === PHASE.WAITING) return 'waiting for skip';
+    if (this.phase === PHASE.LIVE) return this.tradeSummary?.buyShares > 0 ? 'buy placed' : 'monitoring';
+    if (this.phase === PHASE.CLOSING) return 'closed for buying';
+    if (this.phase === PHASE.RESOLVING) return 'resolving';
+    if (this.phase === PHASE.DONE) return this.tradeSummary?.buyShares > 0 ? 'settled' : 'settled without trade';
+    if (this.phase === PHASE.HALTED) return 'halted';
+    return 'waiting for open';
   }
 }

@@ -541,7 +541,7 @@
     function renderMarketCard(market) {
       const settled = Boolean(market.settled);
       const preOpen = isPreOpenMarket(market);
-      const statusText = settled ? 'settled' : (preOpen ? 'upcoming' : (market.tradeStatus || market.status || 'watching'));
+      const statusText = settled ? 'settled' : (preOpen ? 'upcoming' : (market.tradeStatus || market.status || 'monitoring'));
       const beat = market.beatPrice ?? state.btcPrice;
       const liveBtc = market.btcPrice ?? state.btcPrice;
       const btcMove = Number.isFinite(Number(liveBtc)) && Number.isFinite(Number(beat))
@@ -572,7 +572,7 @@
             <div class="metric"><div class="label">Down Bid</div><div class="value">${price(market.downBestBid)}</div></div>
             <div class="metric"><div class="label">Down Ask</div><div class="value">${price(market.downBestAsk)}</div></div>
             <div class="metric"><div class="label">Trade Status</div><div class="value small">${statusText}</div></div>
-            <div class="metric"><div class="label">Settlement</div><div class="value small">${settled ? (market.outcome || '-') : (preOpen ? countdown(market.windowOpenAt) : countdown(market.windowCloseAt))}</div></div>
+            <div class="metric"><div class="label">Settlement</div><div class="value small">${settled ? (market.outcome || '-') : (preOpen ? '' : countdown(market.windowCloseAt))}</div></div>
           </div>
           ${settled ? tradeSummary(market) : ''}
         </article>
