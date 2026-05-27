@@ -28,7 +28,8 @@ export class BeatDashboardServer {
       config,
       stats: {},
       recentTrades: [],
-      logs: [],
+      btcPrice: null,
+      markets: [],
     };
     this._server = null;
     this._wss = null;
@@ -93,9 +94,15 @@ export class BeatDashboardServer {
     this.broadcast('stats', this.state.stats);
   }
 
-  recordTrade(trade) {
-    truncatePush(this.state.recentTrades, trade);
-    this.broadcast('trade', trade);
+  recordPrice(price) {
+    this.state.btcPrice = price;
+    this.broadcast('price', price);
+  }
+
+  recordMarket(market) {
+    // Expect market object with slug, createdAt, price, stats etc.
+    truncatePush(this.state.markets, market);
+    this.broadcast('market', market);
   }
 
   broadcast(type, data) {
