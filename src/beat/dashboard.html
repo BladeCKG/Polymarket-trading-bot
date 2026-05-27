@@ -450,6 +450,7 @@
       const text = String(value || '').toLowerCase();
       if (text.includes('settled')) return 'settled';
       if (text.includes('buy') || text.includes('live') || text.includes('monitor')) return 'live';
+      if (text.includes('resolv')) return 'waiting';
       if (text.includes('wait') || text.includes('discover') || text.includes('watch')) return 'waiting';
       if (text.includes('error') || text.includes('fail')) return 'error';
       return 'waiting';
@@ -465,10 +466,39 @@
       return Number.isFinite(closeMs) ? closeMs : null;
     }
 
-    function isPreOpenMarket(market) {
-      if (market?.settled) return false;
-      const openMs = getWindowOpenMs(market);
-      return Boolean(openMs && Date.now() < openMs);
+    const LIFECYCLE_ORDER = {
+      upcoming: 0,
+      'waiting for skip': 1,
+      monitoring: 2,
+      resolving: 3,
+      halted: 4,
+      settled: 5,
+    };
+
+    function marketLifecycle(market) {
+      return String(market?.lifecycle ?? '').trim().toLowerCase();
+    }
+
+    function marketStatusText(market) {
+      return marketLifecycle(market);
+    }
+
+    function marketRank(market) {
+      return LIFECYCLE_ORDER[marketLifecycle(market)] ?? -1;
+    }
+
+    function isSettledMarket(market) {
+      return marketLifecycle(market) === 'settled';
+    }
+
+    function sortMarketsForView(markets) {
+      return [...markets].sort((a, b) => {
+        const stageDiff = marketRank(a) - marketRank(b);
+        if (stageDiff !== 0) return stageDiff;
+        const aTs = Number(a?.windowTs ?? 0);
+        const bTs = Number(b?.windowTs ?? 0);
+        return aTs - bTs;
+      });
     }
 
     function outcomeLabel(market) {
@@ -517,8 +547,8 @@
 
     function renderTop() {
       const markets = Array.isArray(state.markets) ? state.markets : [];
-      const live = markets.filter((m) => !m.settled);
-      const settled = markets.filter((m) => m.settled);
+      const live = sortMarketsForView(markets.filter((m) => !isSettledMarket(m)));
+      const settled = sortMarketsForView(markets.filter((m) => isSettledMarket(m)));
       const traded = markets.filter((m) => Number(m.buyShares || 0) > 0);
       const pnl = settled.reduce((sum, m) => sum + Number(m.pnl || 0), 0);
       const btc = state.btcPrice ?? live[0]?.btcPrice ?? settled[0]?.btcPrice ?? live[0]?.beatPrice ?? settled[0]?.beatPrice;
@@ -539,9 +569,10 @@
     }
 
     function renderMarketCard(market) {
-      const settled = Boolean(market.settled);
-      const preOpen = isPreOpenMarket(market);
-      const statusText = settled ? 'settled' : (preOpen ? 'upcoming' : (market.tradeStatus || market.status || 'monitoring'));
+      const lifecycle = marketLifecycle(market);
+      const settled = lifecycle === 'settled';
+      const preOpen = lifecycle === 'upcoming';
+      const statusText = marketStatusText(market);
       const beat = market.beatPrice ?? state.btcPrice;
       const liveBtc = market.btcPrice ?? state.btcPrice;
       const btcMove = Number.isFinite(Number(liveBtc)) && Number.isFinite(Number(beat))
@@ -554,13 +585,13 @@
         <article class="market-card ${settled ? 'settled' : ''}">
           <div class="market-head">
             <div class="market-name">
-              <div class="eyebrow">${settled ? 'Settled market' : (preOpen ? 'Upcoming market' : 'Live market')}</div>
+              <div class="eyebrow">${settled ? 'Settled market' : (preOpen ? 'Upcoming market' : (lifecycle === 'resolving' ? 'Resolving market' : 'Live market'))}</div>
               <h3>${market.slug || '?'}</h3>
             </div>
             <span class="status-chip ${chipClass(statusText)}">${statusText}</span>
           </div>
           <div class="market-meta">
-            <span>${settled ? `Settled ${ts(market.settledAt)}` : (preOpen ? `Opens in ${countdown(market.windowOpenAt)}` : `Settles in ${countdown(market.windowCloseAt)}`)}</span>
+            <span>${settled ? `Settled ${ts(market.settledAt)}` : (preOpen ? `Opens in ${countdown(market.windowOpenAt)}` : (lifecycle === 'waiting for skip' ? 'Waiting for skip' : (lifecycle === 'resolving' ? `Resolving ${countdown(market.windowCloseAt)}` : `Settles in ${countdown(market.windowCloseAt)}`)))}</span>
             <span>Updated ${ago(market.updatedAt)}</span>
             <span>Window open ${ts(getWindowOpenMs(market))}</span>
           </div>
@@ -581,8 +612,8 @@
 
     function renderMarkets() {
       const markets = Array.isArray(state.markets) ? state.markets : [];
-      const live = markets.filter((m) => !m.settled);
-      const settled = markets.filter((m) => m.settled);
+      const live = sortMarketsForView(markets.filter((m) => !isSettledMarket(m)));
+      const settled = sortMarketsForView(markets.filter((m) => isSettledMarket(m)));
 
       const liveHtml = live.length
         ? live.map(renderMarketCard).join('')

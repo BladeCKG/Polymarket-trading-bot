@@ -12,10 +12,11 @@ import { BeatDashboardServer } from './dashboard.js';
 import logger from '../logger.js';
 import { ClobClient } from '../clob.js';
 import { getSigner, ensureApprovals } from '../onchain.js';
-import { fetchMarketWithRetry, msUntil, nextWindowTs, slugFor } from '../market.js';
+import { fetchMarketWithRetry, currentWindowTs, msUntil, nextWindowTs, slugFor } from '../market.js';
 import { PnlTracker } from '../pnl.js';
 import { BeatTrader } from './beat-trader.js';
 import { BtcPriceFeed } from './btc-price-feed.js';
+import { BEAT_LIFECYCLE } from './lifecycle.js';
 
 const MIN_WEB3_PRC_PRICE = 0.983;
 
@@ -133,9 +134,8 @@ export async function main() {
             windowOpenAt: openMs,
             windowCloseAt: closeMs,
             conditionId: null,
-            status: 'DISCOVERED',
-            phase: 'INIT',
-            tradeStatus: 'waiting for open',
+            lifecycle: BEAT_LIFECYCLE.UPCOMING,
+            tradeStatus: 'upcoming',
             settled: false,
             updatedAt: Date.now(),
           });
@@ -159,9 +159,8 @@ export async function main() {
               windowOpenAt: openMs,
               windowCloseAt: closeMs,
               conditionId: market?.conditionId ?? null,
-              status: 'DISCOVERED',
-              phase: 'INIT',
-              tradeStatus: 'waiting for open',
+              lifecycle: BEAT_LIFECYCLE.UPCOMING,
+              tradeStatus: 'upcoming',
               settled: false,
               updatedAt: Date.now(),
             });
@@ -198,16 +197,11 @@ export async function main() {
       break;
     }
 
-    const wts = nextWindowTs();
+    const wts = currentWindowTs();
     const slug = slugFor(wts);
 
     let market;
     try {
-      const fetchDelay = msUntil(wts) - 30_000;
-      if (fetchDelay > 0) {
-        await sleep(fetchDelay);
-        if (stopping) break;
-      }
       market = await fetchMarketWithRetry(slug, 30, 3_000);
       if (dashboard) {
         dashboard.recordMarket({
@@ -216,9 +210,8 @@ export async function main() {
           windowOpenAt: wts * 1000,
           windowCloseAt: (wts + MARKET_WINDOW_SECONDS) * 1000,
           conditionId: market?.conditionId ?? null,
-          status: 'DISCOVERED',
-          phase: 'INIT',
-          tradeStatus: 'waiting for open',
+          lifecycle: BEAT_LIFECYCLE.UPCOMING,
+          tradeStatus: 'upcoming',
           settled: false,
           updatedAt: Date.now(),
         });

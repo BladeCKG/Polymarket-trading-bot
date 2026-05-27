@@ -21,21 +21,11 @@ import {
   STOP_BUYING_BEFORE_CLOSE,
 } from '../config.js';
 import { BtcPriceFeed } from './btc-price-feed.js';
+import { BEAT_LIFECYCLE } from './lifecycle.js';
 import { ClobClient } from '../clob.js';
 import { getTokenBalances, redeemPositions, sleep } from '../onchain.js';
 import { msUntil, waitForResolution } from '../market.js';
 import { marketLogger } from '../logger.js';
-
-const PHASE = {
-  INIT: 'INIT',
-  CAPTURE_BEAT: 'CAPTURE_BEAT',
-  WAITING: 'WAITING',
-  LIVE: 'LIVE',
-  CLOSING: 'CLOSING',
-  RESOLVING: 'RESOLVING',
-  DONE: 'DONE',
-  HALTED: 'HALTED',
-};
 
 function bestBid(book) {
   return Array.isArray(book?.bids) && book.bids.length
@@ -83,6 +73,15 @@ function estimateSharesFromBook(book, maxPrice, targetShares) {
   };
 }
 
+function tradeStatusFromLifecycle(lifecycle, hasTrade) {
+  if (lifecycle === BEAT_LIFECYCLE.WAITING_SKIP) return BEAT_LIFECYCLE.WAITING_SKIP;
+  if (lifecycle === BEAT_LIFECYCLE.MONITORING) return hasTrade ? 'buy placed' : BEAT_LIFECYCLE.MONITORING;
+  if (lifecycle === BEAT_LIFECYCLE.RESOLVING) return BEAT_LIFECYCLE.RESOLVING;
+  if (lifecycle === BEAT_LIFECYCLE.SETTLED) return hasTrade ? BEAT_LIFECYCLE.SETTLED : 'settled without trade';
+  if (lifecycle === BEAT_LIFECYCLE.HALTED) return 'halted';
+  return BEAT_LIFECYCLE.UPCOMING;
+}
+
 export class BeatTrader {
   constructor(market, wallet, pnl, { dashboard = null, btcFeed = null } = {}) {
     this.market = market;
@@ -91,7 +90,7 @@ export class BeatTrader {
     this.dashboard = dashboard;
     this.log = marketLogger(market.slug);
 
-    this.phase = PHASE.INIT;
+    this.lifecycle = BEAT_LIFECYCLE.UPCOMING;
     this.halted = false;
     this.balanceUp = 0;
     this.balanceDown = 0;
@@ -111,6 +110,7 @@ export class BeatTrader {
   async run() {
     const { windowTs, conditionId, upToken, downToken } = this.market;
     const windowClose = windowTs + MARKET_WINDOW_SECONDS;
+    const skipEndMs = (windowTs * 1000) + (BEAT_ENTRY_DELAY_SECONDS * 1000);
 
     this.log.info('BeatTrader: starting', {
       conditionId,
@@ -132,30 +132,30 @@ export class BeatTrader {
         await sleep(waitMs);
       }
 
-      this.phase = PHASE.CAPTURE_BEAT;
-      this._publishMarket({
-        status: 'OPEN',
-        phase: PHASE.CAPTURE_BEAT,
-        tradeStatus: 'capturing beat price',
-      });
       this.beatPrice = await this._captureBeatPrice(windowTs);
 
-      this.phase = PHASE.WAITING;
-      if (BEAT_ENTRY_DELAY_SECONDS > 0) {
+      const remainingSkipMs = skipEndMs - Date.now();
+      if (remainingSkipMs > 0) {
+        this.lifecycle = BEAT_LIFECYCLE.WAITING_SKIP;
+        this._publishMarket({
+          lifecycle: BEAT_LIFECYCLE.WAITING_SKIP,
+          tradeStatus: BEAT_LIFECYCLE.WAITING_SKIP,
+        });
         this.log.info('BeatTrader: skipping early market seconds', {
           skipSeconds: BEAT_ENTRY_DELAY_SECONDS,
           beatPrice: this.beatPrice,
+          waitMs: Math.round(remainingSkipMs),
         });
-        await sleep(BEAT_ENTRY_DELAY_SECONDS * 1000);
+        await sleep(remainingSkipMs);
       }
 
-      this.phase = PHASE.LIVE;
-      this._publishMarket({ status: 'LIVE', tradeStatus: 'monitoring' });
+      this.lifecycle = BEAT_LIFECYCLE.MONITORING;
+      this._publishMarket({ lifecycle: BEAT_LIFECYCLE.MONITORING, tradeStatus: BEAT_LIFECYCLE.MONITORING });
       await this._syncBalances(upToken.tokenId, downToken.tokenId);
       await this._monitorLoop(windowClose);
 
-      this.phase = PHASE.CLOSING;
-      this._publishMarket({ status: 'CLOSING', tradeStatus: 'closed for buying' });
+      this.lifecycle = BEAT_LIFECYCLE.RESOLVING;
+      this._publishMarket({ lifecycle: BEAT_LIFECYCLE.RESOLVING, tradeStatus: BEAT_LIFECYCLE.RESOLVING });
       await this._cancelAllOrders(conditionId);
     } finally {
       if (this._ownsBtcFeed) {
@@ -163,15 +163,15 @@ export class BeatTrader {
       }
     }
 
-    this.phase = PHASE.RESOLVING;
+    this.lifecycle = BEAT_LIFECYCLE.RESOLVING;
     await this._redeemPhase(conditionId, windowClose);
 
-    this.phase = PHASE.DONE;
+    this.lifecycle = BEAT_LIFECYCLE.SETTLED;
     this._publishMarket({
-      status: 'SETTLED',
+      lifecycle: BEAT_LIFECYCLE.SETTLED,
       settled: true,
       settledAt: this.lastSettledAt ?? Date.now(),
-      tradeStatus: this.tradeSummary?.buyShares > 0 ? 'settled' : 'settled without trade',
+      tradeStatus: tradeStatusFromLifecycle(BEAT_LIFECYCLE.SETTLED, this.tradeSummary?.buyShares > 0),
     });
     this.log.info('BeatTrader: market complete', {
       beatPrice: this.beatPrice,
@@ -217,9 +217,7 @@ export class BeatTrader {
     }
     this.latestBtcTick = tick;
     this._publishMarket({
-      status: 'LIVE',
-      phase: PHASE.CAPTURE_BEAT,
-      tradeStatus: 'captured beat price',
+      lifecycle: BEAT_LIFECYCLE.WAITING_SKIP,
       beatPrice: tick.price,
       btcPrice: tick.price,
       btcBestBid: tick.bestBid ?? null,
@@ -246,12 +244,11 @@ export class BeatTrader {
 
       try {
         const snapshot = await this._snapshotMarketState();
-        this._publishMarket({
-          ...snapshot,
-          status: 'LIVE',
-          phase: this.phase,
-          tradeStatus: this.tradeSummary?.buyShares > 0 ? 'buy placed' : 'monitoring',
-        });
+      this._publishMarket({
+        ...snapshot,
+        lifecycle: BEAT_LIFECYCLE.MONITORING,
+        tradeStatus: tradeStatusFromLifecycle(this.lifecycle, this.tradeSummary?.buyShares > 0),
+      });
         await this._maybeBuy(snapshot);
       } catch (err) {
         this.log.warn('BeatTrader: monitor iteration failed', { err: err.message });
@@ -384,7 +381,7 @@ export class BeatTrader {
       this._recordBuy(side, plan.spentUsdc / plan.fillShares, plan.fillShares);
       this.lastBuyAt = Date.now();
       this._publishTrade({
-        status: 'LIVE',
+        lifecycle: BEAT_LIFECYCLE.MONITORING,
         tradeStatus: BEAT_DRY_RUN ? 'dry-run buy placed' : 'buy placed',
         chosenSide: this.tradeSummary?.chosenSide ?? side,
         buyShares: this.tradeSummary?.buyShares ?? plan.fillShares,
@@ -424,9 +421,9 @@ export class BeatTrader {
 
     this._recordBuy(side, plan.avgFillPrice ?? bestAsk.price, plan.fillShares, plan.spentUsdc);
     this.lastBuyAt = Date.now();
-    this._publishTrade({
-      status: 'LIVE',
-      tradeStatus: BEAT_DRY_RUN ? 'dry-run buy placed' : 'buy placed',
+      this._publishTrade({
+        lifecycle: BEAT_LIFECYCLE.MONITORING,
+        tradeStatus: BEAT_DRY_RUN ? 'dry-run buy placed' : 'buy placed',
       chosenSide: this.tradeSummary?.chosenSide ?? side,
       buyShares: this.tradeSummary?.buyShares ?? plan.fillShares,
       buyUsdc: this.tradeSummary?.buyUsdc ?? plan.spentUsdc,
@@ -484,14 +481,14 @@ export class BeatTrader {
         balanceDown: this.balanceDown,
       });
       this.halted = true;
-      this.phase = PHASE.HALTED;
+      this.lifecycle = BEAT_LIFECYCLE.HALTED;
       return true;
     }
 
     if (this.totalSpent >= MAX_SPEND_PER_MARKET) {
       this.log.info('BeatTrader: spend cap reached', { totalSpent: this.totalSpent.toFixed(2) });
       this.halted = true;
-      this.phase = PHASE.HALTED;
+      this.lifecycle = BEAT_LIFECYCLE.HALTED;
       return true;
     }
 
@@ -552,7 +549,7 @@ export class BeatTrader {
     this.redeemedUsdc += estimatedPayout;
 
     this._publishMarket({
-      status: 'SETTLED',
+      lifecycle: BEAT_LIFECYCLE.SETTLED,
       settled: true,
       settledAt: this.lastSettledAt,
       outcome,
@@ -625,15 +622,16 @@ export class BeatTrader {
 
   _publishMarket(patch = {}) {
     if (!this.dashboard) return;
+    const lifecycle = patch.lifecycle ?? this.lifecycle;
+    const settled = patch.settled ?? lifecycle === BEAT_LIFECYCLE.SETTLED;
     this.dashboard.recordMarket({
       slug: this.market.slug,
       windowTs: this.market.windowTs,
       windowOpenAt: this.market.windowTs * 1000,
       windowCloseAt: (this.market.windowTs + MARKET_WINDOW_SECONDS) * 1000,
       conditionId: this.market.conditionId,
-      status: patch.status ?? (this.phase === PHASE.DONE ? 'SETTLED' : 'LIVE'),
-      phase: patch.phase ?? this.phase,
-      settled: Boolean(patch.settled ?? false),
+      lifecycle,
+      settled: Boolean(settled),
       beatPrice: patch.beatPrice ?? this.beatPrice,
       btcPrice: patch.btcPrice ?? this.latestBtcTick?.price ?? null,
       btcBestBid: patch.btcBestBid ?? this.latestBtcTick?.bestBid ?? null,
@@ -656,13 +654,6 @@ export class BeatTrader {
   }
 
   _defaultTradeStatus() {
-    if (this.phase === PHASE.CAPTURE_BEAT) return 'capturing beat price';
-    if (this.phase === PHASE.WAITING) return 'waiting for skip';
-    if (this.phase === PHASE.LIVE) return this.tradeSummary?.buyShares > 0 ? 'buy placed' : 'monitoring';
-    if (this.phase === PHASE.CLOSING) return 'closed for buying';
-    if (this.phase === PHASE.RESOLVING) return 'resolving';
-    if (this.phase === PHASE.DONE) return this.tradeSummary?.buyShares > 0 ? 'settled' : 'settled without trade';
-    if (this.phase === PHASE.HALTED) return 'halted';
-    return 'waiting for open';
+    return tradeStatusFromLifecycle(this.lifecycle, this.tradeSummary?.buyShares > 0);
   }
 }
