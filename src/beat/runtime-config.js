@@ -176,9 +176,10 @@ function coerceValue(key, value) {
 
 function priceFeedDefaultsFor(symbol) {
   const normalized = String(symbol ?? 'BTC').trim().toUpperCase();
+  const filterSymbol = `${normalized.toLowerCase()}usdt`;
   return {
-    BTC_PRICE_WS_URL: `wss://stream.binance.com:9443/ws/${normalized.toLowerCase()}usdt@ticker`,
-    BTC_PRICE_PRODUCT_ID: `${normalized}USDT`,
+    BTC_PRICE_WS_URL: 'wss://ws-live-data.polymarket.com',
+    BTC_PRICE_PRODUCT_ID: filterSymbol,
     BTC_PRICE_REST_URL: `https://api.binance.com/api/v3/ticker/price?symbol=${normalized}USDT`,
   };
 }

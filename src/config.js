@@ -220,16 +220,10 @@ export const BEAT_MARKET_SYMBOL = parseSymbol_('BEAT_MARKET_SYMBOL', BEAT_SYMBOL
 
 function priceFeedDefaultsFor(symbol) {
   const normalized = normalizeBeatSymbol(symbol, 'BTC');
-  if (normalized === 'ETH') {
-    return {
-      wsUrl: 'wss://stream.binance.com:9443/ws/ethusdt@ticker',
-      productId: 'ETHUSDT',
-      restUrl: 'https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT',
-    };
-  }
+  const filterSymbol = `${normalized.toLowerCase()}usdt`;
   return {
-    wsUrl: `wss://stream.binance.com:9443/ws/${normalized.toLowerCase()}usdt@ticker`,
-    productId: `${normalized.toUpperCase()}USDT`,
+    wsUrl: 'wss://ws-live-data.polymarket.com',
+    productId: filterSymbol,
     restUrl: `https://api.binance.com/api/v3/ticker/price?symbol=${normalized.toUpperCase()}USDT`,
   };
 }

@@ -114,32 +114,46 @@ export class BeatDashboardServer {
   recordPrice(tick) {
     if (tick && typeof tick === 'object') {
       const symbol = String(tick.symbol ?? 'BTC').toUpperCase();
+      const source = String(tick.source ?? 'rtds').toLowerCase();
       const next = {
         symbol,
+        source,
         price: Number.isFinite(Number(tick.price)) ? Number(tick.price) : null,
         bestBid: Number.isFinite(Number(tick.bestBid)) ? Number(tick.bestBid) : null,
         bestAsk: Number.isFinite(Number(tick.bestAsk)) ? Number(tick.bestAsk) : null,
-        updatedAt: tick.timeMs ?? Date.now(),
+        updatedAt: Number.isFinite(Number(tick.timeMs))
+          ? Number(tick.timeMs)
+          : (typeof tick.isoTime === 'string' ? Date.parse(tick.isoTime) : Date.now()),
+        isoTime: typeof tick.isoTime === 'string'
+          ? tick.isoTime
+          : new Date(
+            Number.isFinite(Number(tick.timeMs))
+              ? Number(tick.timeMs)
+              : Date.now(),
+          ).toISOString(),
       };
-      this.state.prices = {
-        ...this.state.prices,
-        [symbol]: next,
-      };
+      if (!this.state.prices[symbol]) {
+        this.state.prices[symbol] = {};
+      }
+      this.state.prices[symbol][source] = next;
       this.broadcast('price', next);
       return;
     }
     const symbol = 'BTC';
+    const source = 'default';
     const next = {
       symbol,
+      source,
       price: Number.isFinite(Number(tick)) ? Number(tick) : null,
       bestBid: null,
       bestAsk: null,
       updatedAt: Date.now(),
+      isoTime: new Date().toISOString(),
     };
-    this.state.prices = {
-      ...this.state.prices,
-      [symbol]: next,
-    };
+    if (!this.state.prices[symbol]) {
+      this.state.prices[symbol] = {};
+    }
+    this.state.prices[symbol][source] = next;
     this.broadcast('price', next);
   }
 

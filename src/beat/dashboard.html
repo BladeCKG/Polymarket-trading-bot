@@ -410,6 +410,32 @@
     .log-line.warn { border-left: 4px solid var(--warn); }
     .log-line.error { border-left: 4px solid var(--bad); }
 
+    .price-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.84rem;
+    }
+
+    .price-table th,
+    .price-table td {
+      padding: 6px 4px;
+      border-bottom: 1px solid rgba(15, 118, 110, 0.08);
+      text-align: left;
+      vertical-align: top;
+    }
+
+    .price-table th:last-child,
+    .price-table td:last-child {
+      text-align: right;
+    }
+
+    .price-table th {
+      color: var(--muted);
+      font-size: 0.72rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+
     .empty {
       padding: 18px;
       color: var(--muted);
@@ -536,6 +562,15 @@
       return Number.isFinite(n) ? '$' + n.toFixed(4) : '-';
     }
 
+    function exactPrice(v) {
+      const n = Number(v);
+      if (!Number.isFinite(n)) return '-';
+      return '$' + n.toLocaleString(undefined, {
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 8,
+      });
+    }
+
     function signedMoney(v, digits = 2) {
       const n = Number(v);
       if (!Number.isFinite(n)) return '-';
@@ -602,8 +637,28 @@
         .filter((sym) => sym !== '');
     }
 
-    function priceFor(symbol) {
-      return state.prices?.[String(symbol ?? 'BTC').toUpperCase()]?.price ?? null;
+    function priceEntriesFor(symbol) {
+      const sources = state.prices?.[String(symbol ?? 'BTC').toUpperCase()] ?? {};
+      return Object.entries(sources)
+        .map(([source, data]) => ({
+          source,
+          symbol: String(symbol ?? 'BTC').toUpperCase(),
+          price: data?.price != null && Number.isFinite(Number(data.price)) ? Number(data.price) : null,
+          bestBid: data?.bestBid != null && Number.isFinite(Number(data.bestBid)) ? Number(data.bestBid) : null,
+          bestAsk: data?.bestAsk != null && Number.isFinite(Number(data.bestAsk)) ? Number(data.bestAsk) : null,
+          updatedAt: data?.updatedAt != null && Number.isFinite(Number(data.updatedAt)) ? Number(data.updatedAt) : null,
+          isoTime: data?.isoTime || null,
+        }))
+        .sort((a, b) => {
+          const tsDiff = Number(b.updatedAt ?? 0) - Number(a.updatedAt ?? 0);
+          if (tsDiff !== 0) return tsDiff;
+          return String(a.source).localeCompare(String(b.source));
+        });
+    }
+
+    function bestPriceSnapshotFor(symbol) {
+      const entries = priceEntriesFor(symbol);
+      return entries.length ? entries[0] : null;
     }
 
     function beatSymbol(market) {
@@ -775,22 +830,52 @@
       const traded = markets.filter((m) => Number(m.buyShares || 0) > 0);
       const pnl = settled.reduce((sum, m) => sum + Number(m.pnl || 0), 0);
       const symbols = activeBeatSymbols();
-      const priceStats = symbols.map((symbol) => [`${symbol} Price`, money(priceFor(symbol))]);
+      
+      const priceStats = symbols.map((symbol) => {
+        const sourceList = priceEntriesFor(symbol);
+        
+        return {
+          label: `${symbol} Prices (${sourceList.length} source${sourceList.length !== 1 ? 's' : ''})`,
+          html: sourceList.length > 0 ? `
+            <table class="price-table">
+              <thead>
+                <tr>
+                  <th>Source</th>
+                  <th>Price</th>
+                  <th>Bid / Ask</th>
+                  <th>Timestamp</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${sourceList.map(({ source, price: sourcePrice, bestBid, bestAsk, updatedAt }) => `
+                  <tr>
+                    <td>${escapeHtml(source)}</td>
+                    <td>${exactPrice(sourcePrice)}</td>
+                    <td>${price(bestBid)} / ${price(bestAsk)}</td>
+                    <td>${updatedAt ? `${ts(updatedAt)}<br><span style="color:var(--muted);font-size:0.78rem;">${ago(updatedAt)}</span>` : '-'}</td>
+                  </tr>
+                `).join('')}
+              </tbody>
+            </table>
+          ` : 'No prices',
+          isTable: true,
+        };
+      });
+      
       const stats = [
         ...priceStats,
-        ['Live Markets', String(live.length)],
-        ['Settled Markets', String(settled.length)],
-        ['Traded Markets', String(traded.length)],
-        ['Realized PnL', money(pnl)],
+        { label: 'Live Markets', value: String(live.length), hint: state.runtime.mode ? `Mode: ${state.runtime.mode}` : '' },
+        { label: 'Settled Markets', value: String(settled.length), hint: state.runtime.mode ? `Mode: ${state.runtime.mode}` : '' },
+        { label: 'Traded Markets', value: String(traded.length), hint: state.runtime.mode ? `Mode: ${state.runtime.mode}` : '' },
+        { label: 'Realized PnL', value: money(pnl), hint: state.runtime.mode ? `Mode: ${state.runtime.mode}` : '' },
       ];
 
-      topStatsEl.innerHTML = stats.map(([label, value]) => `
-        <article class="stat">
-          <div class="label">${label}</div>
-          <div class="value">${value}</div>
-          <div class="hint">${state.runtime.mode ? `Mode: ${state.runtime.mode}` : ''}</div>
-        </article>
-      `).join('');
+      topStatsEl.innerHTML = stats.map(({ label, value, hint, html, isTable }) => {
+        if (isTable) {
+          return `<article class="stat" style="grid-column:1/-1;"><div class="label">${label}</div><div style="overflow-x:auto;">${html}</div></article>`;
+        }
+        return `<article class="stat"><div class="label">${label}</div><div class="value">${value}</div><div class="hint">${hint}</div></article>`;
+      }).join('');
     }
 
     function renderMarketCard(market) {
@@ -799,8 +884,9 @@
       const preOpen = lifecycle === 'upcoming';
       const statusText = marketStatusText(market);
       const symbol = beatSymbol(market);
+      const latestSnapshot = bestPriceSnapshotFor(symbol);
       const traded = Boolean(market.tradeOccurred || Number(market.buyShares || 0) > 0);
-      const symbolPrice = priceFor(symbol);
+      const symbolPrice = latestSnapshot?.price ?? null;
       const beat = market.beatPrice ?? symbolPrice;
       const livePrice = market.btcPrice ?? symbolPrice;
       const move = !settled && Number.isFinite(Number(livePrice)) && Number.isFinite(Number(beat))
@@ -838,6 +924,7 @@
           </div>
           <div class="metric-grid">
             <div class="metric"><div class="label">Beat ${symbol}</div><div class="value">${money(beat)}</div></div>
+            <div class="metric"><div class="label">Latest Source</div><div class="value small">${latestSnapshot ? `${latestSnapshot.source} @ ${ts(latestSnapshot.updatedAt)}` : '-'}</div></div>
             ${!settled ? `<div class="metric"><div class="label">${moveLabel}</div><div class="value ${moveValueClass}">${moveValueText}</div></div>` : ''}
             ${traded && !settled ? `<div class="metric"><div class="label">Simulated If Up</div><div class="value ${pnlIfUp >= 0 ? 'summary-positive' : 'summary-negative'}">${money(pnlIfUp)}</div></div><div class="metric"><div class="label">Simulated If Down</div><div class="value ${pnlIfDown >= 0 ? 'summary-positive' : 'summary-negative'}">${money(pnlIfDown)}</div></div>` : ''}
             <div class="metric"><div class="label">Up Bid</div><div class="value">${price(market.upBestBid)}</div></div>
@@ -1040,17 +1127,20 @@
         scheduleRender('logs');
       } else if (type === 'price') {
         const symbol = String(data?.symbol ?? 'BTC').toUpperCase();
+        const source = String(data?.source ?? 'default').toLowerCase();
         const next = {
           symbol,
+          source,
           price: data?.price != null && Number.isFinite(Number(data.price)) ? Number(data.price) : null,
           bestBid: data?.bestBid != null && Number.isFinite(Number(data.bestBid)) ? Number(data.bestBid) : null,
           bestAsk: data?.bestAsk != null && Number.isFinite(Number(data.bestAsk)) ? Number(data.bestAsk) : null,
           updatedAt: data?.updatedAt ?? Date.now(),
+          isoTime: data?.isoTime || null,
         };
-        state.prices = {
-          ...state.prices,
-          [symbol]: next,
-        };
+        if (!state.prices[symbol]) {
+          state.prices[symbol] = {};
+        }
+        state.prices[symbol][source] = next;
         scheduleRender('topStats', 'markets');
       } else if (type === 'market') {
         const slug = data?.slug;

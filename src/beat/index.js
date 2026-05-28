@@ -14,18 +14,39 @@ import { BtcPriceFeed } from './btc-price-feed.js';
 import { BEAT_LIFECYCLE } from './lifecycle.js';
 import { applyBeatRuntimeConfigPatch, createBeatRuntimeConfig } from './runtime-config.js';
 
-function feedDefaultsFor(symbol) {
-  const normalized = String(symbol ?? 'BTC').trim().toUpperCase();
-  return {
-    wsUrl: `wss://stream.binance.com:9443/ws/${normalized.toLowerCase()}usdt@ticker`,
-    productId: `${normalized.toUpperCase()}USDT`,
-    restUrl: `https://api.binance.com/api/v3/ticker/price?symbol=${normalized.toUpperCase()}USDT`,
-  };
-}
+const PRICE_FEED_SOURCE_ORDER = ['rtds', 'binance', 'coinbase', 'okx', 'hyperliquid'];
 
-function symbolFromSlug(slug) {
-  if (!slug || typeof slug !== 'string') return 'BTC';
-  return String(slug).split('-')[0].toUpperCase();
+function feedConfigsFor(symbol) {
+  const normalized = String(symbol ?? 'BTC').trim().toUpperCase();
+  const restUrl = `https://api.binance.com/api/v3/ticker/price?symbol=${normalized}USDT`;
+  return {
+    rtds: {
+      url: 'wss://ws-live-data.polymarket.com',
+      productId: `${normalized.toLowerCase()}usdt`,
+      topic: 'crypto_prices',
+      restUrl,
+    },
+    binance: {
+      url: `wss://stream.binance.com:9443/ws/${normalized.toLowerCase()}usdt@ticker`,
+      productId: `${normalized}USDT`,
+      restUrl,
+    },
+    coinbase: {
+      url: 'wss://ws-feed.exchange.coinbase.com',
+      productId: `${normalized}-USD`,
+      restUrl,
+    },
+    okx: {
+      url: 'wss://ws.okx.com:8443/ws/v5/public',
+      productId: `${normalized}-USDT`,
+      restUrl,
+    },
+    hyperliquid: {
+      url: 'wss://api.hyperliquid.xyz/ws',
+      productId: normalized,
+      restUrl,
+    },
+  };
 }
 
 const MIN_WEB3_PRC_PRICE = 0.983;
@@ -87,6 +108,7 @@ export async function main() {
     ? beatConfig.BEAT_SYMBOLS
     : [beatConfig.BEAT_MARKET_SYMBOL];
   const priceFeeds = new Map();
+  const primaryPriceFeeds = new Map();
   let dashboard = null;
   if (beatConfig.BEAT_DASHBOARD_ENABLED) {
     dashboard = new BeatDashboardServer({
@@ -110,20 +132,25 @@ export async function main() {
   }
 
   for (const symbol of symbols) {
-    const defaults = feedDefaultsFor(symbol);
-    const feed = new BtcPriceFeed({
-      url: defaults.wsUrl,
-      productId: defaults.productId,
-      restUrl: defaults.restUrl,
-    });
-    feed.on('tick', (tick) => {
-      dashboard?.recordPrice({ ...tick, symbol });
-    });
-    feed.on('error', (err) => {
-      logger.warn('Beat main: price feed error', { symbol, err: err.message });
-    });
-    feed.start();
-    priceFeeds.set(symbol, feed);
+    const feedConfigs = feedConfigsFor(symbol);
+    for (const source of PRICE_FEED_SOURCE_ORDER) {
+      const feedConfig = feedConfigs[source];
+      const feed = new BtcPriceFeed({
+        ...feedConfig,
+        source,
+      });
+      feed.on('tick', (tick) => {
+        dashboard?.recordPrice({ ...tick, symbol, source });
+      });
+      feed.on('error', (err) => {
+        logger.warn('Beat main: price feed error', { symbol, source, err: err.message });
+      });
+      feed.start();
+      priceFeeds.set(`${symbol}-${source}`, feed);
+      if (!primaryPriceFeeds.has(symbol)) {
+        primaryPriceFeeds.set(symbol, feed);
+      }
+    }
   }
 
   const pnl = new PnlTracker();
@@ -269,7 +296,7 @@ export async function main() {
 
       if (stopping) return;
 
-      const symbolFeed = priceFeeds.get(symbol);
+      const symbolFeed = primaryPriceFeeds.get(symbol) ?? priceFeeds.get(`${symbol}-rtds`) ?? priceFeeds.get(`${symbol}-binance`);
       const symbolMomentsKey = `BEAT_MOMENTS_${String(symbol ?? '').toUpperCase()}`;
       const symbolMoments = beatConfig[symbolMomentsKey] || beatConfig.BEAT_MOMENTS;
       const traderConfig = {
