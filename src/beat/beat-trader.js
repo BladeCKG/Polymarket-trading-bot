@@ -187,6 +187,8 @@ export class BeatTrader {
         return;
       }
 
+      await this._primeCurrentBtcTick();
+
       // Determine first allowed buy time from the symbol-specific moments.
       const firstAllowedMs = (windowTs + firstStart) * 1000;
       const remainingSkipMs = firstAllowedMs - Date.now();
@@ -295,13 +297,9 @@ export class BeatTrader {
       );
     }
 
-    this.latestBtcTick = tick;
     this._publishMarket({
       lifecycle: BEAT_LIFECYCLE.WAITING_SKIP,
       beatPrice: tick.price,
-      btcPrice: tick.price,
-      btcBestBid: tick.bestBid ?? null,
-      btcBestAsk: tick.bestAsk ?? null,
     });
     this.log.info('BeatTrader: captured BTC beat price', {
       beatPrice: tick.price,
@@ -321,6 +319,34 @@ export class BeatTrader {
       tick,
     });
     return tick.price;
+  }
+
+  async _primeCurrentBtcTick() {
+    if (this.latestBtcTick && !this.latestBtcTick.historical && Number.isFinite(Number(this.latestBtcTick.price))) {
+      return this.latestBtcTick;
+    }
+
+    try {
+      const refreshed = await this._btcFeed.fetchRestTick(1_500);
+      if (refreshed && Number.isFinite(Number(refreshed.price))) {
+        this.latestBtcTick = refreshed;
+        this._recordAudit('current_btc_tick_primed', {
+          strategy: 'rest',
+          source: refreshed.source,
+          btcPrice: refreshed.price,
+          btcTime: refreshed.isoTime,
+        });
+        return refreshed;
+      }
+    } catch (err) {
+      this.log.debug('BeatTrader: current BTC refresh failed before monitoring', { err: err.message });
+      this._recordAudit('current_btc_tick_prime_failed', {
+        strategy: 'rest',
+        err: err.message,
+      });
+    }
+
+    return null;
   }
 
   async _monitorLoop(windowClose) {
@@ -399,13 +425,26 @@ export class BeatTrader {
       down: { book: downBook, bid: downBid, ask: downAsk },
     };
 
+    const secondsAfterOpen = Math.max(0, Math.round((Date.now() - (this.market.windowTs * 1000)) / 1000));
+    const btcPrice = Number.isFinite(Number(this.latestBtcTick?.price)) ? Number(this.latestBtcTick.price) : null;
+    const beatPrice = Number.isFinite(Number(this.beatPrice)) ? Number(this.beatPrice) : null;
+    const upAskPrice = Number.isFinite(Number(upAsk?.price)) ? Number(upAsk.price) : null;
+    const downAskPrice = Number.isFinite(Number(downAsk?.price)) ? Number(downAsk.price) : null;
+    const chartPoint = {
+      second: secondsAfterOpen,
+      move: Number.isFinite(btcPrice) && Number.isFinite(beatPrice) ? btcPrice - beatPrice : null,
+      upAsk: upAskPrice,
+      downAsk: downAskPrice,
+    };
+
     return {
       upBestBid: upBid?.price ?? null,
       upBestAsk: upAsk?.price ?? null,
       downBestBid: downBid?.price ?? null,
       downBestAsk: downAsk?.price ?? null,
-      beatPrice: this.beatPrice,
-      btcPrice: this.latestBtcTick?.price ?? null,
+      beatPrice,
+      btcPrice,
+      chartPoint,
     };
   }
 
@@ -1211,6 +1250,7 @@ export class BeatTrader {
       upBestAsk: patch.upBestAsk ?? this.latestQuotes.up?.ask?.price ?? null,
       downBestBid: patch.downBestBid ?? this.latestQuotes.down?.bid?.price ?? null,
       downBestAsk: patch.downBestAsk ?? this.latestQuotes.down?.ask?.price ?? null,
+      chartPoint: patch.chartPoint ?? null,
       tradeStatus: patch.tradeStatus ?? this._defaultTradeStatus(),
       chosenSide: patch.chosenSide ?? this.tradeSummary?.chosenSide ?? null,
       buyShares: patch.buyShares ?? this.tradeSummary?.buyShares ?? 0,

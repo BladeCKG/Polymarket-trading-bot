@@ -4,7 +4,7 @@ import { WebSocketServer } from 'ws';
 import logger, { subscribeLogs } from '../logger.js';
 
 const MAX_LOGS = 250;
-const MAX_MARKETS = 80;
+const MAX_GRAPH_SECONDS = 300;
 const DASHBOARD_HTML = readFileSync(new URL('./dashboard.html', import.meta.url), 'utf8');
 
 function htmlPage() {
@@ -17,6 +17,29 @@ function clone(value) {
 
 function truncate(list, max) {
   if (list.length > max) list.length = max;
+}
+
+function finiteNumberOrNull(value) {
+  const num = Number(value);
+  return Number.isFinite(num) ? num : null;
+}
+
+function appendSeriesPoint(series, second, value) {
+  if (!Number.isFinite(second) || second < 0 || second > MAX_GRAPH_SECONDS) return Array.isArray(series) ? series : [];
+  if (!Number.isFinite(value)) return Array.isArray(series) ? series : [];
+
+  const next = Array.isArray(series) ? [...series] : [];
+  const point = { second, value };
+  const existingIndex = next.findIndex((entry) => Number(entry?.second) === second);
+  if (existingIndex >= 0) {
+    next[existingIndex] = point;
+  } else {
+    next.push(point);
+  }
+
+  return next
+    .filter((entry) => Number.isFinite(Number(entry?.second)) && Number.isFinite(Number(entry?.value)))
+    .sort((a, b) => Number(a.second) - Number(b.second));
 }
 
 export class BeatDashboardServer {
@@ -161,17 +184,43 @@ export class BeatDashboardServer {
     if (!patch?.slug) return;
     const slug = String(patch.slug);
     const existing = this._marketIndex.get(slug) ?? { slug };
+    const updatedAt = patch.updatedAt ?? Date.now();
     const next = {
       ...existing,
       ...clone(patch),
       slug,
-      updatedAt: patch.updatedAt ?? Date.now(),
+      updatedAt,
     };
+    const chartHistory = {
+      move: Array.isArray(existing.chartHistory?.move) ? [...existing.chartHistory.move] : [],
+      upAsk: Array.isArray(existing.chartHistory?.upAsk) ? [...existing.chartHistory.upAsk] : [],
+      downAsk: Array.isArray(existing.chartHistory?.downAsk) ? [...existing.chartHistory.downAsk] : [],
+    };
+    const chartPoint = patch?.chartPoint && typeof patch.chartPoint === 'object'
+      ? patch.chartPoint
+      : null;
+    const second = finiteNumberOrNull(chartPoint?.second);
+    const move = finiteNumberOrNull(chartPoint?.move);
+    const upAsk = finiteNumberOrNull(chartPoint?.upAsk);
+    const downAsk = finiteNumberOrNull(chartPoint?.downAsk);
+
+    if (Number.isFinite(second)) {
+      if (Number.isFinite(move)) {
+        chartHistory.move = appendSeriesPoint(chartHistory.move, second, move);
+      }
+      if (Number.isFinite(upAsk)) {
+        chartHistory.upAsk = appendSeriesPoint(chartHistory.upAsk, second, upAsk);
+      }
+      if (Number.isFinite(downAsk)) {
+        chartHistory.downAsk = appendSeriesPoint(chartHistory.downAsk, second, downAsk);
+      }
+    }
+
+    next.chartHistory = chartHistory;
 
     this._marketIndex.set(slug, next);
     this.state.markets = [...this._marketIndex.values()]
-      .sort((a, b) => Number(b.updatedAt ?? 0) - Number(a.updatedAt ?? 0))
-      .slice(0, MAX_MARKETS);
+      .sort((a, b) => Number(b.updatedAt ?? 0) - Number(a.updatedAt ?? 0));
 
     if (next.btcPrice != null && Number.isFinite(Number(next.btcPrice))) {
       this.state.btcPrice = Number(next.btcPrice);

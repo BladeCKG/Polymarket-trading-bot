@@ -145,6 +145,26 @@
       gap: 16px;
     }
 
+    .live-section-layout {
+      display: grid;
+      gap: 16px;
+      grid-template-columns: minmax(0, 1.35fr) minmax(340px, 0.9fr);
+      align-items: start;
+    }
+
+    .sections-main {
+      display: grid;
+      gap: 16px;
+      min-width: 0;
+    }
+
+    .sections-side {
+      display: grid;
+      gap: 16px;
+      align-content: start;
+      min-width: 0;
+    }
+
     .panel {
       border-radius: var(--radius);
       background: var(--panel);
@@ -292,6 +312,135 @@
     .metric .value.small {
       font-size: 0.92rem;
       font-weight: 700;
+    }
+
+    .market-graphs {
+      display: grid;
+      gap: 12px;
+      align-content: start;
+    }
+
+    .monitoring-graphs-panel {
+      position: sticky;
+      top: 18px;
+    }
+
+    .graph-card {
+      min-height: 214px;
+      padding: 12px 14px 10px;
+      border-radius: 18px;
+      background: linear-gradient(180deg, rgba(248, 252, 251, 0.98), rgba(238, 247, 244, 0.92));
+      border: 1px solid rgba(15, 118, 110, 0.12);
+      display: grid;
+      gap: 10px;
+    }
+
+    .graph-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    .graph-title {
+      font-size: 0.78rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--muted);
+      font-weight: 800;
+    }
+
+    .graph-meta {
+      color: var(--muted);
+      font-size: 0.8rem;
+    }
+
+    .graph-legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 10px;
+      color: var(--muted);
+      font-size: 0.78rem;
+    }
+
+    .legend-item {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .legend-swatch {
+      width: 10px;
+      height: 10px;
+      border-radius: 999px;
+    }
+
+    .graph-svg {
+      width: 100%;
+      height: 148px;
+      display: block;
+      overflow: visible;
+    }
+
+    .graph-shell {
+      position: relative;
+      min-height: 148px;
+    }
+
+    .graph-empty {
+      height: 148px;
+      display: grid;
+      place-items: center;
+      color: var(--muted);
+      border-radius: 14px;
+      border: 1px dashed rgba(15, 118, 110, 0.18);
+      background: rgba(255, 255, 255, 0.66);
+      font-size: 0.84rem;
+    }
+
+    .graph-axis-label {
+      font-size: 10px;
+      fill: var(--muted);
+    }
+
+    .graph-axis-line {
+      stroke: rgba(20, 32, 28, 0.16);
+      stroke-width: 1;
+    }
+
+    .graph-axis-line.center {
+      stroke: rgba(20, 32, 28, 0.36);
+      stroke-dasharray: 4 4;
+    }
+
+    .graph-track {
+      stroke: rgba(15, 118, 110, 0.10);
+      stroke-width: 1;
+    }
+
+    .graph-line-move {
+      stroke: #0f766e;
+      stroke-width: 2.5;
+      fill: none;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+
+    .graph-line-up {
+      stroke: #166534;
+      stroke-width: 2.5;
+      fill: none;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+
+    .graph-line-down {
+      stroke: #b42318;
+      stroke-width: 2.5;
+      fill: none;
+      stroke-linecap: round;
+      stroke-linejoin: round;
     }
 
     .settlement {
@@ -498,6 +647,16 @@
       font-size: 0.9rem;
       color: var(--accent);
       min-height: 1.2em;
+    }
+
+    @media (max-width: 1120px) {
+      .live-section-layout {
+        grid-template-columns: 1fr;
+      }
+
+      .monitoring-graphs-panel {
+        position: static;
+      }
     }
 
     @media (max-width: 720px) {
@@ -878,6 +1037,186 @@
       }).join('');
     }
 
+    function seriesPoints(market, key) {
+      const points = Array.isArray(market?.chartHistory?.[key]) ? market.chartHistory[key] : [];
+      return points
+        .map((entry) => {
+          const second = typeof entry?.second === 'number' ? entry.second : Number.NaN;
+          const value = typeof entry?.value === 'number' ? entry.value : Number.NaN;
+          return { second, value };
+        })
+        .filter((entry) => Number.isFinite(entry.second) && Number.isFinite(entry.value) && entry.second >= 0 && entry.second <= 300)
+        .sort((a, b) => a.second - b.second);
+    }
+
+    function linePath(points, centerValue, radius, width, height, paddingX, paddingY) {
+      if (!points.length || !Number.isFinite(radius) || radius <= 0) return '';
+      const usableWidth = width - (paddingX * 2);
+      const usableHeight = height - (paddingY * 2);
+      return points.map((point, index) => {
+        const x = paddingX + (Math.max(0, Math.min(300, point.second)) / 300) * usableWidth;
+        const normalized = (point.value - centerValue) / radius;
+        const clamped = Math.max(-1, Math.min(1, normalized));
+        const y = paddingY + ((1 - ((clamped + 1) / 2)) * usableHeight);
+        return `${index === 0 ? 'M' : 'L'} ${x.toFixed(2)} ${y.toFixed(2)}`;
+      }).join(' ');
+    }
+
+    function chartSvg(seriesList, { centerValue, minRadius = 0.01, fixedRadius = null, yFormatter }) {
+      const width = 360;
+      const height = 148;
+      const paddingX = 28;
+      const paddingY = 16;
+      const allValues = seriesList.flatMap((series) => series.points.map((point) => point.value));
+      if (!allValues.length) {
+        return `<div class="graph-empty">Waiting for monitoring samples...</div>`;
+      }
+
+      const radius = Number.isFinite(Number(fixedRadius)) && Number(fixedRadius) > 0
+        ? Number(fixedRadius)
+        : Math.max(
+          minRadius,
+          ...allValues.map((value) => Math.abs(value - centerValue)),
+        );
+      const centerY = paddingY + ((height - (paddingY * 2)) / 2);
+      const bottomY = height - paddingY;
+      const rightX = width - paddingX;
+      const pathHtml = seriesList
+        .map((series) => {
+          const path = linePath(series.points, centerValue, radius, width, height, paddingX, paddingY);
+          return path ? `<path class="${series.className}" d="${path}"></path>` : '';
+        })
+        .join('');
+
+      return `
+        <svg class="graph-svg" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" aria-hidden="true">
+          <line class="graph-track" x1="${paddingX}" y1="${paddingY}" x2="${paddingX}" y2="${bottomY}"></line>
+          <line class="graph-track" x1="${paddingX}" y1="${bottomY}" x2="${rightX}" y2="${bottomY}"></line>
+          <line class="graph-axis-line center" x1="${paddingX}" y1="${centerY}" x2="${rightX}" y2="${centerY}"></line>
+          <line class="graph-axis-line" x1="${paddingX}" y1="${paddingY}" x2="${rightX}" y2="${paddingY}"></line>
+          ${pathHtml}
+          <text class="graph-axis-label" x="${paddingX}" y="${height - 2}" text-anchor="start">0s</text>
+          <text class="graph-axis-label" x="${rightX}" y="${height - 2}" text-anchor="end">300s</text>
+          <text class="graph-axis-label" x="${paddingX - 6}" y="${paddingY + 4}" text-anchor="end">${escapeHtml(yFormatter(centerValue + radius))}</text>
+          <text class="graph-axis-label" x="${paddingX - 6}" y="${centerY + 4}" text-anchor="end">${escapeHtml(yFormatter(centerValue))}</text>
+          <text class="graph-axis-label" x="${paddingX - 6}" y="${bottomY + 4}" text-anchor="end">${escapeHtml(yFormatter(centerValue - radius))}</text>
+        </svg>
+      `;
+    }
+
+    function renderMonitoringGraphs(market, symbol, move) {
+      const movePoints = seriesPoints(market, 'move');
+      const upAskPoints = seriesPoints(market, 'upAsk');
+      const downAskPoints = seriesPoints(market, 'downAsk');
+      const moveChart = chartSvg(
+        [{ points: movePoints, className: 'graph-line-move' }],
+        {
+          centerValue: 0,
+          minRadius: 10,
+          yFormatter: (value) => signedMoney(value, 0),
+        },
+      );
+      const askChart = chartSvg(
+        [
+          { points: upAskPoints, className: 'graph-line-up' },
+          { points: downAskPoints, className: 'graph-line-down' },
+        ],
+        {
+          centerValue: 0.5,
+          fixedRadius: 0.5,
+          yFormatter: (value) => price(value),
+        },
+      );
+
+      return `
+        <aside class="market-graphs">
+          <section class="graph-card">
+            <div class="graph-head">
+              <div class="graph-title">${symbol} Move</div>
+              <div class="graph-meta">0 is middle line</div>
+            </div>
+            <div class="graph-legend">
+              <span class="legend-item"><span class="legend-swatch" style="background:#0f766e;"></span>Now ${signedMoney(move)}</span>
+            </div>
+            <div class="graph-shell">${moveChart}</div>
+          </section>
+          <section class="graph-card">
+            <div class="graph-head">
+              <div class="graph-title">Up Ask / Down Ask</div>
+              <div class="graph-meta">0.5 is middle line</div>
+            </div>
+            <div class="graph-legend">
+              <span class="legend-item"><span class="legend-swatch" style="background:#166534;"></span>Up Ask ${price(market.upBestAsk)}</span>
+              <span class="legend-item"><span class="legend-swatch" style="background:#b42318;"></span>Down Ask ${price(market.downBestAsk)}</span>
+            </div>
+            <div class="graph-shell">${askChart}</div>
+          </section>
+        </aside>
+      `;
+    }
+
+    function renderMonitoringGraphsPanel(markets) {
+      const monitoring = sortMarketsForView(
+        markets.filter((market) => marketLifecycle(market) === 'monitoring'),
+      );
+
+      if (!monitoring.length) {
+        return `
+          <section class="panel monitoring-graphs-panel">
+            <div class="panel-head">
+              <div>
+                <h2 class="panel-title">Monitoring Graphs</h2>
+                <div class="panel-subtitle">Live move and ask history for currently monitoring markets.</div>
+              </div>
+              <span class="status-chip waiting">0 live</span>
+            </div>
+            <div class="panel-body">
+              <div class="empty">Graphs appear here when a market enters monitoring.</div>
+            </div>
+          </section>
+        `;
+      }
+
+      const graphHtml = monitoring.map((market) => {
+        const symbol = beatSymbol(market);
+        const latestSnapshot = bestPriceSnapshotFor(symbol);
+        const symbolPrice = latestSnapshot?.price ?? null;
+        const beat = market.beatPrice ?? symbolPrice;
+        const livePrice = market.btcPrice ?? symbolPrice;
+        const move = Number.isFinite(Number(livePrice)) && Number.isFinite(Number(beat))
+          ? Number(livePrice) - Number(beat)
+          : null;
+
+        return `
+          <article class="graph-card" style="padding:16px;">
+            <div class="graph-head">
+              <div>
+                <div class="graph-title">${escapeHtml(market.slug || '?')}</div>
+                <div class="graph-meta">${escapeHtml(symbol)} monitoring</div>
+              </div>
+              <span class="status-chip live">Live</span>
+            </div>
+            ${renderMonitoringGraphs(market, symbol, move)}
+          </article>
+        `;
+      }).join('');
+
+      return `
+        <section class="panel monitoring-graphs-panel">
+          <div class="panel-head">
+            <div>
+              <h2 class="panel-title">Monitoring Graphs</h2>
+              <div class="panel-subtitle">Move and ask history sit beside the markets list instead of inside each card.</div>
+            </div>
+            <span class="status-chip live">${monitoring.length} live</span>
+          </div>
+          <div class="panel-body">
+            <div class="market-graphs">${graphHtml}</div>
+          </div>
+        </section>
+      `;
+    }
+
     function renderMarketCard(market) {
       const lifecycle = marketLifecycle(market);
       const settled = lifecycle === 'settled';
@@ -952,36 +1291,46 @@
         : `<div class="empty">No settled markets yet.</div>`;
 
       return `
-        <section class="panel">
-          <div class="panel-head">
-            <div>
-              <h2 class="panel-title">Live Markets</h2>
-              <div class="panel-subtitle">Open and pre-open up/down windows, with upcoming markets shown inline.</div>
-            </div>
-            <div>
-              <button class="panel-toggle" type="button" data-panel-toggle="liveMarkets">${sectionCollapsed.liveMarkets ? 'Expand' : 'Collapse'}</button>
-              <span class="status-chip live">${live.length} active</span>
-            </div>
+        <div class="live-section-layout">
+          <div class="sections-main">
+            <section class="panel">
+              <div class="panel-head">
+                <div>
+                  <h2 class="panel-title">Live Markets</h2>
+                  <div class="panel-subtitle">Open and pre-open up/down windows, with upcoming markets shown inline.</div>
+                </div>
+                <div>
+                  <button class="panel-toggle" type="button" data-panel-toggle="liveMarkets">${sectionCollapsed.liveMarkets ? 'Expand' : 'Collapse'}</button>
+                  <span class="status-chip live">${live.length} active</span>
+                </div>
+              </div>
+              <div class="panel-body ${sectionCollapsed.liveMarkets ? 'is-collapsed' : ''}">
+                <div class="market-column">${liveHtml}</div>
+              </div>
+            </section>
           </div>
-          <div class="panel-body ${sectionCollapsed.liveMarkets ? 'is-collapsed' : ''}">
-            <div class="market-column">${liveHtml}</div>
-          </div>
-        </section>
-        <section class="panel">
-          <div class="panel-head">
-            <div>
-              <h2 class="panel-title">Settled Markets</h2>
-              <div class="panel-subtitle">Outcome, PnL, and trade details for completed markets that actually traded.</div>
+          <aside class="sections-side">
+            ${renderMonitoringGraphsPanel(live)}
+          </aside>
+        </div>
+        <div class="sections-main">
+          <section class="panel">
+            <div class="panel-head">
+              <div>
+                <h2 class="panel-title">Settled Markets</h2>
+                <div class="panel-subtitle">Outcome, PnL, and trade details for completed markets that actually traded.</div>
+              </div>
+              <div>
+                <button class="panel-toggle" type="button" data-panel-toggle="settledMarkets">${sectionCollapsed.settledMarkets ? 'Expand' : 'Collapse'}</button>
+                <span class="status-chip settled">${settled.length} settled</span>
+              </div>
             </div>
-            <div>
-              <button class="panel-toggle" type="button" data-panel-toggle="settledMarkets">${sectionCollapsed.settledMarkets ? 'Expand' : 'Collapse'}</button>
-              <span class="status-chip settled">${settled.length} settled</span>
+            <div class="panel-body ${sectionCollapsed.settledMarkets ? 'is-collapsed' : ''}">
+              <div class="market-column">${settledHtml}</div>
             </div>
-          </div>
-          <div class="panel-body ${sectionCollapsed.settledMarkets ? 'is-collapsed' : ''}">
-            <div class="market-column">${settledHtml}</div>
-          </div>
-        </section>
+          </section>
+          ${renderLogs()}
+        </div>
       `;
     }
 
@@ -1100,12 +1449,12 @@
         dirty.delete('config');
       }
       if (dirty.has('markets')) {
-        sectionsEl.innerHTML = renderMarkets() + renderLogs();
+        sectionsEl.innerHTML = renderMarkets();
         bindMarketSectionControls();
         dirty.delete('markets');
       }
       if (dirty.has('logs')) {
-        sectionsEl.innerHTML = renderMarkets() + renderLogs();
+        sectionsEl.innerHTML = renderMarkets();
         bindMarketSectionControls();
         dirty.delete('logs');
       }
