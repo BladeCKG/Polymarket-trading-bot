@@ -1169,7 +1169,10 @@
 
     function renderMonitoringGraphsPanel(markets) {
       const monitoring = sortMarketsForView(
-        markets.filter((market) => marketLifecycle(market) === 'monitoring'),
+        markets.filter((market) => {
+          const lifecycle = marketLifecycle(market);
+          return lifecycle === 'monitoring' || lifecycle === 'resolving';
+        }),
       );
 
       if (!monitoring.length) {
@@ -1204,9 +1207,9 @@
             <div class="graph-head">
               <div>
                 <div class="graph-title">${escapeHtml(market.slug || '?')}</div>
-                <div class="graph-meta">${escapeHtml(symbol)} monitoring</div>
+                <div class="graph-meta">${escapeHtml(symbol)} ${escapeHtml(marketStatusText(market) || 'live')}</div>
               </div>
-              <span class="status-chip live">Live</span>
+              <span class="status-chip ${chipClass(marketStatusText(market))}">${escapeHtml(marketStatusText(market) || 'live')}</span>
             </div>
             ${renderMonitoringGraphs(market, symbol, move)}
           </article>
