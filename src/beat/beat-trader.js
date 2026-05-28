@@ -88,6 +88,11 @@ function summarizeBook(book) {
   };
 }
 
+function positiveFiniteOrNull(value) {
+  const num = Number(value);
+  return Number.isFinite(num) && num > 0 ? num : null;
+}
+
 export class BeatTrader {
   constructor(market, wallet, pnl, { dashboard = null, btcFeed = null, config = null, onSettled = null } = {}) {
     this.market = market;
@@ -428,8 +433,12 @@ export class BeatTrader {
     const secondsAfterOpen = Math.max(0, Math.round((Date.now() - (this.market.windowTs * 1000)) / 1000));
     const btcPrice = Number.isFinite(Number(this.latestBtcTick?.price)) ? Number(this.latestBtcTick.price) : null;
     const beatPrice = Number.isFinite(Number(this.beatPrice)) ? Number(this.beatPrice) : null;
-    const upAskPrice = Number.isFinite(Number(upAsk?.price)) ? Number(upAsk.price) : null;
-    const downAskPrice = Number.isFinite(Number(downAsk?.price)) ? Number(downAsk.price) : null;
+    let upAskPrice = positiveFiniteOrNull(upAsk?.price);
+    let downAskPrice = positiveFiniteOrNull(downAsk?.price);
+    if (upAskPrice == null && downAskPrice == null) {
+      upAskPrice = null;
+      downAskPrice = null;
+    }
     const chartPoint = {
       second: secondsAfterOpen,
       move: Number.isFinite(btcPrice) && Number.isFinite(beatPrice) ? btcPrice - beatPrice : null,

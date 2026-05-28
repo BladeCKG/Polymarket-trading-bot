@@ -26,10 +26,11 @@ function finiteNumberOrNull(value) {
 
 function appendSeriesPoint(series, second, value) {
   if (!Number.isFinite(second) || second < 0 || second > MAX_GRAPH_SECONDS) return Array.isArray(series) ? series : [];
-  if (!Number.isFinite(value)) return Array.isArray(series) ? series : [];
+  const isGap = value == null;
+  if (!isGap && !Number.isFinite(value)) return Array.isArray(series) ? series : [];
 
   const next = Array.isArray(series) ? [...series] : [];
-  const point = { second, value };
+  const point = { second, value: isGap ? null : value };
   const existingIndex = next.findIndex((entry) => Number(entry?.second) === second);
   if (existingIndex >= 0) {
     next[existingIndex] = point;
@@ -38,7 +39,7 @@ function appendSeriesPoint(series, second, value) {
   }
 
   return next
-    .filter((entry) => Number.isFinite(Number(entry?.second)) && Number.isFinite(Number(entry?.value)))
+    .filter((entry) => Number.isFinite(Number(entry?.second)))
     .sort((a, b) => Number(a.second) - Number(b.second));
 }
 
@@ -210,9 +211,13 @@ export class BeatDashboardServer {
       }
       if (Number.isFinite(upAsk)) {
         chartHistory.upAsk = appendSeriesPoint(chartHistory.upAsk, second, upAsk);
+      } else if (upAsk == null) {
+        chartHistory.upAsk = appendSeriesPoint(chartHistory.upAsk, second, null);
       }
       if (Number.isFinite(downAsk)) {
         chartHistory.downAsk = appendSeriesPoint(chartHistory.downAsk, second, downAsk);
+      } else if (downAsk == null) {
+        chartHistory.downAsk = appendSeriesPoint(chartHistory.downAsk, second, null);
       }
     }
 

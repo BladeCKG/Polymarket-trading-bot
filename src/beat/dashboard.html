@@ -1054,10 +1054,12 @@
       return points
         .map((entry) => {
           const second = typeof entry?.second === 'number' ? entry.second : Number.NaN;
-          const value = typeof entry?.value === 'number' ? entry.value : Number.NaN;
+          const value = entry?.value == null
+            ? null
+            : (typeof entry?.value === 'number' ? entry.value : Number.NaN);
           return { second, value };
         })
-        .filter((entry) => Number.isFinite(entry.second) && Number.isFinite(entry.value) && entry.second >= 0 && entry.second <= 300)
+        .filter((entry) => Number.isFinite(entry.second) && entry.second >= 0 && entry.second <= 300)
         .sort((a, b) => a.second - b.second);
     }
 
@@ -1065,13 +1067,20 @@
       if (!points.length || !Number.isFinite(radius) || radius <= 0) return '';
       const usableWidth = width - (paddingX * 2);
       const usableHeight = height - (paddingY * 2);
-      return points.map((point, index) => {
+      let drawing = false;
+      return points.map((point) => {
+        if (!Number.isFinite(point.value)) {
+          drawing = false;
+          return '';
+        }
         const x = paddingX + (Math.max(0, Math.min(300, point.second)) / 300) * usableWidth;
         const normalized = (point.value - centerValue) / radius;
         const clamped = Math.max(-1, Math.min(1, normalized));
         const y = paddingY + ((1 - ((clamped + 1) / 2)) * usableHeight);
-        return `${index === 0 ? 'M' : 'L'} ${x.toFixed(2)} ${y.toFixed(2)}`;
-      }).join(' ');
+        const command = drawing ? 'L' : 'M';
+        drawing = true;
+        return `${command} ${x.toFixed(2)} ${y.toFixed(2)}`;
+      }).filter(Boolean).join(' ');
     }
 
     function chartSvg(seriesList, { centerValue, minRadius = 0.01, fixedRadius = null, yFormatter }) {
@@ -1079,7 +1088,11 @@
       const height = 228;
       const paddingX = 34;
       const paddingY = 20;
-      const allValues = seriesList.flatMap((series) => series.points.map((point) => point.value));
+      const allValues = seriesList.flatMap((series) =>
+        series.points
+          .map((point) => point.value)
+          .filter((value) => Number.isFinite(value)),
+      );
       if (!allValues.length) {
         return `<div class="graph-empty">Waiting for monitoring samples...</div>`;
       }
@@ -1168,10 +1181,12 @@
     }
 
     function renderMonitoringGraphsPanel(markets) {
+      const nowMs = Date.now();
       const monitoring = sortMarketsForView(
         markets.filter((market) => {
-          const lifecycle = marketLifecycle(market);
-          return lifecycle === 'monitoring' || lifecycle === 'resolving';
+          const openMs = getWindowOpenMs(market);
+          const closeMs = getWindowCloseMs(market);
+          return Number.isFinite(openMs) && Number.isFinite(closeMs) && nowMs >= openMs && nowMs < closeMs;
         }),
       );
 
@@ -1179,11 +1194,11 @@
         return `
           <section class="panel monitoring-graphs-panel">
             <div class="panel-head">
-              <div>
-                <h2 class="panel-title">Monitoring Graphs</h2>
-                <div class="panel-subtitle">Live move and ask history for currently monitoring markets.</div>
-              </div>
-              <span class="status-chip waiting">0 live</span>
+            <div>
+              <h2 class="panel-title">Monitoring Graphs</h2>
+              <div class="panel-subtitle">Live move and ask history for markets whose window has not ended yet.</div>
+            </div>
+            <span class="status-chip waiting">0 live</span>
             </div>
             <div class="panel-body">
               <div class="empty">Graphs appear here when a market enters monitoring.</div>
@@ -1221,7 +1236,7 @@
           <div class="panel-head">
             <div>
               <h2 class="panel-title">Monitoring Graphs</h2>
-              <div class="panel-subtitle">Move and ask history sit beside the markets list instead of inside each card.</div>
+              <div class="panel-subtitle">Move and ask history for markets before their end time, shown beside the live markets list.</div>
             </div>
             <span class="status-chip live">${monitoring.length} live</span>
           </div>
