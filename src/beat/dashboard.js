@@ -20,6 +20,7 @@ function truncate(list, max) {
 }
 
 function finiteNumberOrNull(value) {
+  if (value == null) return null;
   const num = Number(value);
   return Number.isFinite(num) ? num : null;
 }
