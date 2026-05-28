@@ -321,6 +321,58 @@
       letter-spacing: -0.03em;
     }
 
+    .summary-box .hint {
+      margin-top: 6px;
+      color: var(--muted);
+      font-size: 0.78rem;
+      line-height: 1.4;
+    }
+
+    .buy-history {
+      display: grid;
+      gap: 10px;
+      padding-top: 4px;
+    }
+
+    .buy-history .title {
+      font-size: 0.86rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--muted);
+      font-weight: 700;
+    }
+
+    .buy-list {
+      display: grid;
+      gap: 10px;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    }
+
+    .buy-item {
+      padding: 12px 14px;
+      border-radius: 16px;
+      border: 1px solid rgba(15, 118, 110, 0.12);
+      background: rgba(15, 118, 110, 0.04);
+      display: grid;
+      gap: 6px;
+    }
+
+    .buy-item .head {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      align-items: baseline;
+      flex-wrap: wrap;
+      font-weight: 800;
+      letter-spacing: -0.03em;
+    }
+
+    .buy-item .meta {
+      color: var(--muted);
+      font-size: 0.8rem;
+      line-height: 1.45;
+    }
+
     .summary-positive { color: var(--good); }
     .summary-negative { color: var(--bad); }
 
@@ -427,7 +479,7 @@
         <div class="eyebrow">Realtime market room</div>
         <h1>Beat strategy live console</h1>
       </div>
-      <p>Watch the BTC beat price, live Polymarket quotes, countdown to settlement, and the eventual settlement result without the dead trade panel cluttering the screen.</p>
+      <p>Watch the live beat price, live Polymarket quotes, countdown to settlement, and the eventual settlement result without the dead trade panel cluttering the screen.</p>
     </section>
 
     <section class="grid" id="topStats"></section>
@@ -525,6 +577,10 @@
         .replaceAll("'", '&#39;');
     }
 
+    function beatSymbol() {
+      return String(state.config?.BEAT_MARKET_SYMBOL ?? state.runtime?.marketSymbol ?? 'BTC').toUpperCase();
+    }
+
     function getWindowOpenMs(market) {
       const openMs = Number(market?.windowOpenAt ?? (market?.windowTs ? market.windowTs * 1000 : null));
       return Number.isFinite(openMs) ? openMs : null;
@@ -581,9 +637,32 @@
         return `<div class="empty">No trade executed on this market.</div>`;
       }
       const pnl = Number(market.pnl ?? 0);
+      const title = market.settled ? 'Settlement summary' : 'Trade summary';
+      const moveAtBuy = market.moveAtBuyUsd;
+      const moveAtBuyPct = market.moveAtBuyPct;
+      const buyEvents = Array.isArray(market.buyEvents) ? market.buyEvents : [];
+      const buyRows = buyEvents.length
+        ? buyEvents.map((buy, index) => {
+            const buyMove = Number(buy?.moveAtBuyUsd ?? null);
+            const buyMovePct = buy?.moveAtBuyPct;
+            return `
+              <div class="buy-item">
+                <div class="head">
+                  <span>Buy #${index + 1} ${buy?.side ? `(${buy.side})` : ''}</span>
+                  <span>${money(buy?.usdc)}</span>
+                </div>
+                <div class="meta">
+                  ${buy?.shares != null ? `${Number(buy.shares).toFixed(4)} shares` : '-'} at ${price(buy?.price)}
+                  ${buyMovePct != null ? ` • move ${signedMoney(buyMove)} (${buyMovePct >= 0 ? '+' : ''}${Number(buyMovePct).toFixed(2)}%)` : ''}
+                  ${buy?.recordedAt ? ` • ${ago(buy.recordedAt)}` : ''}
+                </div>
+              </div>
+            `;
+          }).join('')
+        : '';
       return `
         <div class="settlement">
-          <div class="title">Settlement summary</div>
+          <div class="title">${title}</div>
           <div class="settlement-grid">
             <div class="summary-box">
               <div class="label">Outcome</div>
@@ -602,15 +681,29 @@
               <div class="value">${market.buyShares != null ? Number(market.buyShares).toFixed(4) : '-'}</div>
             </div>
             <div class="summary-box">
-              <div class="label">Buy USDC</div>
+              <div class="label">Total Buy USDC</div>
               <div class="value">${money(market.buyUsdc)}</div>
             </div>
             <div class="summary-box">
               <div class="label">Buy Price</div>
               <div class="value">${price(market.buyPrice)}</div>
             </div>
+            <div class="summary-box">
+              <div class="label">Move at Buy</div>
+              <div class="value ${Number(moveAtBuy) >= 0 ? 'summary-positive' : 'summary-negative'}">${signedMoney(moveAtBuy)}${moveAtBuyPct != null ? ` (${moveAtBuyPct >= 0 ? '+' : ''}${Number(moveAtBuyPct).toFixed(2)}%)` : ''}</div>
+            </div>
+            <div class="summary-box">
+              <div class="label">Buy Count</div>
+              <div class="value">${market.buyCount != null ? Number(market.buyCount) : '-'}</div>
+            </div>
           </div>
         </div>
+        ${buyRows ? `
+          <div class="buy-history">
+            <div class="title">Buy History</div>
+            <div class="buy-list">${buyRows}</div>
+          </div>
+        ` : ''}
       `;
     }
 
@@ -645,9 +738,10 @@
       const traded = markets.filter((m) => Number(m.buyShares || 0) > 0);
       const pnl = settled.reduce((sum, m) => sum + Number(m.pnl || 0), 0);
       const btc = state.btcPrice ?? live[0]?.btcPrice ?? settled[0]?.btcPrice ?? live[0]?.beatPrice ?? settled[0]?.beatPrice;
+      const symbol = beatSymbol();
 
       topStatsEl.innerHTML = [
-        ['BTC Price', money(btc)],
+        [`${symbol} Price`, money(btc)],
         ['Live Markets', String(live.length)],
         ['Settled Markets', String(settled.length)],
         ['Traded Markets', String(traded.length)],
@@ -666,6 +760,8 @@
       const settled = lifecycle === 'settled';
       const preOpen = lifecycle === 'upcoming';
       const statusText = marketStatusText(market);
+      const symbol = beatSymbol();
+      const traded = Boolean(market.tradeOccurred || Number(market.buyShares || 0) > 0);
       const beat = market.beatPrice ?? state.btcPrice;
       const liveBtc = market.btcPrice ?? state.btcPrice;
       const btcMove = Number.isFinite(Number(liveBtc)) && Number.isFinite(Number(beat))
@@ -674,6 +770,19 @@
       const btcMovePct = Number.isFinite(btcMove) && Number.isFinite(Number(beat)) && Number(beat) !== 0
         ? (btcMove / Number(beat)) * 100
         : null;
+      const moveAtBuy = Number(market.moveAtBuyUsd ?? null);
+      const moveAtBuyPct = market.moveAtBuyPct;
+      const moveLabel = traded ? 'Move at Buy' : (settled ? 'Trade Move' : `${symbol} Move`);
+      const moveValueText = traded
+        ? `${signedMoney(moveAtBuy)}${moveAtBuyPct != null ? ` (${moveAtBuyPct >= 0 ? '+' : ''}${Number(moveAtBuyPct).toFixed(2)}%)` : ''}`
+        : settled
+          ? '-'
+          : `${signedMoney(btcMove)}${btcMovePct != null ? ` (${btcMovePct >= 0 ? '+' : ''}${btcMovePct.toFixed(2)}%)` : ''}`;
+      const moveValueClass = traded
+        ? (Number(moveAtBuy) >= 0 ? 'summary-positive' : 'summary-negative')
+        : settled
+          ? ''
+          : (Number(btcMove) >= 0 ? 'summary-positive' : 'summary-negative');
       return `
         <article class="market-card ${settled ? 'settled' : ''}">
           <div class="market-head">
@@ -689,8 +798,8 @@
             <span>Window open ${ts(getWindowOpenMs(market))}</span>
           </div>
           <div class="metric-grid">
-            <div class="metric"><div class="label">Beat BTC</div><div class="value">${money(beat)}</div></div>
-            <div class="metric"><div class="label">BTC Move</div><div class="value ${btcMove >= 0 ? 'summary-positive' : 'summary-negative'}">${signedMoney(btcMove)}${btcMovePct != null ? ` (${btcMovePct >= 0 ? '+' : ''}${btcMovePct.toFixed(2)}%)` : ''}</div></div>
+            <div class="metric"><div class="label">Beat ${symbol}</div><div class="value">${money(beat)}</div></div>
+            <div class="metric"><div class="label">${moveLabel}</div><div class="value ${moveValueClass}">${moveValueText}</div></div>
             <div class="metric"><div class="label">Up Bid</div><div class="value">${price(market.upBestBid)}</div></div>
             <div class="metric"><div class="label">Up Ask</div><div class="value">${price(market.upBestAsk)}</div></div>
             <div class="metric"><div class="label">Down Bid</div><div class="value">${price(market.downBestBid)}</div></div>
@@ -698,7 +807,7 @@
             <div class="metric"><div class="label">Trade Status</div><div class="value small">${statusText}</div></div>
             <div class="metric"><div class="label">Settlement</div><div class="value small">${settled ? (market.outcome || '-') : (preOpen ? '' : countdown(market.windowCloseAt))}</div></div>
           </div>
-          ${settled ? tradeSummary(market) : ''}
+          ${traded ? tradeSummary(market) : ''}
         </article>
       `;
     }
@@ -720,7 +829,7 @@
           <div class="panel-head">
             <div>
               <h2 class="panel-title">Live Markets</h2>
-              <div class="panel-subtitle">Open and pre-open BTC up/down windows, with upcoming markets shown inline.</div>
+              <div class="panel-subtitle">Open and pre-open up/down windows, with upcoming markets shown inline.</div>
             </div>
             <div class="status-chip live">${live.length} active</div>
           </div>

@@ -2,8 +2,8 @@
  * market.js
  * Market discovery via the Polymarket Gamma API.
  *
- * btc-updown-5m markets follow the naming scheme:
- *   slug = "btc-updown-5m-<unix_ts>" where unix_ts is the window open time
+ * btc-updown-5m / eth-updown-5m markets follow the naming scheme:
+ *   slug = "<symbol>-updown-5m-<unix_ts>" where unix_ts is the window open time
  *   (multiple of 300 seconds).
  *
  * Responsibilities:
@@ -34,8 +34,8 @@ export function nextWindowTs(windowSeconds = MARKET_WINDOW_SECONDS) {
 /**
  * Build the slug for a given window open timestamp.
  */
-export function slugFor(ts) {
-  return `btc-updown-5m-${ts}`;
+export function slugFor(ts, symbol = 'BTC') {
+  return `${String(symbol ?? 'BTC').toLowerCase()}-updown-5m-${ts}`;
 }
 
 /**

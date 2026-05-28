@@ -112,9 +112,21 @@ export const HEARTBEAT_INTERVAL_MS      = Math.max(
 );
 
 // ── BTC beat strategy ────────────────────────────────────────────────────────
-export const BTC_PRICE_WS_URL            = optional('BTC_PRICE_WS_URL', 'wss://stream.binance.com:9443/ws/btcusdt@ticker');
-export const BTC_PRICE_PRODUCT_ID        = optional('BTC_PRICE_PRODUCT_ID', 'BTCUSDT');
-export const BTC_PRICE_REST_URL          = optional('BTC_PRICE_REST_URL', 'https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT');
+export const BEAT_MARKET_SYMBOL          = parseEnum_('BEAT_MARKET_SYMBOL', ['BTC', 'ETH'], 'BTC');
+const PRICE_FEED_DEFAULTS = BEAT_MARKET_SYMBOL === 'ETH'
+  ? {
+      wsUrl: 'wss://stream.binance.com:9443/ws/ethusdt@ticker',
+      productId: 'ETHUSDT',
+      restUrl: 'https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT',
+    }
+  : {
+      wsUrl: 'wss://stream.binance.com:9443/ws/btcusdt@ticker',
+      productId: 'BTCUSDT',
+      restUrl: 'https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT',
+    };
+export const BTC_PRICE_WS_URL            = optional('BTC_PRICE_WS_URL', PRICE_FEED_DEFAULTS.wsUrl);
+export const BTC_PRICE_PRODUCT_ID        = optional('BTC_PRICE_PRODUCT_ID', PRICE_FEED_DEFAULTS.productId);
+export const BTC_PRICE_REST_URL          = optional('BTC_PRICE_REST_URL', PRICE_FEED_DEFAULTS.restUrl);
 export const BTC_PRICE_MAX_AGE_MS        = parseInt_('BTC_PRICE_MAX_AGE_MS', 2_000);
 export const BEAT_DRY_RUN                = parseBool_('BEAT_DRY_RUN', true);
 export const BEAT_ENTRY_DELAY_SECONDS    = parseInt_('BEAT_ENTRY_DELAY_SECONDS', 15);
@@ -128,6 +140,8 @@ export const BEAT_UP_MOVE_MIN_USD        = parseFloat_('BEAT_UP_MOVE_MIN_USD', 1
 export const BEAT_UP_MOVE_MAX_USD        = parseFloat_('BEAT_UP_MOVE_MAX_USD', 120);
 export const BEAT_DOWN_MOVE_MIN_USD      = parseFloat_('BEAT_DOWN_MOVE_MIN_USD', 15);
 export const BEAT_DOWN_MOVE_MAX_USD      = parseFloat_('BEAT_DOWN_MOVE_MAX_USD', 120);
+export const BEAT_ETH_UP_MOVE_MAX_USD    = parseFloat_('BEAT_ETH_UP_MOVE_MAX_USD', 180);
+export const BEAT_ETH_DOWN_MOVE_MAX_USD  = parseFloat_('BEAT_ETH_DOWN_MOVE_MAX_USD', 180);
 export const BEAT_UP_MAX_BUY_PRICE       = parseFloat_('BEAT_UP_MAX_BUY_PRICE', 0.46);
 export const BEAT_DOWN_MAX_BUY_PRICE       = parseFloat_('BEAT_DOWN_MAX_BUY_PRICE', 0.46);
 export const BEAT_DASHBOARD_ENABLED = parseBool_('BEAT_DASHBOARD_ENABLED', false);

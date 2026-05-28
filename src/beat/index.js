@@ -78,6 +78,7 @@ export async function main() {
       runtime: {
         mode: 'beat',
         wallet: wallet.address,
+        marketSymbol: beatConfig.BEAT_MARKET_SYMBOL,
         dryRun: beatConfig.BEAT_DRY_RUN,
         startedAt: Date.now(),
       },
@@ -121,7 +122,7 @@ export async function main() {
   const upcomingDiscoveryTask = (async () => {
     while (!stopping) {
       const wts = nextWindowTs(beatConfig.MARKET_WINDOW_SECONDS);
-      const slug = slugFor(wts);
+      const slug = slugFor(wts, beatConfig.BEAT_MARKET_SYMBOL);
       const openMs = wts * 1000;
       const closeMs = (wts + beatConfig.MARKET_WINDOW_SECONDS) * 1000;
 
@@ -202,7 +203,7 @@ export async function main() {
     }
 
     const wts = currentWindowTs(beatConfig.MARKET_WINDOW_SECONDS);
-    const slug = slugFor(wts);
+    const slug = slugFor(wts, beatConfig.BEAT_MARKET_SYMBOL);
 
     let market;
     try {

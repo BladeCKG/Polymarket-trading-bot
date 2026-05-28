@@ -61,6 +61,24 @@ function tradeStatusFromLifecycle(lifecycle, hasTrade) {
   return BEAT_LIFECYCLE.UPCOMING;
 }
 
+function moveThresholdsForConfig(cfg) {
+  const symbol = String(cfg.BEAT_MARKET_SYMBOL ?? 'BTC').toUpperCase();
+  if (symbol === 'ETH') {
+    return {
+      upMin: cfg.BEAT_UP_MOVE_MIN_USD,
+      upMax: cfg.BEAT_ETH_UP_MOVE_MAX_USD ?? cfg.BEAT_UP_MOVE_MAX_USD,
+      downMin: cfg.BEAT_DOWN_MOVE_MIN_USD,
+      downMax: cfg.BEAT_ETH_DOWN_MOVE_MAX_USD ?? cfg.BEAT_DOWN_MOVE_MAX_USD,
+    };
+  }
+  return {
+    upMin: cfg.BEAT_UP_MOVE_MIN_USD,
+    upMax: cfg.BEAT_UP_MOVE_MAX_USD,
+    downMin: cfg.BEAT_DOWN_MOVE_MIN_USD,
+    downMax: cfg.BEAT_DOWN_MOVE_MAX_USD,
+  };
+}
+
 export class BeatTrader {
   constructor(market, wallet, pnl, { dashboard = null, btcFeed = null, config = null } = {}) {
     this.market = market;
@@ -325,11 +343,12 @@ export class BeatTrader {
 
   _signalFromDelta(delta) {
     const cfg = this.config;
-    if (delta >= cfg.BEAT_UP_MOVE_MIN_USD && delta <= cfg.BEAT_UP_MOVE_MAX_USD) {
+    const thresholds = moveThresholdsForConfig(cfg);
+    if (delta >= thresholds.upMin && delta <= thresholds.upMax) {
       return { side: 'Up' };
     }
     const downMove = Math.abs(delta);
-    if (delta <= -cfg.BEAT_DOWN_MOVE_MIN_USD && downMove <= cfg.BEAT_DOWN_MOVE_MAX_USD) {
+    if (delta <= -thresholds.downMin && downMove <= thresholds.downMax) {
       return { side: 'Down' };
     }
     return null;
@@ -363,7 +382,7 @@ export class BeatTrader {
         }
       }
 
-      this._recordBuy(side, plan.spentUsdc / plan.fillShares, plan.fillShares);
+      this._recordBuy(side, plan.spentUsdc / plan.fillShares, plan.fillShares, plan.spentUsdc, delta, btcPrice);
       this.lastBuyAt = Date.now();
       this._publishTrade({
         lifecycle: BEAT_LIFECYCLE.MONITORING,
@@ -404,7 +423,7 @@ export class BeatTrader {
       }
     }
 
-    this._recordBuy(side, plan.avgFillPrice ?? bestAsk.price, plan.fillShares, plan.spentUsdc);
+    this._recordBuy(side, plan.avgFillPrice ?? bestAsk.price, plan.fillShares, plan.spentUsdc, delta, btcPrice);
     this.lastBuyAt = Date.now();
     this._publishTrade({
       lifecycle: BEAT_LIFECYCLE.MONITORING,
@@ -429,7 +448,7 @@ export class BeatTrader {
     });
   }
 
-  _recordBuy(side, avgPrice, shares, spentOverride = null) {
+  _recordBuy(side, avgPrice, shares, spentOverride = null, moveAtBuyUsd = null, btcPriceAtBuy = null) {
     const spentUsdc = spentOverride ?? (avgPrice * shares);
     this.totalSpent += spentUsdc;
     if (side === 'Up') this.balanceUp += shares;
@@ -443,6 +462,10 @@ export class BeatTrader {
         buyUsdc: 0,
         buyPrice: 0,
         buyCount: 0,
+        buyEvents: [],
+        moveAtBuyUsd: null,
+        moveAtBuyPct: null,
+        btcPriceAtBuy: null,
       };
     }
     if (this.tradeSummary.chosenSide !== side) {
@@ -453,6 +476,23 @@ export class BeatTrader {
     this.tradeSummary.buyCount += 1;
     this.tradeSummary.buyPrice = this.tradeSummary.buyUsdc / this.tradeSummary.buyShares;
     this.tradeSummary.tradeOccurred = true;
+    this.tradeSummary.buyEvents.push({
+      side,
+      shares,
+      usdc: spentUsdc,
+      price: avgPrice,
+      moveAtBuyUsd,
+      moveAtBuyPct: moveAtBuyUsd != null && this.beatPrice
+        ? (moveAtBuyUsd / this.beatPrice) * 100
+        : null,
+      btcPriceAtBuy,
+      recordedAt: Date.now(),
+    });
+    this.tradeSummary.moveAtBuyUsd = moveAtBuyUsd ?? this.tradeSummary.moveAtBuyUsd;
+    this.tradeSummary.moveAtBuyPct = moveAtBuyUsd != null && this.beatPrice
+      ? (moveAtBuyUsd / this.beatPrice) * 100
+      : this.tradeSummary.moveAtBuyPct;
+    this.tradeSummary.btcPriceAtBuy = btcPriceAtBuy ?? this.tradeSummary.btcPriceAtBuy;
   }
 
   _checkCircuitBreakers() {
@@ -633,6 +673,11 @@ export class BeatTrader {
       buyShares: patch.buyShares ?? this.tradeSummary?.buyShares ?? 0,
       buyUsdc: patch.buyUsdc ?? this.tradeSummary?.buyUsdc ?? 0,
       buyPrice: patch.buyPrice ?? this.tradeSummary?.buyPrice ?? null,
+      buyCount: patch.buyCount ?? this.tradeSummary?.buyCount ?? 0,
+      buyEvents: patch.buyEvents ?? this.tradeSummary?.buyEvents ?? [],
+      moveAtBuyUsd: patch.moveAtBuyUsd ?? this.tradeSummary?.moveAtBuyUsd ?? null,
+      moveAtBuyPct: patch.moveAtBuyPct ?? this.tradeSummary?.moveAtBuyPct ?? null,
+      btcPriceAtBuy: patch.btcPriceAtBuy ?? this.tradeSummary?.btcPriceAtBuy ?? null,
       tradeOccurred: patch.tradeOccurred ?? Boolean(this.tradeSummary?.buyShares > 0),
       outcome: patch.outcome ?? this.lastOutcome ?? null,
       pnl: patch.pnl ?? (this.redeemedUsdc - this.totalSpent),

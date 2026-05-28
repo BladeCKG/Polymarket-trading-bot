@@ -10,6 +10,9 @@ import {
   BEAT_DOWN_MOVE_MIN_USD,
   BEAT_ENTRY_DELAY_SECONDS,
   BEAT_MAX_SLIPPAGE,
+  BEAT_MARKET_SYMBOL,
+  BEAT_ETH_DOWN_MOVE_MAX_USD,
+  BEAT_ETH_UP_MOVE_MAX_USD,
   BEAT_ORDER_MODE,
   BEAT_ORDER_SIZE_SHARES,
   BEAT_ORDER_SIZE_USDC,
@@ -28,6 +31,7 @@ import {
 } from '../config.js';
 
 const DEFAULTS = Object.freeze({
+  BEAT_MARKET_SYMBOL,
   BTC_PRICE_WS_URL,
   BTC_PRICE_PRODUCT_ID,
   BTC_PRICE_REST_URL,
@@ -47,6 +51,8 @@ const DEFAULTS = Object.freeze({
   BEAT_UP_MOVE_MAX_USD,
   BEAT_DOWN_MOVE_MIN_USD,
   BEAT_DOWN_MOVE_MAX_USD,
+  BEAT_ETH_UP_MOVE_MAX_USD,
+  BEAT_ETH_DOWN_MOVE_MAX_USD,
   BEAT_UP_MAX_BUY_PRICE,
   BEAT_DOWN_MAX_BUY_PRICE,
   MAX_INVENTORY_IMBALANCE,
@@ -78,11 +84,30 @@ function coerceValue(key, value) {
     return text === 'SHARES' ? 'SHARES' : 'USDC';
   }
 
+  if (key === 'BEAT_MARKET_SYMBOL') {
+    const text = String(value ?? '').trim().toUpperCase();
+    return text === 'ETH' ? 'ETH' : 'BTC';
+  }
+
   return String(value ?? fallback);
 }
 
+function priceFeedDefaultsFor(symbol) {
+  return String(symbol ?? '').trim().toUpperCase() === 'ETH'
+    ? {
+        BTC_PRICE_WS_URL: 'wss://stream.binance.com:9443/ws/ethusdt@ticker',
+        BTC_PRICE_PRODUCT_ID: 'ETHUSDT',
+        BTC_PRICE_REST_URL: 'https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT',
+      }
+    : {
+        BTC_PRICE_WS_URL: 'wss://stream.binance.com:9443/ws/btcusdt@ticker',
+        BTC_PRICE_PRODUCT_ID: 'BTCUSDT',
+        BTC_PRICE_REST_URL: 'https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT',
+      };
+}
+
 export function createBeatRuntimeConfig(overrides = {}) {
-  return {
+  const next = {
     ...DEFAULTS,
     ...Object.fromEntries(
       Object.entries(overrides)
@@ -90,13 +115,31 @@ export function createBeatRuntimeConfig(overrides = {}) {
         .map(([key, value]) => [key, coerceValue(key, value)]),
     ),
   };
+
+  const feedDefaults = priceFeedDefaultsFor(next.BEAT_MARKET_SYMBOL);
+  for (const [key, value] of Object.entries(feedDefaults)) {
+    if (!(key in overrides)) {
+      next[key] = value;
+    }
+  }
+
+  return next;
 }
 
 export function applyBeatRuntimeConfigPatch(target, patch = {}) {
   if (!target || typeof target !== 'object') return target;
+  const marketSymbolChanged = Object.prototype.hasOwnProperty.call(patch, 'BEAT_MARKET_SYMBOL');
   for (const [key, value] of Object.entries(patch)) {
     if (!(key in DEFAULTS)) continue;
     target[key] = coerceValue(key, value);
+  }
+  if (marketSymbolChanged) {
+    const feedDefaults = priceFeedDefaultsFor(target.BEAT_MARKET_SYMBOL);
+    for (const [key, value] of Object.entries(feedDefaults)) {
+      if (!Object.prototype.hasOwnProperty.call(patch, key)) {
+        target[key] = value;
+      }
+    }
   }
   return target;
 }
