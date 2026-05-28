@@ -98,7 +98,7 @@ export const LADDER_SIZE_PER_LEVEL    = parseFloat_('LADDER_SIZE_PER_LEVEL_USDC'
 // ── Market timing ────────────────────────────────────────────────────────────
 export const MARKET_WINDOW_SECONDS      = 300;   // each btc-updown-5m window is 5 min
 export const ENTRY_DELAY_SECONDS        = 2;     // start posting after window opens
-export const STOP_BUYING_BEFORE_CLOSE   = 15;   // stop buying N seconds before window close
+export const STOP_BUYING_BEFORE_CLOSE   = 0;   // stop buying N seconds before window close
 export const REDEEM_DELAY_AFTER_CLOSE   = 60;   // start polling for resolution shortly after close
 
 // ── Operational ─────────────────────────────────────────────────────────────

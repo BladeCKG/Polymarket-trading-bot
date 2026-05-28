@@ -344,11 +344,11 @@ export class BeatTrader {
   _signalFromDelta(delta) {
     const cfg = this.config;
     const thresholds = moveThresholdsForConfig(cfg);
-    if (delta >= thresholds.upMin && delta <= thresholds.upMax) {
+    if (delta > 0 && delta <= thresholds.upMax) {
       return { side: 'Up' };
     }
     const downMove = Math.abs(delta);
-    if (delta <= -thresholds.downMin && downMove <= thresholds.downMax) {
+    if (delta <= 0 && downMove <= thresholds.downMax) {
       return { side: 'Down' };
     }
     return null;
