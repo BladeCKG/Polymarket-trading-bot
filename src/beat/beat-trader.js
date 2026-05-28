@@ -61,19 +61,7 @@ function tradeStatusFromLifecycle(lifecycle, hasTrade) {
   return BEAT_LIFECYCLE.UPCOMING;
 }
 
-function moveThresholdsForConfig(cfg) {
-  const symbol = String(cfg.BEAT_MARKET_SYMBOL ?? 'BTC').toUpperCase();
-  if (symbol === 'ETH') {
-    return {
-      upMax: cfg.BEAT_ETH_MOVE_MAX_USD ?? cfg.BEAT_MOVE_MAX_USD,
-      downMax: cfg.BEAT_ETH_MOVE_MAX_USD ?? cfg.BEAT_MOVE_MAX_USD,
-    };
-  }
-  return {
-    upMax: cfg.BEAT_MOVE_MAX_USD,
-    downMax: cfg.BEAT_MOVE_MAX_USD,
-  };
-}
+// Removed obsolete moveThresholdsForConfig — per-moment thresholds are authoritative.
 
 export class BeatTrader {
   constructor(market, wallet, pnl, { dashboard = null, btcFeed = null, config = null } = {}) {
@@ -105,7 +93,8 @@ export class BeatTrader {
     const cfg = this.config;
     const { windowTs, conditionId, upToken, downToken } = this.market;
     const windowClose = windowTs + cfg.MARKET_WINDOW_SECONDS;
-    const skipEndMs = (windowTs * 1000) + (cfg.BEAT_ENTRY_DELAY_SECONDS * 1000);
+    const momentsForLog = Array.isArray(cfg.BEAT_MOMENTS) ? cfg.BEAT_MOMENTS : [];
+    const firstStart = Number(momentsForLog[0]?.start ?? 0);
 
     this.log.info('BeatTrader: starting', {
       conditionId,
@@ -114,7 +103,7 @@ export class BeatTrader {
       downTokenId: downToken.tokenId,
       windowOpen: new Date(windowTs * 1000).toISOString(),
       windowClose: new Date(windowClose * 1000).toISOString(),
-      skipSeconds: cfg.BEAT_ENTRY_DELAY_SECONDS,
+      skipSeconds: firstStart,
       orderMode: cfg.BEAT_ORDER_MODE,
     });
 
@@ -129,15 +118,17 @@ export class BeatTrader {
 
       this.beatPrice = await this._captureBeatPrice(windowTs);
 
-      const remainingSkipMs = skipEndMs - Date.now();
+      // Determine first allowed buy time from BEAT_MOMENTS (seconds after open)
+      const firstAllowedMs = (windowTs + firstStart) * 1000;
+      const remainingSkipMs = firstAllowedMs - Date.now();
       if (remainingSkipMs > 0) {
         this.lifecycle = BEAT_LIFECYCLE.WAITING_SKIP;
         this._publishMarket({
           lifecycle: BEAT_LIFECYCLE.WAITING_SKIP,
           tradeStatus: BEAT_LIFECYCLE.WAITING_SKIP,
         });
-        this.log.info('BeatTrader: skipping early market seconds', {
-          skipSeconds: cfg.BEAT_ENTRY_DELAY_SECONDS,
+        this.log.info('BeatTrader: waiting until first buy moment', {
+          firstStart,
           beatPrice: this.beatPrice,
           waitMs: Math.round(remainingSkipMs),
         });
@@ -223,10 +214,13 @@ export class BeatTrader {
 
   async _monitorLoop(windowClose) {
     const cfg = this.config;
-    while (true) {
+      while (true) {
       const nowSec = Math.floor(Date.now() / 1000);
-      if (nowSec >= windowClose - cfg.STOP_BUYING_BEFORE_CLOSE) {
-        this.log.info('BeatTrader: buy window closed', { stopBeforeClose: cfg.STOP_BUYING_BEFORE_CLOSE });
+      // Stop buying when past the last moment's end (seconds after open)
+      const momentsLocal = Array.isArray(cfg.BEAT_MOMENTS) ? cfg.BEAT_MOMENTS : [];
+      const lastEnd = Number(momentsLocal.length ? momentsLocal[momentsLocal.length - 1].end ?? cfg.MARKET_WINDOW_SECONDS : cfg.MARKET_WINDOW_SECONDS);
+      if (nowSec >= (this.market.windowTs + lastEnd)) {
+        this.log.info('BeatTrader: buy window closed (moments end)', { lastEnd });
         break;
       }
 
@@ -293,8 +287,17 @@ export class BeatTrader {
     }
 
     const delta = tick.price - this.beatPrice;
-    const signal = this._signalFromDelta(delta);
-    if (!signal) return;
+    // Determine per-moment thresholds (seconds after market open)
+    const secondsAfterOpen = Math.floor(Date.now() / 1000) - this.market.windowTs;
+    const moments = Array.isArray(cfg.BEAT_MOMENTS) ? cfg.BEAT_MOMENTS : [];
+    const moment = moments.find((m) => secondsAfterOpen >= Number(m.start ?? 0) && secondsAfterOpen < Number(m.end ?? cfg.MARKET_WINDOW_SECONDS)) || null;
+    // Require an explicit moment with thresholds to allow buys. If no moment or missing values, do not buy.
+    if (!moment || !Number.isFinite(Number(moment.btcmoveMax)) || !Number.isFinite(Number(moment.buyMax))) {
+      return;
+    }
+
+    const thresholds = { upMax: Number(moment.btcmoveMax), downMax: Number(moment.btcmoveMax) };
+    const resolvedBuyMax = Number(moment.buyMax);
 
     const bookState = {
       Up: {
@@ -302,25 +305,34 @@ export class BeatTrader {
         book: this.latestQuotes.up?.book ?? null,
         bid: this.latestQuotes.up?.bid ?? null,
         ask: this.latestQuotes.up?.ask ?? null,
-        maxBuyPrice: cfg.BEAT_MAX_BUY_PRICE,
+        maxBuyPrice: resolvedBuyMax,
       },
       Down: {
         tokenId: this.market.downToken.tokenId,
         book: this.latestQuotes.down?.book ?? null,
         bid: this.latestQuotes.down?.bid ?? null,
         ask: this.latestQuotes.down?.ask ?? null,
-        maxBuyPrice: cfg.BEAT_MAX_BUY_PRICE,
+        maxBuyPrice: resolvedBuyMax,
       },
     };
 
-    const leg = bookState[signal.side];
+    // Recompute signal using per-moment thresholds
+    const adaptedSignal = (function (deltaVal, thresholdsVal) {
+      if (deltaVal > 0 && deltaVal <= thresholdsVal.upMax) return { side: 'Up' };
+      const downMove = Math.abs(deltaVal);
+      if (deltaVal <= 0 && downMove <= thresholdsVal.downMax) return { side: 'Down' };
+      return null;
+    })(delta, thresholds);
+    if (!adaptedSignal) return;
+
+    const leg = bookState[adaptedSignal.side];
     if (!leg.ask || leg.ask.price > leg.maxBuyPrice) return;
 
     const maxPrice = clampMaxPrice(leg.ask.price, leg.maxBuyPrice, cfg.BEAT_MAX_SLIPPAGE);
     if (maxPrice + 1e-9 < leg.ask.price) return;
 
     await this._executeBuy({
-      side: signal.side,
+      side: adaptedSignal.side,
       tokenId: leg.tokenId,
       book: leg.book,
       bestBid: leg.bid,
@@ -331,18 +343,7 @@ export class BeatTrader {
     });
   }
 
-  _signalFromDelta(delta) {
-    const cfg = this.config;
-    const thresholds = moveThresholdsForConfig(cfg);
-    if (delta > 0 && delta <= thresholds.upMax) {
-      return { side: 'Up' };
-    }
-    const downMove = Math.abs(delta);
-    if (delta <= 0 && downMove <= thresholds.downMax) {
-      return { side: 'Down' };
-    }
-    return null;
-  }
+
 
   async _executeBuy({ side, tokenId, book, bestBid, bestAsk, maxPrice, delta, btcPrice }) {
     const cfg = this.config;

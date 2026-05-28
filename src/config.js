@@ -36,6 +36,28 @@ function parseEnum_(key, allowed, fallback) {
   return allowed.includes(raw) ? raw : fallback;
 }
 
+function parseMoments_(key, fallback) {
+  const v = process.env[key];
+  if (v === undefined) return fallback;
+  try {
+    const parsed = JSON.parse(v);
+    if (!Array.isArray(parsed)) return fallback;
+    // Expect compact double-array format: [[start,end,btcmoveMax,buyMax], ...]
+    return parsed.map((it) => {
+      if (!Array.isArray(it) || it.length < 4) throw new Error('Invalid BEAT_MOMENTS format');
+      const [s, e, bm, bk] = it;
+      return {
+        start: Number(s ?? 0),
+        end: Number(e ?? 300),
+        btcmoveMax: Number(bm),
+        buyMax: Number(bk),
+      };
+    });
+  } catch (err) {
+    return fallback;
+  }
+}
+
 // ── Wallet ───────────────────────────────────────────────────────────────────
 export const PRIVATE_KEY    = required('PRIVATE_KEY');
 export const PROXY_WALLET   = required('PROXY_WALLET'); // Keep EIP-55 checksum as-is
@@ -129,7 +151,7 @@ export const BTC_PRICE_PRODUCT_ID        = optional('BTC_PRICE_PRODUCT_ID', PRIC
 export const BTC_PRICE_REST_URL          = optional('BTC_PRICE_REST_URL', PRICE_FEED_DEFAULTS.restUrl);
 export const BTC_PRICE_MAX_AGE_MS        = parseInt_('BTC_PRICE_MAX_AGE_MS', 2_000);
 export const BEAT_DRY_RUN                = parseBool_('BEAT_DRY_RUN', true);
-export const BEAT_ENTRY_DELAY_SECONDS    = parseInt_('BEAT_ENTRY_DELAY_SECONDS', 15);
+// Entry delay is now controlled by `BEAT_MOMENTS` (per-moment starts)
 export const BEAT_BOOK_POLL_MS           = parseInt_('BEAT_BOOK_POLL_MS', 1_000);
 export const BEAT_BUY_COOLDOWN_MS        = parseInt_('BEAT_BUY_COOLDOWN_MS', 5_000);
 export const BEAT_ORDER_MODE             = parseEnum_('BEAT_ORDER_MODE', ['USDC', 'SHARES'], 'USDC');
@@ -138,16 +160,21 @@ export const BEAT_ORDER_SIZE_SHARES      = parseFloat_('BEAT_ORDER_SIZE_SHARES',
 export const BEAT_MAX_SLIPPAGE           = parseFloat_('BEAT_MAX_SLIPPAGE', 0.01);
 // Deprecated per-side move minimums removed (use unified thresholds instead)
 // Unified move maximum (USD): supports legacy env names for fallback
-export const BEAT_MOVE_MAX_USD =
-  parseFloat_('BEAT_MOVE_MAX_USD', parseFloat_('BEAT_UP_MOVE_MAX_USD', parseFloat_('BEAT_DOWN_MOVE_MAX_USD', 120)));
-// Per-symbol ETH override (kept for compatibility with older env names)
-export const BEAT_ETH_MOVE_MAX_USD =
-  parseFloat_('BEAT_ETH_MOVE_MAX_USD', parseFloat_('BEAT_ETH_UP_MOVE_MAX_USD', parseFloat_('BEAT_ETH_DOWN_MOVE_MAX_USD', 180)));
-// Unified max buy price (single setting for both sides)
-export const BEAT_MAX_BUY_PRICE = parseFloat_('BEAT_MAX_BUY_PRICE', parseFloat_('BEAT_UP_MAX_BUY_PRICE', parseFloat_('BEAT_DOWN_MAX_BUY_PRICE', 0.46)));
+// Per-moment configuration `BEAT_MOMENTS` controls move and buy thresholds.
 export const BEAT_DASHBOARD_ENABLED = parseBool_('BEAT_DASHBOARD_ENABLED', false);
 export const BEAT_DASHBOARD_HOST = optional('BEAT_DASHBOARD_HOST', '127.0.0.1');
 export const BEAT_DASHBOARD_PORT = parseInt_('BEAT_DASHBOARD_PORT', 8798);
+
+// Per-market time-segment configuration for directional buys.
+// Env var `BEAT_MOMENTS` should be a JSON array of objects like:
+// [{"start":0,"end":15,"btcmoveMax":100,"buyMax":0.1}, ...]
+// Values are seconds after market open (0-300 for 5m markets).
+// `BEAT_MOMENTS` accepts a compact double-array or array-of-objects JSON.
+// Compact form: [[start,end,btcmoveMax,buyMax], ...]
+export const BEAT_MOMENTS = parseMoments_('BEAT_MOMENTS', [
+  // Default: allow reasonable moves and buy price across full window
+  [0, MARKET_WINDOW_SECONDS, 120, 0.46],
+]);
 
 // ── EIP-712 domains for CLOB order signing ───────────────────────────────────
 // Polymarket has TWO exchange contracts. Orders MUST be signed against the

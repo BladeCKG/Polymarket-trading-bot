@@ -5,13 +5,9 @@ import {
   BEAT_DASHBOARD_HOST,
   BEAT_DASHBOARD_PORT,
   BEAT_DRY_RUN,
-  BEAT_MAX_BUY_PRICE,
-  BEAT_MOVE_MAX_USD,
-  BEAT_ENTRY_DELAY_SECONDS,
+  BEAT_MOMENTS,
   BEAT_MAX_SLIPPAGE,
   BEAT_MARKET_SYMBOL,
-  BEAT_ETH_MOVE_MAX_USD,
-  BEAT_ETH_UP_MOVE_MAX_USD,
   BEAT_ORDER_MODE,
   BEAT_ORDER_SIZE_SHARES,
   BEAT_ORDER_SIZE_USDC,
@@ -23,7 +19,6 @@ import {
   MAX_SPEND_PER_MARKET,
   MARKET_WINDOW_SECONDS,
   REDEEM_DELAY_AFTER_CLOSE,
-  STOP_BUYING_BEFORE_CLOSE,
 } from '../config.js';
 
 const DEFAULTS = Object.freeze({
@@ -34,19 +29,14 @@ const DEFAULTS = Object.freeze({
   BTC_PRICE_MAX_AGE_MS,
   MARKET_WINDOW_SECONDS,
   REDEEM_DELAY_AFTER_CLOSE,
-  STOP_BUYING_BEFORE_CLOSE,
   BEAT_DRY_RUN,
-  BEAT_ENTRY_DELAY_SECONDS,
   BEAT_BOOK_POLL_MS,
   BEAT_BUY_COOLDOWN_MS,
   BEAT_ORDER_MODE,
   BEAT_ORDER_SIZE_USDC,
   BEAT_ORDER_SIZE_SHARES,
   BEAT_MAX_SLIPPAGE,
-  BEAT_MOVE_MAX_USD,
-  BEAT_ETH_MOVE_MAX_USD,
-  BEAT_ETH_UP_MOVE_MAX_USD,
-  BEAT_MAX_BUY_PRICE,
+  BEAT_MOMENTS,
   MAX_INVENTORY_IMBALANCE,
   MAX_SPEND_PER_MARKET,
   BEAT_DASHBOARD_ENABLED,
@@ -69,6 +59,20 @@ function coerceValue(key, value) {
   if (typeof fallback === 'number') {
     const num = Number(value);
     return Number.isFinite(num) ? num : fallback;
+  }
+
+  // Arrays (e.g., BEAT_MOMENTS) — accept JSON string or array value
+  if (Array.isArray(fallback)) {
+    if (Array.isArray(value)) return value;
+    if (typeof value === 'string') {
+      try {
+        const parsed = JSON.parse(value);
+        if (Array.isArray(parsed)) return parsed;
+      } catch (err) {
+        return fallback;
+      }
+    }
+    return fallback;
   }
 
   if (key === 'BEAT_ORDER_MODE') {
