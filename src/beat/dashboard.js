@@ -20,9 +20,10 @@ function truncate(list, max) {
 }
 
 export class BeatDashboardServer {
-  constructor({ host, port, runtime, config }) {
+  constructor({ host, port, runtime, config, onConfigUpdate = null }) {
     this.host = host;
     this.port = port;
+    this._onConfigUpdate = onConfigUpdate;
     this.state = {
       runtime: {
         ...runtime,
@@ -58,6 +59,9 @@ export class BeatDashboardServer {
     this._wss.on('connection', (socket) => {
       this.state.runtime.connected = true;
       socket.send(JSON.stringify({ type: 'snapshot', data: clone(this.state) }));
+      socket.on('message', (raw) => {
+        this._handleMessage(socket, raw);
+      });
     });
 
     this._unsubscribeLogs = subscribeLogs((entry) => {
@@ -105,6 +109,11 @@ export class BeatDashboardServer {
     this.broadcast('stats', this.state.stats);
   }
 
+  setConfig(config) {
+    this.state.config = config;
+    this.broadcast('config', this.state.config);
+  }
+
   recordPrice(tick) {
     if (tick && typeof tick === 'object') {
       if (tick.price != null && Number.isFinite(Number(tick.price))) {
@@ -149,6 +158,35 @@ export class BeatDashboardServer {
     }
 
     this.broadcast('market', next);
+  }
+
+  _handleMessage(socket, raw) {
+    let payload = null;
+    try {
+      payload = JSON.parse(raw.toString('utf8'));
+    } catch {
+      socket.send(JSON.stringify({ type: 'error', data: { message: 'Invalid JSON message' } }));
+      return;
+    }
+
+    if (payload?.type === 'config:update') {
+      if (typeof this._onConfigUpdate !== 'function') {
+        socket.send(JSON.stringify({ type: 'error', data: { message: 'Config updates are disabled' } }));
+        return;
+      }
+
+      try {
+        const next = this._onConfigUpdate(payload.data ?? {});
+        if (next && typeof next === 'object') {
+          this.setConfig(next);
+        } else {
+          this.broadcast('config', this.state.config);
+        }
+        socket.send(JSON.stringify({ type: 'config:ack', data: { ok: true } }));
+      } catch (err) {
+        socket.send(JSON.stringify({ type: 'error', data: { message: err.message || 'Failed to apply config update' } }));
+      }
+    }
   }
 
   broadcast(type, data) {

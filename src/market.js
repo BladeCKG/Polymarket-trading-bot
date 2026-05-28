@@ -20,15 +20,15 @@ import logger from './logger.js';
  * Returns the unix timestamp of the CURRENT 5-min window open.
  * e.g. if now = 06:42:30, window open = 06:40:00 (ts ending in :00 on 5-min grid).
  */
-export function currentWindowTs() {
-  return Math.floor(Date.now() / 1000 / MARKET_WINDOW_SECONDS) * MARKET_WINDOW_SECONDS;
+export function currentWindowTs(windowSeconds = MARKET_WINDOW_SECONDS) {
+  return Math.floor(Date.now() / 1000 / windowSeconds) * windowSeconds;
 }
 
 /**
  * Returns the unix timestamp of the NEXT 5-min window open.
  */
-export function nextWindowTs() {
-  return currentWindowTs() + MARKET_WINDOW_SECONDS;
+export function nextWindowTs(windowSeconds = MARKET_WINDOW_SECONDS) {
+  return currentWindowTs(windowSeconds) + windowSeconds;
 }
 
 /**

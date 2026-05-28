@@ -1,27 +1,6 @@
-import {
-  BEAT_BOOK_POLL_MS,
-  BEAT_BUY_COOLDOWN_MS,
-  BEAT_DRY_RUN,
-  BEAT_DOWN_MAX_BUY_PRICE,
-  BEAT_DOWN_MOVE_MAX_USD,
-  BEAT_DOWN_MOVE_MIN_USD,
-  BEAT_ENTRY_DELAY_SECONDS,
-  BEAT_MAX_SLIPPAGE,
-  BEAT_ORDER_MODE,
-  BEAT_ORDER_SIZE_SHARES,
-  BEAT_ORDER_SIZE_USDC,
-  BEAT_UP_MAX_BUY_PRICE,
-  BEAT_UP_MOVE_MAX_USD,
-  BEAT_UP_MOVE_MIN_USD,
-  BTC_PRICE_MAX_AGE_MS,
-  MAX_INVENTORY_IMBALANCE,
-  MAX_SPEND_PER_MARKET,
-  MARKET_WINDOW_SECONDS,
-  REDEEM_DELAY_AFTER_CLOSE,
-  STOP_BUYING_BEFORE_CLOSE,
-} from '../config.js';
 import { BtcPriceFeed } from './btc-price-feed.js';
 import { BEAT_LIFECYCLE } from './lifecycle.js';
+import { createBeatRuntimeConfig } from './runtime-config.js';
 import { ClobClient } from '../clob.js';
 import { getTokenBalances, redeemPositions, sleep } from '../onchain.js';
 import { msUntil, waitForResolution } from '../market.js';
@@ -39,8 +18,8 @@ function bestAsk(book) {
     : null;
 }
 
-function clampMaxPrice(askPrice, capPrice) {
-  return Math.min(capPrice, askPrice + BEAT_MAX_SLIPPAGE);
+function clampMaxPrice(askPrice, capPrice, maxSlippage) {
+  return Math.min(capPrice, askPrice + maxSlippage);
 }
 
 function estimateSharesFromBook(book, maxPrice, targetShares) {
@@ -83,12 +62,13 @@ function tradeStatusFromLifecycle(lifecycle, hasTrade) {
 }
 
 export class BeatTrader {
-  constructor(market, wallet, pnl, { dashboard = null, btcFeed = null } = {}) {
+  constructor(market, wallet, pnl, { dashboard = null, btcFeed = null, config = null } = {}) {
     this.market = market;
     this.wallet = wallet;
     this.pnl = pnl;
     this.dashboard = dashboard;
     this.log = marketLogger(market.slug);
+    this.config = config ?? createBeatRuntimeConfig();
 
     this.lifecycle = BEAT_LIFECYCLE.UPCOMING;
     this.halted = false;
@@ -108,19 +88,20 @@ export class BeatTrader {
   }
 
   async run() {
+    const cfg = this.config;
     const { windowTs, conditionId, upToken, downToken } = this.market;
-    const windowClose = windowTs + MARKET_WINDOW_SECONDS;
-    const skipEndMs = (windowTs * 1000) + (BEAT_ENTRY_DELAY_SECONDS * 1000);
+    const windowClose = windowTs + cfg.MARKET_WINDOW_SECONDS;
+    const skipEndMs = (windowTs * 1000) + (cfg.BEAT_ENTRY_DELAY_SECONDS * 1000);
 
     this.log.info('BeatTrader: starting', {
       conditionId,
-      dryRun: BEAT_DRY_RUN,
+      dryRun: cfg.BEAT_DRY_RUN,
       upTokenId: upToken.tokenId,
       downTokenId: downToken.tokenId,
       windowOpen: new Date(windowTs * 1000).toISOString(),
       windowClose: new Date(windowClose * 1000).toISOString(),
-      skipSeconds: BEAT_ENTRY_DELAY_SECONDS,
-      orderMode: BEAT_ORDER_MODE,
+      skipSeconds: cfg.BEAT_ENTRY_DELAY_SECONDS,
+      orderMode: cfg.BEAT_ORDER_MODE,
     });
 
     this._startBtcFeed();
@@ -142,7 +123,7 @@ export class BeatTrader {
           tradeStatus: BEAT_LIFECYCLE.WAITING_SKIP,
         });
         this.log.info('BeatTrader: skipping early market seconds', {
-          skipSeconds: BEAT_ENTRY_DELAY_SECONDS,
+          skipSeconds: cfg.BEAT_ENTRY_DELAY_SECONDS,
           beatPrice: this.beatPrice,
           waitMs: Math.round(remainingSkipMs),
         });
@@ -167,12 +148,12 @@ export class BeatTrader {
     await this._redeemPhase(conditionId, windowClose);
 
     this.lifecycle = BEAT_LIFECYCLE.SETTLED;
-    this._publishMarket({
-      lifecycle: BEAT_LIFECYCLE.SETTLED,
-      settled: true,
-      settledAt: this.lastSettledAt ?? Date.now(),
-      tradeStatus: tradeStatusFromLifecycle(BEAT_LIFECYCLE.SETTLED, this.tradeSummary?.buyShares > 0),
-    });
+      this._publishMarket({
+        lifecycle: BEAT_LIFECYCLE.SETTLED,
+        settled: true,
+        settledAt: this.lastSettledAt ?? Date.now(),
+        tradeStatus: tradeStatusFromLifecycle(BEAT_LIFECYCLE.SETTLED, this.tradeSummary?.buyShares > 0),
+      });
     this.log.info('BeatTrader: market complete', {
       beatPrice: this.beatPrice,
       totalSpent: this.totalSpent.toFixed(4),
@@ -183,7 +164,7 @@ export class BeatTrader {
 
   _startBtcFeed() {
     if (!this._btcFeed) {
-      this._btcFeed = new BtcPriceFeed();
+      this._btcFeed = new BtcPriceFeed({ config: this.config });
     }
     if (this._btcFeedAttached) return;
 
@@ -233,10 +214,11 @@ export class BeatTrader {
   }
 
   async _monitorLoop(windowClose) {
+    const cfg = this.config;
     while (true) {
       const nowSec = Math.floor(Date.now() / 1000);
-      if (nowSec >= windowClose - STOP_BUYING_BEFORE_CLOSE) {
-        this.log.info('BeatTrader: buy window closed', { stopBeforeClose: STOP_BUYING_BEFORE_CLOSE });
+      if (nowSec >= windowClose - cfg.STOP_BUYING_BEFORE_CLOSE) {
+        this.log.info('BeatTrader: buy window closed', { stopBeforeClose: cfg.STOP_BUYING_BEFORE_CLOSE });
         break;
       }
 
@@ -244,11 +226,11 @@ export class BeatTrader {
 
       try {
         const snapshot = await this._snapshotMarketState();
-      this._publishMarket({
-        ...snapshot,
-        lifecycle: BEAT_LIFECYCLE.MONITORING,
-        tradeStatus: tradeStatusFromLifecycle(this.lifecycle, this.tradeSummary?.buyShares > 0),
-      });
+        this._publishMarket({
+          ...snapshot,
+          lifecycle: BEAT_LIFECYCLE.MONITORING,
+          tradeStatus: tradeStatusFromLifecycle(this.lifecycle, this.tradeSummary?.buyShares > 0),
+        });
         await this._maybeBuy(snapshot);
       } catch (err) {
         this.log.warn('BeatTrader: monitor iteration failed', { err: err.message });
@@ -258,7 +240,7 @@ export class BeatTrader {
         await this._syncBalances(this.market.upToken.tokenId, this.market.downToken.tokenId);
       }
 
-      await sleep(BEAT_BOOK_POLL_MS);
+      await sleep(cfg.BEAT_BOOK_POLL_MS);
     }
   }
 
@@ -289,15 +271,16 @@ export class BeatTrader {
   }
 
   async _maybeBuy(snapshot = {}) {
+    const cfg = this.config;
     if (!this.beatPrice) return;
-    if (Date.now() - this.lastBuyAt < BEAT_BUY_COOLDOWN_MS) return;
+    if (Date.now() - this.lastBuyAt < cfg.BEAT_BUY_COOLDOWN_MS) return;
 
     const tick = this.latestBtcTick;
     if (!tick) return;
 
     const ageMs = Date.now() - tick.timeMs;
-    if (ageMs > BTC_PRICE_MAX_AGE_MS) {
-      this.log.debug('BeatTrader: skipping stale BTC tick', { ageMs, maxAgeMs: BTC_PRICE_MAX_AGE_MS });
+    if (ageMs > cfg.BTC_PRICE_MAX_AGE_MS) {
+      this.log.debug('BeatTrader: skipping stale BTC tick', { ageMs, maxAgeMs: cfg.BTC_PRICE_MAX_AGE_MS });
       return;
     }
 
@@ -311,21 +294,21 @@ export class BeatTrader {
         book: this.latestQuotes.up?.book ?? null,
         bid: this.latestQuotes.up?.bid ?? null,
         ask: this.latestQuotes.up?.ask ?? null,
-        maxBuyPrice: BEAT_UP_MAX_BUY_PRICE,
+        maxBuyPrice: cfg.BEAT_UP_MAX_BUY_PRICE,
       },
       Down: {
         tokenId: this.market.downToken.tokenId,
         book: this.latestQuotes.down?.book ?? null,
         bid: this.latestQuotes.down?.bid ?? null,
         ask: this.latestQuotes.down?.ask ?? null,
-        maxBuyPrice: BEAT_DOWN_MAX_BUY_PRICE,
+        maxBuyPrice: cfg.BEAT_DOWN_MAX_BUY_PRICE,
       },
     };
 
     const leg = bookState[signal.side];
     if (!leg.ask || leg.ask.price > leg.maxBuyPrice) return;
 
-    const maxPrice = clampMaxPrice(leg.ask.price, leg.maxBuyPrice);
+    const maxPrice = clampMaxPrice(leg.ask.price, leg.maxBuyPrice, cfg.BEAT_MAX_SLIPPAGE);
     if (maxPrice + 1e-9 < leg.ask.price) return;
 
     await this._executeBuy({
@@ -341,26 +324,28 @@ export class BeatTrader {
   }
 
   _signalFromDelta(delta) {
-    if (delta >= BEAT_UP_MOVE_MIN_USD && delta <= BEAT_UP_MOVE_MAX_USD) {
+    const cfg = this.config;
+    if (delta >= cfg.BEAT_UP_MOVE_MIN_USD && delta <= cfg.BEAT_UP_MOVE_MAX_USD) {
       return { side: 'Up' };
     }
     const downMove = Math.abs(delta);
-    if (delta <= -BEAT_DOWN_MOVE_MIN_USD && downMove <= BEAT_DOWN_MOVE_MAX_USD) {
+    if (delta <= -cfg.BEAT_DOWN_MOVE_MIN_USD && downMove <= cfg.BEAT_DOWN_MOVE_MAX_USD) {
       return { side: 'Down' };
     }
     return null;
   }
 
   async _executeBuy({ side, tokenId, book, bestBid, bestAsk, maxPrice, delta, btcPrice }) {
-    const remainingBudget = MAX_SPEND_PER_MARKET - this.totalSpent;
+    const cfg = this.config;
+    const remainingBudget = cfg.MAX_SPEND_PER_MARKET - this.totalSpent;
     if (remainingBudget < 1) {
       this.halted = true;
       return;
     }
 
-    if (BEAT_ORDER_MODE === 'SHARES') {
+    if (cfg.BEAT_ORDER_MODE === 'SHARES') {
       const requestedShares = Math.min(
-        BEAT_ORDER_SIZE_SHARES,
+        cfg.BEAT_ORDER_SIZE_SHARES,
         remainingBudget / Math.max(bestAsk.price, 0.0001),
       );
       if (requestedShares <= 0) return;
@@ -368,7 +353,7 @@ export class BeatTrader {
       const plan = estimateSharesFromBook(book, maxPrice, requestedShares);
       if (!plan.fullyFilled || plan.fillShares <= 0 || plan.spentUsdc <= 0) return;
 
-      if (!BEAT_DRY_RUN) {
+      if (!cfg.BEAT_DRY_RUN) {
         try {
           const response = await ClobClient.postFOKLimitBuy(this.wallet, tokenId, maxPrice, plan.fillShares);
           if (response?.success === false) return;
@@ -382,13 +367,13 @@ export class BeatTrader {
       this.lastBuyAt = Date.now();
       this._publishTrade({
         lifecycle: BEAT_LIFECYCLE.MONITORING,
-        tradeStatus: BEAT_DRY_RUN ? 'dry-run buy placed' : 'buy placed',
+        tradeStatus: cfg.BEAT_DRY_RUN ? 'dry-run buy placed' : 'buy placed',
         chosenSide: this.tradeSummary?.chosenSide ?? side,
         buyShares: this.tradeSummary?.buyShares ?? plan.fillShares,
         buyUsdc: this.tradeSummary?.buyUsdc ?? plan.spentUsdc,
         buyPrice: this.tradeSummary?.buyPrice ?? (plan.spentUsdc / plan.fillShares),
       });
-      this.log.info(`BeatTrader: ${BEAT_DRY_RUN ? 'dry-run buy' : 'bought'} directional shares`, {
+      this.log.info(`BeatTrader: ${cfg.BEAT_DRY_RUN ? 'dry-run buy' : 'bought'} directional shares`, {
         side,
         shares: plan.fillShares,
         spentUsdc: plan.spentUsdc,
@@ -403,13 +388,13 @@ export class BeatTrader {
       return;
     }
 
-    const amountUsdc = Math.min(BEAT_ORDER_SIZE_USDC, remainingBudget);
+    const amountUsdc = Math.min(cfg.BEAT_ORDER_SIZE_USDC, remainingBudget);
     if (amountUsdc <= 0) return;
 
     const plan = ClobClient.estimateMarketBuyFillFromBook(book, maxPrice, amountUsdc, 0);
     if (!plan || plan.fillShares <= 0 || plan.spentUsdc <= 0) return;
 
-    if (!BEAT_DRY_RUN) {
+    if (!cfg.BEAT_DRY_RUN) {
       try {
         const response = await ClobClient.postIOCBuy(this.wallet, tokenId, maxPrice, amountUsdc);
         if (response?.success === false) return;
@@ -421,15 +406,15 @@ export class BeatTrader {
 
     this._recordBuy(side, plan.avgFillPrice ?? bestAsk.price, plan.fillShares, plan.spentUsdc);
     this.lastBuyAt = Date.now();
-      this._publishTrade({
-        lifecycle: BEAT_LIFECYCLE.MONITORING,
-        tradeStatus: BEAT_DRY_RUN ? 'dry-run buy placed' : 'buy placed',
+    this._publishTrade({
+      lifecycle: BEAT_LIFECYCLE.MONITORING,
+      tradeStatus: cfg.BEAT_DRY_RUN ? 'dry-run buy placed' : 'buy placed',
       chosenSide: this.tradeSummary?.chosenSide ?? side,
       buyShares: this.tradeSummary?.buyShares ?? plan.fillShares,
       buyUsdc: this.tradeSummary?.buyUsdc ?? plan.spentUsdc,
       buyPrice: this.tradeSummary?.buyPrice ?? (plan.avgFillPrice ?? bestAsk.price),
     });
-    this.log.info(`BeatTrader: ${BEAT_DRY_RUN ? 'dry-run buy' : 'bought'} directional USDC`, {
+    this.log.info(`BeatTrader: ${cfg.BEAT_DRY_RUN ? 'dry-run buy' : 'bought'} directional USDC`, {
       side,
       requestedUsdc: amountUsdc,
       estimatedFillShares: plan.fillShares,
@@ -471,10 +456,11 @@ export class BeatTrader {
   }
 
   _checkCircuitBreakers() {
+    const cfg = this.config;
     if (this.halted) return true;
 
     const imbalanceShares = Math.abs(this.balanceUp - this.balanceDown);
-    if (imbalanceShares > MAX_INVENTORY_IMBALANCE) {
+    if (imbalanceShares > cfg.MAX_INVENTORY_IMBALANCE) {
       this.log.warn('BeatTrader: inventory imbalance limit reached', {
         imbalanceShares,
         balanceUp: this.balanceUp,
@@ -485,7 +471,7 @@ export class BeatTrader {
       return true;
     }
 
-    if (this.totalSpent >= MAX_SPEND_PER_MARKET) {
+    if (this.totalSpent >= cfg.MAX_SPEND_PER_MARKET) {
       this.log.info('BeatTrader: spend cap reached', { totalSpent: this.totalSpent.toFixed(2) });
       this.halted = true;
       this.lifecycle = BEAT_LIFECYCLE.HALTED;
@@ -496,7 +482,7 @@ export class BeatTrader {
   }
 
   async _cancelAllOrders(conditionId) {
-    if (BEAT_DRY_RUN) {
+    if (this.config.BEAT_DRY_RUN) {
       this.log.info('BeatTrader: dry-run cancel skipped', { conditionId });
       return;
     }
@@ -527,7 +513,8 @@ export class BeatTrader {
   }
 
   async _redeemPhase(conditionId, windowClose) {
-    const redeemNotBeforeMs = (windowClose + REDEEM_DELAY_AFTER_CLOSE) * 1000;
+    const cfg = this.config;
+    const redeemNotBeforeMs = (windowClose + cfg.REDEEM_DELAY_AFTER_CLOSE) * 1000;
     const waitMs = redeemNotBeforeMs - Date.now();
     if (waitMs > 0) {
       this.log.debug('BeatTrader: waiting for resolution window', { waitMs });
@@ -562,7 +549,7 @@ export class BeatTrader {
       tradeOccurred: Boolean(this.tradeSummary?.buyShares > 0),
     });
 
-    if (BEAT_DRY_RUN) {
+    if (cfg.BEAT_DRY_RUN) {
       this.pnl.recordRedeem(this.market.slug, marketPnl, 'dry-run');
       this.log.info('BeatTrader: dry-run settlement simulated', {
         outcome,
@@ -622,13 +609,14 @@ export class BeatTrader {
 
   _publishMarket(patch = {}) {
     if (!this.dashboard) return;
+    const cfg = this.config;
     const lifecycle = patch.lifecycle ?? this.lifecycle;
     const settled = patch.settled ?? lifecycle === BEAT_LIFECYCLE.SETTLED;
     this.dashboard.recordMarket({
       slug: this.market.slug,
       windowTs: this.market.windowTs,
       windowOpenAt: this.market.windowTs * 1000,
-      windowCloseAt: (this.market.windowTs + MARKET_WINDOW_SECONDS) * 1000,
+      windowCloseAt: (this.market.windowTs + cfg.MARKET_WINDOW_SECONDS) * 1000,
       conditionId: this.market.conditionId,
       lifecycle,
       settled: Boolean(settled),

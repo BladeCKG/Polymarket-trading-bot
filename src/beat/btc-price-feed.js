@@ -6,12 +6,16 @@ import logger from '../logger.js';
 
 export class BtcPriceFeed extends EventEmitter {
   constructor({
+    config = null,
     url = BTC_PRICE_WS_URL,
     productId = BTC_PRICE_PRODUCT_ID,
+    restUrl = BTC_PRICE_REST_URL,
   } = {}) {
     super();
-    this.url = url;
-    this.productId = productId;
+    this.config = config;
+    this.url = config?.BTC_PRICE_WS_URL ?? url;
+    this.productId = config?.BTC_PRICE_PRODUCT_ID ?? productId;
+    this.restUrl = config?.BTC_PRICE_REST_URL ?? restUrl;
     this._ws = null;
     this._closed = false;
     this._reconnectDelayMs = 1_000;
@@ -34,12 +38,26 @@ export class BtcPriceFeed extends EventEmitter {
     this._ws?.close();
   }
 
+  updateConfig(config) {
+    this.config = config ?? this.config;
+    const nextUrl = this.config?.BTC_PRICE_WS_URL ?? BTC_PRICE_WS_URL;
+    const nextProductId = this.config?.BTC_PRICE_PRODUCT_ID ?? BTC_PRICE_PRODUCT_ID;
+    const nextRestUrl = this.config?.BTC_PRICE_REST_URL ?? BTC_PRICE_REST_URL;
+    const changed = nextUrl !== this.url || nextProductId !== this.productId || nextRestUrl !== this.restUrl;
+    this.url = nextUrl;
+    this.productId = nextProductId;
+    this.restUrl = nextRestUrl;
+    if (changed && this._ws && !this._closed) {
+      this._ws.close();
+    }
+  }
+
   getLatest() {
     return this._latest;
   }
 
   async fetchRestTick(timeoutMs = 5_000) {
-    const res = await axios.get(BTC_PRICE_REST_URL, { timeout: timeoutMs });
+    const res = await axios.get(this.restUrl, { timeout: timeoutMs });
     const payload = res?.data ?? {};
     const price = Number(payload.price);
     if (!Number.isFinite(price)) {

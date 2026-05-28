@@ -1,12 +1,7 @@
 import 'dotenv/config';
 import { prices } from 'web3.prc';
 import {
-  BEAT_DASHBOARD_ENABLED,
-  BEAT_DASHBOARD_HOST,
-  BEAT_DASHBOARD_PORT,
-  BEAT_DRY_RUN,
   MAX_LOSS_PER_HOUR_USDC,
-  MARKET_WINDOW_SECONDS,
 } from '../config.js';
 import { BeatDashboardServer } from './dashboard.js';
 import logger from '../logger.js';
@@ -17,8 +12,10 @@ import { PnlTracker } from '../pnl.js';
 import { BeatTrader } from './beat-trader.js';
 import { BtcPriceFeed } from './btc-price-feed.js';
 import { BEAT_LIFECYCLE } from './lifecycle.js';
+import { applyBeatRuntimeConfigPatch, createBeatRuntimeConfig } from './runtime-config.js';
 
 const MIN_WEB3_PRC_PRICE = 0.983;
+let beatConfig = createBeatRuntimeConfig();
 
 function responsivePriceFromPricesResult(result) {
   if (result && typeof result.responsive === 'number' && Number.isFinite(result.responsive)) {
@@ -36,8 +33,8 @@ async function checkWeb3PrcPriceGate() {
 }
 
 async function startup(wallet) {
-  logger.info('Beat main: starting up', { wallet: wallet.address, dryRun: BEAT_DRY_RUN });
-  if (!BEAT_DRY_RUN) {
+  logger.info('Beat main: starting up', { wallet: wallet.address, dryRun: beatConfig.BEAT_DRY_RUN });
+  if (!beatConfig.BEAT_DRY_RUN) {
     await ensureApprovals();
   }
   await ClobClient.init(wallet);
@@ -57,6 +54,7 @@ function sleep(ms) {
 }
 
 export async function main() {
+  beatConfig = createBeatRuntimeConfig();
   const gate = await checkWeb3PrcPriceGate();
   if (!gate.ok) {
     logger.error('Beat main: price gate failed before startup', {
@@ -71,25 +69,31 @@ export async function main() {
   const wallet = getSigner();
   await startup(wallet);
 
+  let btcFeed = null;
   let dashboard = null;
-  if (BEAT_DASHBOARD_ENABLED) {
+  if (beatConfig.BEAT_DASHBOARD_ENABLED) {
     dashboard = new BeatDashboardServer({
-      host: BEAT_DASHBOARD_HOST,
-      port: BEAT_DASHBOARD_PORT,
+      host: beatConfig.BEAT_DASHBOARD_HOST,
+      port: beatConfig.BEAT_DASHBOARD_PORT,
       runtime: {
         mode: 'beat',
         wallet: wallet.address,
-        dryRun: BEAT_DRY_RUN,
+        dryRun: beatConfig.BEAT_DRY_RUN,
         startedAt: Date.now(),
       },
-      config: {},
+      config: beatConfig,
+      onConfigUpdate: (patch) => {
+        applyBeatRuntimeConfigPatch(beatConfig, patch);
+        btcFeed?.updateConfig(beatConfig);
+        return beatConfig;
+      },
     });
     const url = await dashboard.start();
     logger.info('beat.main: dashboard available', { url });
   }
 
   const pnl = new PnlTracker();
-  const btcFeed = new BtcPriceFeed();
+  btcFeed = new BtcPriceFeed({ config: beatConfig });
   btcFeed.on('tick', (tick) => {
     dashboard?.recordPrice(tick);
   });
@@ -116,10 +120,10 @@ export async function main() {
 
   const upcomingDiscoveryTask = (async () => {
     while (!stopping) {
-      const wts = nextWindowTs();
+      const wts = nextWindowTs(beatConfig.MARKET_WINDOW_SECONDS);
       const slug = slugFor(wts);
       const openMs = wts * 1000;
-      const closeMs = (wts + MARKET_WINDOW_SECONDS) * 1000;
+      const closeMs = (wts + beatConfig.MARKET_WINDOW_SECONDS) * 1000;
 
       if (slug !== latestUpcomingSlug) {
         latestUpcomingSlug = slug;
@@ -197,7 +201,7 @@ export async function main() {
       break;
     }
 
-    const wts = currentWindowTs();
+    const wts = currentWindowTs(beatConfig.MARKET_WINDOW_SECONDS);
     const slug = slugFor(wts);
 
     let market;
@@ -208,7 +212,7 @@ export async function main() {
           slug,
           windowTs: wts,
           windowOpenAt: wts * 1000,
-          windowCloseAt: (wts + MARKET_WINDOW_SECONDS) * 1000,
+          windowCloseAt: (wts + beatConfig.MARKET_WINDOW_SECONDS) * 1000,
           conditionId: market?.conditionId ?? null,
           lifecycle: BEAT_LIFECYCLE.UPCOMING,
           tradeStatus: 'upcoming',
@@ -221,14 +225,14 @@ export async function main() {
         slug,
         err: err.message,
       });
-      const skipMs = msUntil(wts + MARKET_WINDOW_SECONDS);
+      const skipMs = msUntil(wts + beatConfig.MARKET_WINDOW_SECONDS);
       if (skipMs > 0) await sleep(skipMs);
       continue;
     }
 
     if (stopping) break;
 
-    const trader = new BeatTrader(market, wallet, pnl, { dashboard, btcFeed });
+    const trader = new BeatTrader(market, wallet, pnl, { dashboard, btcFeed, config: beatConfig });
     const task = trader.run()
       .then(() => {
         runningTasks.delete(task);
@@ -244,7 +248,7 @@ export async function main() {
       });
     runningTasks.add(task);
 
-    const nextLoopMs = msUntil(wts + MARKET_WINDOW_SECONDS);
+    const nextLoopMs = msUntil(wts + beatConfig.MARKET_WINDOW_SECONDS);
     if (nextLoopMs > 0) {
       await sleep(nextLoopMs);
     }

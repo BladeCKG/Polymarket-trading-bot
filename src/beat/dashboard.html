@@ -351,6 +351,62 @@
       background: rgba(255, 255, 255, 0.46);
     }
 
+    .config-toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 12px;
+    }
+
+    .config-editor {
+      width: 100%;
+      min-height: 260px;
+      padding: 14px;
+      border-radius: 16px;
+      border: 1px solid rgba(15, 118, 110, 0.18);
+      background: rgba(250, 252, 251, 0.96);
+      color: var(--ink);
+      font-family: "Consolas", "IBM Plex Mono", monospace;
+      font-size: 0.84rem;
+      line-height: 1.5;
+      resize: vertical;
+    }
+
+    .config-actions {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+
+    .config-button {
+      border: 1px solid rgba(15, 118, 110, 0.18);
+      background: var(--accent);
+      color: white;
+      border-radius: 999px;
+      padding: 10px 14px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+
+    .config-button.secondary {
+      background: rgba(255, 255, 255, 0.88);
+      color: var(--ink);
+    }
+
+    .config-note {
+      color: var(--muted);
+      font-size: 0.9rem;
+    }
+
+    .config-status {
+      font-size: 0.9rem;
+      color: var(--accent);
+      min-height: 1.2em;
+    }
+
     @media (max-width: 720px) {
       .shell { padding: 16px 12px 28px; }
       .hero { padding: 18px; }
@@ -375,6 +431,7 @@
     </section>
 
     <section class="grid" id="topStats"></section>
+    <section class="panel" id="configPanel"></section>
     <section class="sections" id="sections"></section>
   </div>
 
@@ -388,15 +445,18 @@
       btcBestBid: null,
       btcBestAsk: null,
       btcUpdatedAt: null,
+      config: {},
     };
 
     const topStatsEl = document.getElementById('topStats');
+    const configPanelEl = document.getElementById('configPanel');
     const sectionsEl = document.getElementById('sections');
     const connectionEl = document.getElementById('connection');
     const runtimeLabelEl = document.getElementById('runtimeLabel');
     const modeLabelEl = document.getElementById('modeLabel');
-    const dirty = new Set(['chrome', 'topStats', 'markets', 'logs']);
+    const dirty = new Set(['chrome', 'topStats', 'config', 'markets', 'logs']);
     let renderScheduled = false;
+    let configMessageTimeout = null;
 
     function money(v, digits = 2) {
       const n = Number(v);
@@ -454,6 +514,15 @@
       if (text.includes('wait') || text.includes('discover') || text.includes('watch')) return 'waiting';
       if (text.includes('error') || text.includes('fail')) return 'error';
       return 'waiting';
+    }
+
+    function escapeHtml(value) {
+      return String(value ?? '')
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#39;');
     }
 
     function getWindowOpenMs(market) {
@@ -541,6 +610,30 @@
               <div class="value">${price(market.buyPrice)}</div>
             </div>
           </div>
+        </div>
+      `;
+    }
+
+    function renderConfig() {
+      const configJson = JSON.stringify(state.config ?? {}, null, 2);
+      return `
+        <div class="panel-head">
+          <div>
+            <h2 class="panel-title">Runtime Config</h2>
+            <div class="panel-subtitle">Edit beat settings live. Some startup-only values still require a restart, but the active strategy reads this object directly.</div>
+          </div>
+          <div class="status-chip live">Editable</div>
+        </div>
+        <div class="panel-body">
+          <div class="config-toolbar">
+            <div class="config-note">Changes are applied immediately to the running beat loop when possible.</div>
+            <div class="config-actions">
+              <button class="config-button secondary" type="button" data-config-action="reload">Reload</button>
+              <button class="config-button" type="button" data-config-action="apply">Apply</button>
+            </div>
+          </div>
+          <textarea class="config-editor" id="configEditor" spellcheck="false">${escapeHtml(configJson)}</textarea>
+          <div class="config-status" id="configStatus"></div>
         </div>
       `;
     }
@@ -650,6 +743,50 @@
       `;
     }
 
+    function showConfigStatus(message, isError = false) {
+      const el = document.getElementById('configStatus');
+      if (!el) return;
+      el.textContent = message;
+      el.style.color = isError ? 'var(--bad)' : 'var(--accent)';
+      if (configMessageTimeout) clearTimeout(configMessageTimeout);
+      configMessageTimeout = setTimeout(() => {
+        if (el.textContent === message) el.textContent = '';
+      }, 3500);
+    }
+
+    function readConfigEditor() {
+      const el = document.getElementById('configEditor');
+      if (!el) return null;
+      const raw = el.value.trim();
+      if (!raw) return {};
+      return JSON.parse(raw);
+    }
+
+    function bindConfigControls() {
+      if (configPanelEl.dataset.bound === 'true') return;
+      configPanelEl.dataset.bound = 'true';
+      configPanelEl.addEventListener('click', (event) => {
+        const button = event.target?.closest?.('[data-config-action]');
+        if (!button) return;
+        const action = button.getAttribute('data-config-action');
+        if (action === 'reload') {
+          const editor = document.getElementById('configEditor');
+          if (editor) editor.value = JSON.stringify(state.config ?? {}, null, 2);
+          showConfigStatus('Reloaded current runtime config.');
+          return;
+        }
+        if (action === 'apply') {
+          try {
+            const next = readConfigEditor();
+            ws?.send(JSON.stringify({ type: 'config:update', data: next }));
+            showConfigStatus('Sent config update to runtime...');
+          } catch (err) {
+            showConfigStatus(`Config JSON error: ${err.message}`, true);
+          }
+        }
+      });
+    }
+
     function renderLogs() {
       const logs = Array.isArray(state.logs) ? state.logs : [];
       const content = logs.length
@@ -679,6 +816,7 @@
       if (keys.length === 0) {
         dirty.add('chrome');
         dirty.add('topStats');
+        dirty.add('config');
         dirty.add('markets');
         dirty.add('logs');
       } else {
@@ -701,6 +839,11 @@
         renderTop();
         dirty.delete('topStats');
       }
+      if (dirty.has('config')) {
+        configPanelEl.innerHTML = renderConfig();
+        bindConfigControls();
+        dirty.delete('config');
+      }
       if (dirty.has('markets')) {
         sectionsEl.innerHTML = renderMarkets() + renderLogs();
         dirty.delete('markets');
@@ -715,6 +858,9 @@
       if (type === 'runtime') {
         state.runtime = { ...state.runtime, ...data };
         scheduleRender('chrome');
+      } else if (type === 'config') {
+        state.config = { ...state.config, ...data };
+        scheduleRender('config');
       } else if (type === 'stats') {
         state.stats = { ...state.stats, ...data };
         scheduleRender('topStats');
@@ -749,7 +895,7 @@
       }
     }
 
-    const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
+    let ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
     ws.addEventListener('open', () => {
       state.runtime.connected = true;
       scheduleRender();
@@ -759,10 +905,19 @@
       scheduleRender('chrome');
     });
     ws.addEventListener('message', (event) => {
-      const payload = JSON.parse(event.data);
+      let payload;
+      try {
+        payload = JSON.parse(event.data);
+      } catch {
+        return;
+      }
       if (payload.type === 'snapshot') {
         Object.assign(state, payload.data);
         scheduleRender();
+      } else if (payload.type === 'config:ack') {
+        showConfigStatus('Config applied.');
+      } else if (payload.type === 'error') {
+        showConfigStatus(payload?.data?.message || 'Config update failed.', true);
       } else {
         handleEvent(payload.type, payload.data);
       }
