@@ -277,13 +277,23 @@ export class BeatTrader {
     if (!this.beatPrice) return;
     if (Date.now() - this.lastBuyAt < cfg.BEAT_BUY_COOLDOWN_MS) return;
 
-    const tick = this.latestBtcTick;
+    let tick = this.latestBtcTick;
     if (!tick) return;
 
-    const ageMs = Date.now() - tick.timeMs;
+    let ageMs = Date.now() - tick.timeMs;
     if (ageMs > cfg.BTC_PRICE_MAX_AGE_MS) {
-      this.log.debug('BeatTrader: skipping stale BTC tick', { ageMs, maxAgeMs: cfg.BTC_PRICE_MAX_AGE_MS });
-      return;
+      try {
+        const refreshed = await this._btcFeed.fetchRestTick(1_500);
+        tick = refreshed;
+        this.latestBtcTick = refreshed;
+        ageMs = Date.now() - refreshed.timeMs;
+      } catch (err) {
+        this.log.debug('BeatTrader: stale tick refresh failed', { err: err.message });
+      }
+      if (ageMs > cfg.BTC_PRICE_MAX_AGE_MS) {
+        this.log.debug('BeatTrader: skipping stale BTC tick', { ageMs, maxAgeMs: cfg.BTC_PRICE_MAX_AGE_MS });
+        return;
+      }
     }
 
     const delta = tick.price - this.beatPrice;
