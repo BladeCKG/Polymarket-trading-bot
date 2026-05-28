@@ -166,7 +166,25 @@ export class BeatTrader {
         await sleep(waitMs);
       }
 
-      this.beatPrice = await this._captureBeatPrice(windowTs);
+      try {
+        this.beatPrice = await this._captureBeatPrice(windowTs);
+      } catch (err) {
+        this.lifecycle = BEAT_LIFECYCLE.HALTED;
+        this.log.warn('BeatTrader: unable to capture trustworthy beat price, halting market', {
+          err: err.message,
+          windowOpen: new Date(windowTs * 1000).toISOString(),
+        });
+        this._recordAudit('beat_price_capture_failed', {
+          err: err.message,
+          windowTs,
+          reason: 'untrusted-beat-price',
+        });
+        this._publishMarket({
+          lifecycle: BEAT_LIFECYCLE.HALTED,
+          tradeStatus: BEAT_LIFECYCLE.HALTED,
+        });
+        return;
+      }
 
       // Determine first allowed buy time from the symbol-specific moments.
       const firstAllowedMs = (windowTs + firstStart) * 1000;
@@ -248,30 +266,34 @@ export class BeatTrader {
   }
 
   async _captureBeatPrice(windowTs) {
-    let tick = null;
     const windowOpenMs = windowTs * 1000;
-    const marketAlreadyOpen = Date.now() > (windowOpenMs + 2_000);
-    if (marketAlreadyOpen) {
+    const deadlineMs = Date.now() + 20_000;
+    let tick = null;
+    let lastErr = null;
+
+    while (Date.now() <= deadlineMs) {
       try {
         tick = await this._btcFeed.fetchHistoricalTickAt(windowOpenMs);
-        this.log.info('BeatTrader: recovered historical beat price for already-open market', {
-          beatPrice: tick.price,
-          btcTime: tick.isoTime,
-          source: tick.source,
-        });
+        break;
       } catch (err) {
-        this.log.warn('BeatTrader: historical beat capture failed, falling back to current price', { err: err.message });
+        lastErr = err;
+        await sleep(500);
       }
     }
-    try {
-      tick = tick ?? await this._btcFeed.fetchRestTick();
-    } catch (err) {
-      this.log.warn('BeatTrader: REST beat capture failed, falling back to live BTC tick', { err: err.message });
-      tick = this._btcFeed.getLatest();
-      if (!tick) {
-        tick = await this._btcFeed.waitForTickAfter(windowTs * 1000, 20_000);
-      }
+
+    if (!tick || !Number.isFinite(Number(tick.price))) {
+      const reason = lastErr?.message ? `: ${lastErr.message}` : '';
+      throw new Error(`Historical beat price unavailable for ${new Date(windowOpenMs).toISOString()}${reason}`);
     }
+    if (!tick.historical) {
+      throw new Error(`Beat tick for ${new Date(windowOpenMs).toISOString()} was not historical`);
+    }
+    if (Number(tick.timeMs) !== windowOpenMs) {
+      throw new Error(
+        `Historical beat tick time ${new Date(tick.timeMs).toISOString()} does not match market open ${new Date(windowOpenMs).toISOString()}`,
+      );
+    }
+
     this.latestBtcTick = tick;
     this._publishMarket({
       lifecycle: BEAT_LIFECYCLE.WAITING_SKIP,
