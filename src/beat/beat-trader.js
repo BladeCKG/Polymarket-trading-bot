@@ -629,9 +629,28 @@ export class BeatTrader {
     return null;
   }
 
+  _buyShareCounts() {
+    const events = Array.isArray(this.tradeSummary?.buyEvents) ? this.tradeSummary.buyEvents : [];
+    return events.reduce(
+      (counts, buy) => {
+        if (!buy || typeof buy.side !== 'string') return counts;
+        if (buy.side === 'Up') counts.up += Number(buy.shares ?? 0);
+        if (buy.side === 'Down') counts.down += Number(buy.shares ?? 0);
+        return counts;
+      },
+      { up: 0, down: 0 },
+    );
+  }
+
   _estimateRedeemPayout(resolvedMarket) {
     const payouts = resolvedMarket?.resolvedPayouts;
     if (Array.isArray(payouts) && payouts.length >= 2) {
+      const { up, down } = this._buyShareCounts();
+      const upShares = Number.isFinite(up) && up >= 0 ? up : this.balanceUp;
+      const downShares = Number.isFinite(down) && down >= 0 ? down : this.balanceDown;
+      if (up > 0 || down > 0) {
+        return (upShares * Number(payouts[0] ?? 0)) + (downShares * Number(payouts[1] ?? 0));
+      }
       return (this.balanceUp * Number(payouts[0] ?? 0)) + (this.balanceDown * Number(payouts[1] ?? 0));
     }
     return Math.max(this.balanceUp, this.balanceDown);

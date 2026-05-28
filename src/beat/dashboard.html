@@ -586,6 +586,14 @@
       return Number.isFinite(openMs) ? openMs : null;
     }
 
+    function secondsAfterMarketOpen(buy, market) {
+      if (!buy?.recordedAt) return '-';
+      const openMs = getWindowOpenMs(market);
+      if (!openMs) return ago(buy.recordedAt);
+      const sec = Math.max(0, Math.round((Number(buy.recordedAt) - openMs) / 1000));
+      return `${sec}s`;
+    }
+
     function getWindowCloseMs(market) {
       const closeMs = Number(market?.windowCloseAt ?? null);
       return Number.isFinite(closeMs) ? closeMs : null;
@@ -654,7 +662,7 @@
                 <div class="meta">
                   ${buy?.shares != null ? `${Number(buy.shares).toFixed(4)} shares` : '-'} at ${price(buy?.price)}
                   ${buyMovePct != null ? ` • move ${signedMoney(buyMove)} (${buyMovePct >= 0 ? '+' : ''}${Number(buyMovePct).toFixed(2)}%)` : ''}
-                  ${buy?.recordedAt ? ` • ${ago(buy.recordedAt)}` : ''}
+                  ${buy?.recordedAt ? ` • ${secondsAfterMarketOpen(buy, market)}` : ''}
                 </div>
               </div>
             `;
