@@ -924,7 +924,6 @@
           </div>
           <div class="metric-grid">
             <div class="metric"><div class="label">Beat ${symbol}</div><div class="value">${money(beat)}</div></div>
-            <div class="metric"><div class="label">Latest Source</div><div class="value small">${latestSnapshot ? `${latestSnapshot.source} @ ${ts(latestSnapshot.updatedAt)}` : '-'}</div></div>
             ${!settled ? `<div class="metric"><div class="label">${moveLabel}</div><div class="value ${moveValueClass}">${moveValueText}</div></div>` : ''}
             ${traded && !settled ? `<div class="metric"><div class="label">Simulated If Up</div><div class="value ${pnlIfUp >= 0 ? 'summary-positive' : 'summary-negative'}">${money(pnlIfUp)}</div></div><div class="metric"><div class="label">Simulated If Down</div><div class="value ${pnlIfDown >= 0 ? 'summary-positive' : 'summary-negative'}">${money(pnlIfDown)}</div></div>` : ''}
             <div class="metric"><div class="label">Up Bid</div><div class="value">${price(market.upBestBid)}</div></div>
@@ -942,7 +941,7 @@
     function renderMarkets() {
       const markets = Array.isArray(state.markets) ? state.markets : [];
       const live = sortMarketsForView(markets.filter((m) => !isSettledMarket(m)));
-      const settled = [...markets.filter((m) => isSettledMarket(m))]
+      const settled = [...markets.filter((m) => isSettledMarket(m) && (m.tradeOccurred || Number(m.buyShares || 0) > 0))]
         .sort((a, b) => Number(b?.windowTs ?? 0) - Number(a?.windowTs ?? 0));
 
       const liveHtml = live.length
@@ -972,7 +971,7 @@
           <div class="panel-head">
             <div>
               <h2 class="panel-title">Settled Markets</h2>
-              <div class="panel-subtitle">Outcome, PnL, and trade details for each completed market.</div>
+              <div class="panel-subtitle">Outcome, PnL, and trade details for completed markets that actually traded.</div>
             </div>
             <div>
               <button class="panel-toggle" type="button" data-panel-toggle="settledMarkets">${sectionCollapsed.settledMarkets ? 'Expand' : 'Collapse'}</button>
