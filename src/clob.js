@@ -826,6 +826,20 @@ export class BookFeed extends EventEmitter {
 
   _handleMessage(msg) {
     const { event_type, asset_id } = msg;
+    const eventTimeMs = (() => {
+      const candidates = [msg.timestamp, msg.time, msg.created_at, msg.last_updated_at];
+      for (const candidate of candidates) {
+        const asNumber = Number(candidate);
+        if (Number.isFinite(asNumber) && asNumber > 0) {
+          return asNumber > 1e12 ? asNumber : asNumber * 1000;
+        }
+        const parsed = Date.parse(String(candidate ?? ''));
+        if (Number.isFinite(parsed)) {
+          return parsed;
+        }
+      }
+      return Date.now();
+    })();
 
     if (event_type === 'book') {
       const tid = asset_id ?? msg.asset_id;
@@ -913,6 +927,8 @@ export class BookFeed extends EventEmitter {
           tokenId: tid,
           price: parseFloat(msg.price),
           size: parseFloat(msg.size),
+          side: msg.side ?? msg.taker_side ?? null,
+          timeMs: eventTimeMs,
         });
       }
       return;
@@ -921,7 +937,13 @@ export class BookFeed extends EventEmitter {
     if (event_type === 'trade') {
       const tid = asset_id ?? msg.asset_id;
       if (tid) {
-        this.emit('trade', { tokenId: tid, price: parseFloat(msg.price), size: parseFloat(msg.size) });
+        this.emit('trade', {
+          tokenId: tid,
+          price: parseFloat(msg.price),
+          size: parseFloat(msg.size),
+          side: msg.side ?? msg.taker_side ?? null,
+          timeMs: eventTimeMs,
+        });
       }
     }
   }

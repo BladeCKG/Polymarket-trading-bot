@@ -1,7 +1,8 @@
 import { BtcPriceFeed } from './btc-price-feed.js';
+import { BeatOfiTracker } from './ofi.js';
 import { BEAT_LIFECYCLE } from './lifecycle.js';
 import { createBeatRuntimeConfig } from './runtime-config.js';
-import { ClobClient } from '../clob.js';
+import { BookFeed, ClobClient } from '../clob.js';
 import { getTokenBalances, redeemPositions, sleep } from '../onchain.js';
 import { msUntil, waitForResolution } from '../market.js';
 import { getMarketLogFilePath, marketFileLogger, marketLogger } from '../logger.js';
@@ -94,7 +95,7 @@ function positiveFiniteOrNull(value) {
 }
 
 export class BeatTrader {
-  constructor(market, wallet, pnl, { dashboard = null, btcFeed = null, config = null, onSettled = null } = {}) {
+  constructor(market, wallet, pnl, { dashboard = null, btcFeed = null, bookFeed = null, config = null, onSettled = null } = {}) {
     this.market = market;
     this.wallet = wallet;
     this.pnl = pnl;
@@ -121,6 +122,17 @@ export class BeatTrader {
     this._btcFeed = btcFeed;
     this._ownsBtcFeed = !btcFeed;
     this._btcFeedAttached = false;
+    this._bookFeed = bookFeed;
+    this._ownsBookFeed = !bookFeed;
+    this._bookFeedAttached = false;
+    this.ofi = new BeatOfiTracker({
+      enabled: this.config.BEAT_OFI_ENABLED,
+      windowMs: this.config.BEAT_OFI_WINDOW_MS,
+      toxicityThreshold: this.config.BEAT_OFI_TOXICITY_THRESHOLD,
+      ratioEnter: this.config.BEAT_OFI_RATIO_ENTER,
+      ratioExit: this.config.BEAT_OFI_RATIO_EXIT,
+      exitRatio: this.config.BEAT_OFI_EXIT_RATIO,
+    });
     this._loopCount = 0;
   }
 
@@ -157,12 +169,19 @@ export class BeatTrader {
         buyCooldownMs: cfg.BEAT_BUY_COOLDOWN_MS,
         maxSpendPerMarket: cfg.MAX_SPEND_PER_MARKET,
         maxInventoryImbalanceShares: cfg.BEAT_MAX_INVENTORY_IMBALANCE_SHARES,
+        ofiEnabled: cfg.BEAT_OFI_ENABLED,
+        ofiWindowMs: cfg.BEAT_OFI_WINDOW_MS,
+        ofiToxicityThreshold: cfg.BEAT_OFI_TOXICITY_THRESHOLD,
+        ofiRatioEnter: cfg.BEAT_OFI_RATIO_ENTER,
+        ofiRatioExit: cfg.BEAT_OFI_RATIO_EXIT,
+        ofiExitRatio: cfg.BEAT_OFI_EXIT_RATIO,
         moments: momentsForLog,
       },
       auditLogPath: getMarketLogFilePath(this.market.slug),
     });
 
     this._startBtcFeed();
+    this._startBookFeed();
 
     try {
       const waitMs = msUntil(windowTs);
@@ -228,6 +247,9 @@ export class BeatTrader {
       if (this._ownsBtcFeed) {
         this._btcFeed?.stop();
       }
+      if (this._ownsBookFeed) {
+        this._bookFeed?.stop();
+      }
     }
 
     this.lifecycle = BEAT_LIFECYCLE.RESOLVING;
@@ -271,6 +293,34 @@ export class BeatTrader {
     if (this._ownsBtcFeed) {
       this._btcFeed.start();
     }
+  }
+
+  _startBookFeed() {
+    if (!this._bookFeed) {
+      this._bookFeed = new BookFeed([this.market.upToken.tokenId, this.market.downToken.tokenId]);
+    }
+    if (this._bookFeedAttached) return;
+
+    this._bookFeedAttached = true;
+    this._bookFeed.on('trade', (trade) => {
+      this.ofi.recordTrade(trade);
+    });
+    this._bookFeed.on('error', (err) => {
+      this.log.warn('BeatTrader: market book feed error', { err: err.message });
+    });
+    if (this._ownsBookFeed) {
+      this._bookFeed.start();
+    }
+  }
+
+  _syncOfiConfig() {
+    this.ofi.enabled = Boolean(this.config.BEAT_OFI_ENABLED);
+    this.ofi.windowMs = Math.max(250, Number(this.config.BEAT_OFI_WINDOW_MS) || 3_000);
+    this.ofi.toxicityThreshold = Math.max(1, Number(this.config.BEAT_OFI_TOXICITY_THRESHOLD) || 200);
+    this.ofi.ratioEnter = Math.max(0, Math.min(1, Number(this.config.BEAT_OFI_RATIO_ENTER) || 0.70));
+    this.ofi.ratioExit = Math.max(0, Math.min(this.ofi.ratioEnter, Number(this.config.BEAT_OFI_RATIO_EXIT) || 0.40));
+    this.ofi.exitRatio = Math.max(0.05, Math.min(0.99, Number(this.config.BEAT_OFI_EXIT_RATIO) || 0.85));
+    this.ofi.hotThreshold = this.ofi.toxicityThreshold * 0.5;
   }
 
   async _captureBeatPrice(windowTs) {
@@ -459,6 +509,7 @@ export class BeatTrader {
 
   async _maybeBuy(snapshot = {}) {
     const cfg = this.config;
+    this._syncOfiConfig();
     if (!this.beatPrice) {
       this._recordAudit('decision_skip', { reason: 'missing-beat-price', snapshot });
       return;
@@ -601,7 +652,46 @@ export class BeatTrader {
       })[0];
     const leg = selected.leg;
     const chosenSide = selected.side;
-    const maxPrice = selected.maxPrice;
+    const ofiDecision = this.ofi.decisionFor(
+      leg.tokenId,
+      Number(leg.book?.tickSize ?? 0.01),
+      Date.now(),
+    );
+    if (ofiDecision.suppress) {
+      this._recordAudit('decision_skip', {
+        reason: 'ofi-suppressed',
+        secondsAfterOpen,
+        chosenSide,
+        preferredSide,
+        delta,
+        absoluteMove,
+        beatPrice: this.beatPrice,
+        btcPrice: tick.price,
+        moment,
+        ofiDecision,
+      });
+      return;
+    }
+
+    const maxPrice = Math.max(0, selected.maxPrice - ofiDecision.adjustPrice);
+    if (maxPrice + 1e-9 < Number(leg.ask?.price ?? Infinity)) {
+      this._recordAudit('decision_skip', {
+        reason: 'ofi-softened-price-below-ask',
+        secondsAfterOpen,
+        chosenSide,
+        preferredSide,
+        delta,
+        absoluteMove,
+        beatPrice: this.beatPrice,
+        btcPrice: tick.price,
+        moment,
+        ofiDecision,
+        askPrice: leg.ask?.price ?? null,
+        originalMaxPrice: selected.maxPrice,
+        softenedMaxPrice: maxPrice,
+      });
+      return;
+    }
 
     this._recordAudit('decision_buy_signal', {
       secondsAfterOpen,
@@ -629,6 +719,7 @@ export class BeatTrader {
         maxBuyPrice: leg.maxBuyPrice,
         maxPrice,
       },
+      ofiDecision,
     });
 
     await this._executeBuy({

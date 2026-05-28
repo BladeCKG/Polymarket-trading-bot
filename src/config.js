@@ -226,6 +226,12 @@ export const BEAT_ORDER_SIZE_USDC        = parseFloat_('BEAT_ORDER_SIZE_USDC', 2
 export const BEAT_ORDER_SIZE_SHARES      = parseFloat_('BEAT_ORDER_SIZE_SHARES', 10);
 export const BEAT_MAX_SLIPPAGE           = parseFloat_('BEAT_MAX_SLIPPAGE', 0.01);
 export const BEAT_MAX_INVENTORY_IMBALANCE_SHARES = parseFloat_('BEAT_MAX_INVENTORY_IMBALANCE_SHARES', 200);
+export const BEAT_OFI_ENABLED            = parseBool_('BEAT_OFI_ENABLED', true);
+export const BEAT_OFI_WINDOW_MS          = parseInt_('BEAT_OFI_WINDOW_MS', 3_000);
+export const BEAT_OFI_TOXICITY_THRESHOLD = parseFloat_('BEAT_OFI_TOXICITY_THRESHOLD', 200);
+export const BEAT_OFI_RATIO_ENTER        = parseFloat_('BEAT_OFI_RATIO_ENTER', 0.70);
+export const BEAT_OFI_RATIO_EXIT         = parseFloat_('BEAT_OFI_RATIO_EXIT', 0.40);
+export const BEAT_OFI_EXIT_RATIO         = parseFloat_('BEAT_OFI_EXIT_RATIO', 0.85);
 // Deprecated per-side move minimums removed (use unified thresholds instead)
 export const BEAT_DASHBOARD_ENABLED = parseBool_('BEAT_DASHBOARD_ENABLED', false);
 export const BEAT_DASHBOARD_HOST = optional('BEAT_DASHBOARD_HOST', '127.0.0.1');
