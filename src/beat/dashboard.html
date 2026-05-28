@@ -173,6 +173,21 @@
       font-size: 0.9rem;
     }
 
+    .panel-toggle {
+      border: 1px solid rgba(15, 118, 110, 0.18);
+      background: rgba(255, 255, 255, 0.88);
+      color: var(--ink);
+      border-radius: 999px;
+      padding: 7px 12px;
+      font-size: 0.8rem;
+      font-weight: 700;
+      cursor: pointer;
+    }
+
+    .panel-body.is-collapsed {
+      display: none;
+    }
+
     .panel-body {
       padding: 0 20px 20px;
     }
@@ -506,6 +521,10 @@
     const dirty = new Set(['chrome', 'topStats', 'config', 'markets', 'logs']);
     let renderScheduled = false;
     let configMessageTimeout = null;
+    const sectionCollapsed = {
+      liveMarkets: false,
+      settledMarkets: false,
+    };
 
     function money(v, digits = 2) {
       const n = Number(v);
@@ -836,7 +855,8 @@
     function renderMarkets() {
       const markets = Array.isArray(state.markets) ? state.markets : [];
       const live = sortMarketsForView(markets.filter((m) => !isSettledMarket(m)));
-      const settled = sortMarketsForView(markets.filter((m) => isSettledMarket(m)));
+      const settled = [...markets.filter((m) => isSettledMarket(m))]
+        .sort((a, b) => Number(b?.windowTs ?? 0) - Number(a?.windowTs ?? 0));
 
       const liveHtml = live.length
         ? live.map(renderMarketCard).join('')
@@ -852,9 +872,12 @@
               <h2 class="panel-title">Live Markets</h2>
               <div class="panel-subtitle">Open and pre-open up/down windows, with upcoming markets shown inline.</div>
             </div>
-            <div class="status-chip live">${live.length} active</div>
+            <div>
+              <button class="panel-toggle" type="button" data-panel-toggle="liveMarkets">${sectionCollapsed.liveMarkets ? 'Expand' : 'Collapse'}</button>
+              <span class="status-chip live">${live.length} active</span>
+            </div>
           </div>
-          <div class="panel-body">
+          <div class="panel-body ${sectionCollapsed.liveMarkets ? 'is-collapsed' : ''}">
             <div class="market-column">${liveHtml}</div>
           </div>
         </section>
@@ -864,9 +887,12 @@
               <h2 class="panel-title">Settled Markets</h2>
               <div class="panel-subtitle">Outcome, PnL, and trade details for each completed market.</div>
             </div>
-            <div class="status-chip settled">${settled.length} settled</div>
+            <div>
+              <button class="panel-toggle" type="button" data-panel-toggle="settledMarkets">${sectionCollapsed.settledMarkets ? 'Expand' : 'Collapse'}</button>
+              <span class="status-chip settled">${settled.length} settled</span>
+            </div>
           </div>
-          <div class="panel-body">
+          <div class="panel-body ${sectionCollapsed.settledMarkets ? 'is-collapsed' : ''}">
             <div class="market-column">${settledHtml}</div>
           </div>
         </section>
@@ -914,6 +940,19 @@
             showConfigStatus(`Config JSON error: ${err.message}`, true);
           }
         }
+      });
+    }
+
+    function bindMarketSectionControls() {
+      if (sectionsEl.dataset.bound === 'true') return;
+      sectionsEl.dataset.bound = 'true';
+      sectionsEl.addEventListener('click', (event) => {
+        const button = event.target?.closest?.('[data-panel-toggle]');
+        if (!button) return;
+        const sectionKey = button.getAttribute('data-panel-toggle');
+        if (!Object.prototype.hasOwnProperty.call(sectionCollapsed, sectionKey)) return;
+        sectionCollapsed[sectionKey] = !sectionCollapsed[sectionKey];
+        scheduleRender('markets');
       });
     }
 
@@ -976,10 +1015,12 @@
       }
       if (dirty.has('markets')) {
         sectionsEl.innerHTML = renderMarkets() + renderLogs();
+        bindMarketSectionControls();
         dirty.delete('markets');
       }
       if (dirty.has('logs')) {
         sectionsEl.innerHTML = renderMarkets() + renderLogs();
+        bindMarketSectionControls();
         dirty.delete('logs');
       }
     }
