@@ -166,12 +166,6 @@ export class BeatTrader {
     await this._redeemPhase(conditionId, windowClose);
 
     this.lifecycle = BEAT_LIFECYCLE.SETTLED;
-      this._publishMarket({
-        lifecycle: BEAT_LIFECYCLE.SETTLED,
-        settled: true,
-        settledAt: this.lastSettledAt ?? Date.now(),
-        tradeStatus: tradeStatusFromLifecycle(BEAT_LIFECYCLE.SETTLED, this.tradeSummary?.buyShares > 0),
-      });
     this.log.info('BeatTrader: market complete', {
       beatPrice: this.beatPrice,
       totalSpent: this.totalSpent.toFixed(4),

@@ -689,10 +689,6 @@
               <div class="value">${price(market.buyPrice)}</div>
             </div>
             <div class="summary-box">
-              <div class="label">Move at Buy</div>
-              <div class="value ${Number(moveAtBuy) >= 0 ? 'summary-positive' : 'summary-negative'}">${signedMoney(moveAtBuy)}${moveAtBuyPct != null ? ` (${moveAtBuyPct >= 0 ? '+' : ''}${Number(moveAtBuyPct).toFixed(2)}%)` : ''}</div>
-            </div>
-            <div class="summary-box">
               <div class="label">Buy Count</div>
               <div class="value">${market.buyCount != null ? Number(market.buyCount) : '-'}</div>
             </div>
@@ -764,25 +760,25 @@
       const traded = Boolean(market.tradeOccurred || Number(market.buyShares || 0) > 0);
       const beat = market.beatPrice ?? state.btcPrice;
       const liveBtc = market.btcPrice ?? state.btcPrice;
-      const btcMove = Number.isFinite(Number(liveBtc)) && Number.isFinite(Number(beat))
+      const btcMove = !settled && Number.isFinite(Number(liveBtc)) && Number.isFinite(Number(beat))
         ? Number(liveBtc) - Number(beat)
         : null;
-      const btcMovePct = Number.isFinite(btcMove) && Number.isFinite(Number(beat)) && Number(beat) !== 0
+      const btcMovePct = !settled && Number.isFinite(btcMove) && Number.isFinite(Number(beat)) && Number(beat) !== 0
         ? (btcMove / Number(beat)) * 100
         : null;
-      const moveAtBuy = Number(market.moveAtBuyUsd ?? null);
-      const moveAtBuyPct = market.moveAtBuyPct;
-      const moveLabel = traded ? 'Move at Buy' : (settled ? 'Trade Move' : `${symbol} Move`);
-      const moveValueText = traded
-        ? `${signedMoney(moveAtBuy)}${moveAtBuyPct != null ? ` (${moveAtBuyPct >= 0 ? '+' : ''}${Number(moveAtBuyPct).toFixed(2)}%)` : ''}`
-        : settled
-          ? '-'
-          : `${signedMoney(btcMove)}${btcMovePct != null ? ` (${btcMovePct >= 0 ? '+' : ''}${btcMovePct.toFixed(2)}%)` : ''}`;
-      const moveValueClass = traded
-        ? (Number(moveAtBuy) >= 0 ? 'summary-positive' : 'summary-negative')
-        : settled
-          ? ''
-          : (Number(btcMove) >= 0 ? 'summary-positive' : 'summary-negative');
+      const buyEvents = Array.isArray(market.buyEvents) ? market.buyEvents : [];
+      const totalBuyUsdc = buyEvents.reduce((sum, buy) => sum + Number(buy?.usdc ?? 0), 0);
+      const upShares = buyEvents.reduce((sum, buy) => sum + (buy?.side === 'Up' ? Number(buy?.shares ?? 0) : 0), 0);
+      const downShares = buyEvents.reduce((sum, buy) => sum + (buy?.side === 'Down' ? Number(buy?.shares ?? 0) : 0), 0);
+      const pnlIfUp = traded && !settled ? upShares - totalBuyUsdc : null;
+      const pnlIfDown = traded && !settled ? downShares - totalBuyUsdc : null;
+      const moveLabel = settled ? null : `${symbol} Move`;
+      const moveValueText = settled
+        ? null
+        : `${signedMoney(btcMove)}${btcMovePct != null ? ` (${btcMovePct >= 0 ? '+' : ''}${btcMovePct.toFixed(2)}%)` : ''}`;
+      const moveValueClass = settled
+        ? ''
+        : (Number(btcMove) >= 0 ? 'summary-positive' : 'summary-negative');
       return `
         <article class="market-card ${settled ? 'settled' : ''}">
           <div class="market-head">
@@ -799,7 +795,8 @@
           </div>
           <div class="metric-grid">
             <div class="metric"><div class="label">Beat ${symbol}</div><div class="value">${money(beat)}</div></div>
-            <div class="metric"><div class="label">${moveLabel}</div><div class="value ${moveValueClass}">${moveValueText}</div></div>
+            ${!settled ? `<div class="metric"><div class="label">${moveLabel}</div><div class="value ${moveValueClass}">${moveValueText}</div></div>` : ''}
+            ${traded && !settled ? `<div class="metric"><div class="label">Simulated If Up</div><div class="value ${pnlIfUp >= 0 ? 'summary-positive' : 'summary-negative'}">${money(pnlIfUp)}</div></div><div class="metric"><div class="label">Simulated If Down</div><div class="value ${pnlIfDown >= 0 ? 'summary-positive' : 'summary-negative'}">${money(pnlIfDown)}</div></div>` : ''}
             <div class="metric"><div class="label">Up Bid</div><div class="value">${price(market.upBestBid)}</div></div>
             <div class="metric"><div class="label">Up Ask</div><div class="value">${price(market.upBestAsk)}</div></div>
             <div class="metric"><div class="label">Down Bid</div><div class="value">${price(market.downBestBid)}</div></div>
