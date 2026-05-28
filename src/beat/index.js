@@ -106,7 +106,7 @@ export async function main() {
 
   const symbols = Array.isArray(beatConfig.BEAT_SYMBOLS) && beatConfig.BEAT_SYMBOLS.length
     ? beatConfig.BEAT_SYMBOLS
-    : [beatConfig.BEAT_MARKET_SYMBOL];
+    : ['BTC'];
   const priceFeeds = new Map();
   const primaryPriceFeeds = new Map();
   let dashboard = null;
@@ -271,6 +271,7 @@ export async function main() {
       let market;
       try {
         market = await fetchMarketWithRetry(slug, 30, 3_000);
+        market.marketSymbol = symbol;
         if (dashboard) {
           dashboard.recordMarket({
             slug,
@@ -297,15 +298,7 @@ export async function main() {
       if (stopping) return;
 
       const symbolFeed = primaryPriceFeeds.get(symbol) ?? priceFeeds.get(`${symbol}-rtds`) ?? priceFeeds.get(`${symbol}-binance`);
-      const symbolMomentsKey = `BEAT_MOMENTS_${String(symbol ?? '').toUpperCase()}`;
-      const symbolMoments = beatConfig[symbolMomentsKey] || beatConfig.BEAT_MOMENTS;
-      const traderConfig = {
-        ...beatConfig,
-        BEAT_MARKET_SYMBOL: symbol,
-        BEAT_MOMENTS: Array.isArray(symbolMoments) ? symbolMoments : beatConfig.BEAT_MOMENTS,
-      };
-
-      const trader = new BeatTrader(market, wallet, pnl, { dashboard, btcFeed: symbolFeed, config: traderConfig });
+      const trader = new BeatTrader(market, wallet, pnl, { dashboard, btcFeed: symbolFeed, config: beatConfig });
       const task = trader.run()
         .then(() => {
           runningTasks.delete(task);

@@ -5,7 +5,6 @@ import {
   BEAT_DASHBOARD_HOST,
   BEAT_DASHBOARD_PORT,
   BEAT_DRY_RUN,
-  BEAT_MOMENTS,
   BEAT_MOMENTS_BNB,
   BEAT_MOMENTS_BTC,
   BEAT_MOMENTS_DOGE,
@@ -15,7 +14,6 @@ import {
   BEAT_MOMENTS_XRP,
   BEAT_SYMBOLS,
   BEAT_MAX_SLIPPAGE,
-  BEAT_MARKET_SYMBOL,
   BEAT_ORDER_MODE,
   BEAT_ORDER_SIZE_SHARES,
   BEAT_ORDER_SIZE_USDC,
@@ -31,7 +29,6 @@ import {
 } from '../config.js';
 
 const DEFAULTS = Object.freeze({
-  BEAT_MARKET_SYMBOL,
   BEAT_SYMBOLS,
   BTC_PRICE_WS_URL,
   BTC_PRICE_PRODUCT_ID,
@@ -47,7 +44,6 @@ const DEFAULTS = Object.freeze({
   BEAT_ORDER_SIZE_USDC,
   BEAT_ORDER_SIZE_SHARES,
   BEAT_MAX_SLIPPAGE,
-  BEAT_MOMENTS,
   BEAT_MOMENTS_BTC,
   BEAT_MOMENTS_ETH,
   BEAT_MOMENTS_SOL,
@@ -80,6 +76,12 @@ function normalizeBeatSymbols(value, fallback) {
     .map((item) => String(item ?? '').trim().toUpperCase())
     .filter((item) => SUPPORTED_BEAT_SYMBOLS.has(item));
   return normalized.length ? [...new Set(normalized)] : fallback;
+}
+
+function primaryBeatSymbol(configLike) {
+  const symbols = Array.isArray(configLike?.BEAT_SYMBOLS) ? configLike.BEAT_SYMBOLS : [];
+  const first = symbols.find((item) => SUPPORTED_BEAT_SYMBOLS.has(String(item ?? '').trim().toUpperCase()));
+  return String(first ?? 'BTC').trim().toUpperCase();
 }
 
 function normalizeMoments(value, fallback) {
@@ -166,11 +168,6 @@ function coerceValue(key, value) {
     return text === 'SHARES' ? 'SHARES' : 'USDC';
   }
 
-  if (key === 'BEAT_MARKET_SYMBOL') {
-    const text = String(value ?? '').trim().toUpperCase();
-    return SUPPORTED_BEAT_SYMBOLS.has(text) ? text : 'BTC';
-  }
-
   return String(value ?? fallback);
 }
 
@@ -194,7 +191,7 @@ export function createBeatRuntimeConfig(overrides = {}) {
     ),
   };
 
-  const feedDefaults = priceFeedDefaultsFor(next.BEAT_MARKET_SYMBOL);
+  const feedDefaults = priceFeedDefaultsFor(primaryBeatSymbol(next));
   for (const [key, value] of Object.entries(feedDefaults)) {
     if (!(key in overrides)) {
       next[key] = value;
@@ -206,13 +203,13 @@ export function createBeatRuntimeConfig(overrides = {}) {
 
 export function applyBeatRuntimeConfigPatch(target, patch = {}) {
   if (!target || typeof target !== 'object') return target;
-  const marketSymbolChanged = Object.prototype.hasOwnProperty.call(patch, 'BEAT_MARKET_SYMBOL');
+  const beatSymbolsChanged = Object.prototype.hasOwnProperty.call(patch, 'BEAT_SYMBOLS');
   for (const [key, value] of Object.entries(patch)) {
     if (!(key in DEFAULTS)) continue;
     target[key] = coerceValue(key, value);
   }
-  if (marketSymbolChanged) {
-    const feedDefaults = priceFeedDefaultsFor(target.BEAT_MARKET_SYMBOL);
+  if (beatSymbolsChanged) {
+    const feedDefaults = priceFeedDefaultsFor(primaryBeatSymbol(target));
     for (const [key, value] of Object.entries(feedDefaults)) {
       if (!Object.prototype.hasOwnProperty.call(patch, key)) {
         target[key] = value;

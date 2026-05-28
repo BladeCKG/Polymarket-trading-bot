@@ -61,7 +61,19 @@ function tradeStatusFromLifecycle(lifecycle, hasTrade) {
   return BEAT_LIFECYCLE.UPCOMING;
 }
 
-// Removed obsolete moveThresholdsForConfig — per-moment thresholds are authoritative.
+function traderSymbol(market, config) {
+  const marketSymbol = String(market?.marketSymbol ?? '').trim().toUpperCase();
+  if (marketSymbol) return marketSymbol;
+  const symbols = Array.isArray(config?.BEAT_SYMBOLS) ? config.BEAT_SYMBOLS : [];
+  return String(symbols[0] ?? 'BTC').trim().toUpperCase();
+}
+
+function momentsForConfig(market, config) {
+  const symbol = traderSymbol(market, config);
+  const key = `BEAT_MOMENTS_${symbol}`;
+  const moments = config?.[key];
+  return Array.isArray(moments) ? moments : [];
+}
 
 export class BeatTrader {
   constructor(market, wallet, pnl, { dashboard = null, btcFeed = null, config = null } = {}) {
@@ -93,7 +105,7 @@ export class BeatTrader {
     const cfg = this.config;
     const { windowTs, conditionId, upToken, downToken } = this.market;
     const windowClose = windowTs + cfg.MARKET_WINDOW_SECONDS;
-    const momentsForLog = Array.isArray(cfg.BEAT_MOMENTS) ? cfg.BEAT_MOMENTS : [];
+    const momentsForLog = momentsForConfig(this.market, cfg);
     const firstStart = Number(momentsForLog[0]?.start ?? 0);
 
     this.log.info('BeatTrader: starting', {
@@ -118,7 +130,7 @@ export class BeatTrader {
 
       this.beatPrice = await this._captureBeatPrice(windowTs);
 
-      // Determine first allowed buy time from BEAT_MOMENTS (seconds after open)
+      // Determine first allowed buy time from the symbol-specific moments.
       const firstAllowedMs = (windowTs + firstStart) * 1000;
       const remainingSkipMs = firstAllowedMs - Date.now();
       if (remainingSkipMs > 0) {
@@ -217,7 +229,7 @@ export class BeatTrader {
       while (true) {
       const nowSec = Math.floor(Date.now() / 1000);
       // Stop buying when past the last moment's end (seconds after open)
-      const momentsLocal = Array.isArray(cfg.BEAT_MOMENTS) ? cfg.BEAT_MOMENTS : [];
+      const momentsLocal = momentsForConfig(this.market, cfg);
       const lastEnd = Number(momentsLocal.length ? momentsLocal[momentsLocal.length - 1].end ?? cfg.MARKET_WINDOW_SECONDS : cfg.MARKET_WINDOW_SECONDS);
       if (nowSec >= (this.market.windowTs + lastEnd)) {
         this.log.info('BeatTrader: buy window closed (moments end)', { lastEnd });
@@ -299,7 +311,7 @@ export class BeatTrader {
     const delta = tick.price - this.beatPrice;
     // Determine per-moment thresholds (seconds after market open)
     const secondsAfterOpen = Math.floor(Date.now() / 1000) - this.market.windowTs;
-    const moments = Array.isArray(cfg.BEAT_MOMENTS) ? cfg.BEAT_MOMENTS : [];
+    const moments = momentsForConfig(this.market, cfg);
     const moment = moments.find((m) => secondsAfterOpen >= Number(m.start ?? 0) && secondsAfterOpen < Number(m.end ?? cfg.MARKET_WINDOW_SECONDS)) || null;
     // Require an explicit moment with thresholds to allow buys. If no moment or missing values, do not buy.
     if (!moment || !Number.isFinite(Number(moment.btcmoveMax)) || !Number.isFinite(Number(moment.buyMax))) {
@@ -674,7 +686,7 @@ export class BeatTrader {
     const settled = patch.settled ?? lifecycle === BEAT_LIFECYCLE.SETTLED;
     this.dashboard.recordMarket({
       slug: this.market.slug,
-      marketSymbol: cfg.BEAT_MARKET_SYMBOL,
+      marketSymbol: traderSymbol(this.market, cfg),
       windowTs: this.market.windowTs,
       windowOpenAt: this.market.windowTs * 1000,
       windowCloseAt: (this.market.windowTs + cfg.MARKET_WINDOW_SECONDS) * 1000,

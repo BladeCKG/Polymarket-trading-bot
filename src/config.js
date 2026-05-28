@@ -212,11 +212,8 @@ export const HEARTBEAT_INTERVAL_MS      = Math.max(
 );
 
 // ── Beat strategy symbols ───────────────────────────────────────────────────
-// `BEAT_SYMBOLS` can contain multiple assets to trade in parallel.
-// `BEAT_MARKET_SYMBOL` remains a backward-compatible primary symbol.
-const BEAT_MARKET_SYMBOL_RAW = parseSymbol_('BEAT_MARKET_SYMBOL', 'BTC');
-export const BEAT_SYMBOLS = parseSymbolList_('BEAT_SYMBOLS', [BEAT_MARKET_SYMBOL_RAW]);
-export const BEAT_MARKET_SYMBOL = parseSymbol_('BEAT_MARKET_SYMBOL', BEAT_SYMBOLS[0] ?? 'BTC');
+// `BEAT_SYMBOLS` contains the assets to trade in parallel.
+export const BEAT_SYMBOLS = parseSymbolList_('BEAT_SYMBOLS', ['BTC']);
 
 function priceFeedDefaultsFor(symbol) {
   const normalized = normalizeBeatSymbol(symbol, 'BTC');
@@ -228,13 +225,13 @@ function priceFeedDefaultsFor(symbol) {
   };
 }
 
-export const BTC_PRICE_WS_URL            = optional('BTC_PRICE_WS_URL', priceFeedDefaultsFor(BEAT_MARKET_SYMBOL).wsUrl);
-export const BTC_PRICE_PRODUCT_ID        = optional('BTC_PRICE_PRODUCT_ID', priceFeedDefaultsFor(BEAT_MARKET_SYMBOL).productId);
-export const BTC_PRICE_REST_URL          = optional('BTC_PRICE_REST_URL', priceFeedDefaultsFor(BEAT_MARKET_SYMBOL).restUrl);
+export const BTC_PRICE_WS_URL            = optional('BTC_PRICE_WS_URL', priceFeedDefaultsFor(BEAT_SYMBOLS[0] ?? 'BTC').wsUrl);
+export const BTC_PRICE_PRODUCT_ID        = optional('BTC_PRICE_PRODUCT_ID', priceFeedDefaultsFor(BEAT_SYMBOLS[0] ?? 'BTC').productId);
+export const BTC_PRICE_REST_URL          = optional('BTC_PRICE_REST_URL', priceFeedDefaultsFor(BEAT_SYMBOLS[0] ?? 'BTC').restUrl);
 export const BTC_PRICE_MAX_AGE_MS        = parseInt_('BTC_PRICE_MAX_AGE_MS', 2_000);
 export const BTC_PRICE_STALL_RECONNECT_MS = parseInt_('BTC_PRICE_STALL_RECONNECT_MS', 12_000);
 export const BEAT_DRY_RUN                = parseBool_('BEAT_DRY_RUN', true);
-// Entry delay is now controlled by `BEAT_MOMENTS` (per-moment starts)
+// Entry delay is controlled by per-symbol `BEAT_MOMENTS_<SYMBOL>` settings.
 export const BEAT_BOOK_POLL_MS           = parseInt_('BEAT_BOOK_POLL_MS', 1_000);
 export const BEAT_BUY_COOLDOWN_MS        = parseInt_('BEAT_BUY_COOLDOWN_MS', 5_000);
 export const BEAT_ORDER_MODE             = parseEnum_('BEAT_ORDER_MODE', ['USDC', 'SHARES'], 'USDC');
@@ -242,30 +239,28 @@ export const BEAT_ORDER_SIZE_USDC        = parseFloat_('BEAT_ORDER_SIZE_USDC', 2
 export const BEAT_ORDER_SIZE_SHARES      = parseFloat_('BEAT_ORDER_SIZE_SHARES', 10);
 export const BEAT_MAX_SLIPPAGE           = parseFloat_('BEAT_MAX_SLIPPAGE', 0.01);
 // Deprecated per-side move minimums removed (use unified thresholds instead)
-// Unified move maximum (USD): supports legacy env names for fallback
-// Per-moment configuration `BEAT_MOMENTS` controls move and buy thresholds.
 export const BEAT_DASHBOARD_ENABLED = parseBool_('BEAT_DASHBOARD_ENABLED', false);
 export const BEAT_DASHBOARD_HOST = optional('BEAT_DASHBOARD_HOST', '127.0.0.1');
 export const BEAT_DASHBOARD_PORT = parseInt_('BEAT_DASHBOARD_PORT', 8798);
 
 // Per-market time-segment configuration for directional buys.
-// Env var `BEAT_MOMENTS` should be a JSON array of objects like:
+// Env vars `BEAT_MOMENTS_<SYMBOL>` should be JSON arrays of objects like:
 // [{"start":0,"end":15,"btcmoveMax":100,"buyMax":0.1}, ...]
 // Values are seconds after market open (0-300 for 5m markets).
-// `BEAT_MOMENTS` accepts a compact double-array or array-of-objects JSON.
+// `BEAT_MOMENTS_<SYMBOL>` accepts a compact double-array or array-of-objects JSON.
 // Compact form: [[start,end,btcmoveMax,buyMax], ...]
-export const BEAT_MOMENTS = parseMoments_('BEAT_MOMENTS', [
+const DEFAULT_BEAT_MOMENTS = Object.freeze(parseMoments_('__DEFAULT_BEAT_MOMENTS__', [
   // Default: allow reasonable moves and buy price across full window
   { start: 0, end: MARKET_WINDOW_SECONDS, btcmoveMax: 120, buyMax: 0.46 },
-]);
+]));
 
-export const BEAT_MOMENTS_BTC = parseSymbolMoments_('BTC', BEAT_MOMENTS);
-export const BEAT_MOMENTS_ETH = parseSymbolMoments_('ETH', BEAT_MOMENTS);
-export const BEAT_MOMENTS_SOL = parseSymbolMoments_('SOL', BEAT_MOMENTS);
-export const BEAT_MOMENTS_XRP = parseSymbolMoments_('XRP', BEAT_MOMENTS);
-export const BEAT_MOMENTS_BNB = parseSymbolMoments_('BNB', BEAT_MOMENTS);
-export const BEAT_MOMENTS_DOGE = parseSymbolMoments_('DOGE', BEAT_MOMENTS);
-export const BEAT_MOMENTS_HYPE = parseSymbolMoments_('HYPE', BEAT_MOMENTS);
+export const BEAT_MOMENTS_BTC = parseSymbolMoments_('BTC', DEFAULT_BEAT_MOMENTS);
+export const BEAT_MOMENTS_ETH = parseSymbolMoments_('ETH', DEFAULT_BEAT_MOMENTS);
+export const BEAT_MOMENTS_SOL = parseSymbolMoments_('SOL', DEFAULT_BEAT_MOMENTS);
+export const BEAT_MOMENTS_XRP = parseSymbolMoments_('XRP', DEFAULT_BEAT_MOMENTS);
+export const BEAT_MOMENTS_BNB = parseSymbolMoments_('BNB', DEFAULT_BEAT_MOMENTS);
+export const BEAT_MOMENTS_DOGE = parseSymbolMoments_('DOGE', DEFAULT_BEAT_MOMENTS);
+export const BEAT_MOMENTS_HYPE = parseSymbolMoments_('HYPE', DEFAULT_BEAT_MOMENTS);
 
 // ── EIP-712 domains for CLOB order signing ───────────────────────────────────
 // Polymarket has TWO exchange contracts. Orders MUST be signed against the

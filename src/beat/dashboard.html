@@ -631,7 +631,7 @@
     function activeBeatSymbols() {
       const raw = Array.isArray(state.config?.BEAT_SYMBOLS) && state.config.BEAT_SYMBOLS.length
         ? state.config.BEAT_SYMBOLS
-        : (Array.isArray(state.runtime?.marketSymbols) ? state.runtime.marketSymbols : [state.config?.BEAT_MARKET_SYMBOL ?? 'BTC']);
+        : (Array.isArray(state.runtime?.marketSymbols) && state.runtime.marketSymbols.length ? state.runtime.marketSymbols : ['BTC']);
       return raw
         .map((sym) => String(sym ?? '').trim().toUpperCase())
         .filter((sym) => sym !== '');
@@ -666,7 +666,7 @@
       if (Array.isArray(state.runtime?.marketSymbols) && state.runtime.marketSymbols.length) {
         return String(state.runtime.marketSymbols[0]).toUpperCase();
       }
-      return String(state.config?.BEAT_MARKET_SYMBOL ?? 'BTC').toUpperCase();
+      return String(state.config?.BEAT_SYMBOLS?.[0] ?? 'BTC').toUpperCase();
     }
 
     function getWindowOpenMs(market) {
