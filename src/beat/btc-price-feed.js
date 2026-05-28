@@ -386,6 +386,7 @@ export class BtcPriceFeed extends EventEmitter {
     this._ws = new WebSocket(this.url);
 
     this._ws.on('open', () => {
+      this._lastTickAtMs = Date.now();
       this._reconnectDelayMs = 1_000;
       this._subscribe();
       this._startPing();
@@ -397,6 +398,9 @@ export class BtcPriceFeed extends EventEmitter {
     });
 
     this._ws.on('message', (raw) => {
+      // Any inbound frame proves the transport is alive, even if it does not
+      // contain a matching BTC tick for this configured product.
+      this._lastTickAtMs = Date.now();
       try {
         const text = raw.toString();
         if (this._handleControlMessage(text)) {
@@ -412,6 +416,14 @@ export class BtcPriceFeed extends EventEmitter {
     this._ws.on('error', (err) => {
       logger.warn('BtcPriceFeed: websocket error', { err: err.message });
       this.emit('error', err);
+    });
+
+    this._ws.on('pong', () => {
+      this._lastTickAtMs = Date.now();
+    });
+
+    this._ws.on('ping', () => {
+      this._lastTickAtMs = Date.now();
     });
 
     this._ws.on('close', () => {
