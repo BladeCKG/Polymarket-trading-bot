@@ -4,10 +4,14 @@
  * Fields: timestamp, level, market (if provided), message, ...meta
  */
 import winston from 'winston';
+import fs from 'node:fs';
+import path from 'node:path';
 import { LOG_LEVEL } from './config.js';
 
 const { combine, timestamp, colorize, printf, json } = winston.format;
 const logSubscribers = new Set();
+const marketFileStreams = new Map();
+const MARKET_LOG_DIR = path.join(process.cwd(), 'logs', 'beat-markets');
 
 const consoleFormat = printf(({ level, message, timestamp: ts, market, ...meta }) => {
   const mkt = market ? ` [${market}]` : '';
@@ -60,4 +64,44 @@ export function subscribeLogs(listener) {
  */
 export function marketLogger(slug) {
   return logger.child({ market: slug });
+}
+
+function ensureMarketLogDir() {
+  fs.mkdirSync(MARKET_LOG_DIR, { recursive: true });
+}
+
+function sanitizeMarketLogName(slug) {
+  const normalized = String(slug ?? 'unknown-market').trim() || 'unknown-market';
+  return normalized.replace(/[^a-zA-Z0-9._-]+/g, '_');
+}
+
+export function getMarketLogFilePath(slug) {
+  return path.join(MARKET_LOG_DIR, `${sanitizeMarketLogName(slug)}.jsonl`);
+}
+
+export function marketFileLogger(slug) {
+  const key = String(slug ?? 'unknown-market');
+  let stream = marketFileStreams.get(key);
+  if (!stream) {
+    ensureMarketLogDir();
+    stream = fs.createWriteStream(getMarketLogFilePath(key), { flags: 'a' });
+    marketFileStreams.set(key, stream);
+  }
+
+  return {
+    path: getMarketLogFilePath(key),
+    write(eventType, payload = {}) {
+      const entry = {
+        timestamp: new Date().toISOString(),
+        market: key,
+        eventType,
+        ...payload,
+      };
+      try {
+        stream.write(`${JSON.stringify(entry)}\n`);
+      } catch {
+        // Ignore file logging failures so audit logging never interrupts trading.
+      }
+    },
+  };
 }

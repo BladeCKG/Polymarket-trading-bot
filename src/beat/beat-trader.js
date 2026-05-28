@@ -4,7 +4,7 @@ import { createBeatRuntimeConfig } from './runtime-config.js';
 import { ClobClient } from '../clob.js';
 import { getTokenBalances, redeemPositions, sleep } from '../onchain.js';
 import { msUntil, waitForResolution } from '../market.js';
-import { marketLogger } from '../logger.js';
+import { getMarketLogFilePath, marketFileLogger, marketLogger } from '../logger.js';
 
 function bestBid(book) {
   return Array.isArray(book?.bids) && book.bids.length
@@ -75,6 +75,19 @@ function momentsForConfig(market, config) {
   return Array.isArray(moments) ? moments : [];
 }
 
+function summarizeBook(book) {
+  const bids = Array.isArray(book?.bids) ? book.bids : [];
+  const asks = Array.isArray(book?.asks) ? book.asks : [];
+  return {
+    bidLevels: bids.length,
+    askLevels: asks.length,
+    totalBidSize: bids.reduce((sum, row) => sum + Number(row?.size ?? 0), 0),
+    totalAskSize: asks.reduce((sum, row) => sum + Number(row?.size ?? 0), 0),
+    bids,
+    asks,
+  };
+}
+
 export class BeatTrader {
   constructor(market, wallet, pnl, { dashboard = null, btcFeed = null, config = null } = {}) {
     this.market = market;
@@ -82,12 +95,15 @@ export class BeatTrader {
     this.pnl = pnl;
     this.dashboard = dashboard;
     this.log = marketLogger(market.slug);
+    this.auditLog = marketFileLogger(market.slug);
     this.config = config ?? createBeatRuntimeConfig();
 
     this.lifecycle = BEAT_LIFECYCLE.UPCOMING;
     this.halted = false;
     this.balanceUp = 0;
     this.balanceDown = 0;
+    this.walletBalanceUp = 0;
+    this.walletBalanceDown = 0;
     this.totalSpent = 0;
     this.redeemedUsdc = 0;
     this.lastBuyAt = 0;
@@ -99,6 +115,7 @@ export class BeatTrader {
     this._btcFeed = btcFeed;
     this._ownsBtcFeed = !btcFeed;
     this._btcFeedAttached = false;
+    this._loopCount = 0;
   }
 
   async run() {
@@ -118,6 +135,26 @@ export class BeatTrader {
       skipSeconds: firstStart,
       orderMode: cfg.BEAT_ORDER_MODE,
     });
+    this._recordAudit('market_start', {
+      marketSymbol: traderSymbol(this.market, cfg),
+      conditionId,
+      upTokenId: upToken.tokenId,
+      downTokenId: downToken.tokenId,
+      windowTs,
+      windowClose,
+      config: {
+        dryRun: cfg.BEAT_DRY_RUN,
+        orderMode: cfg.BEAT_ORDER_MODE,
+        orderSizeUsdc: cfg.BEAT_ORDER_SIZE_USDC,
+        orderSizeShares: cfg.BEAT_ORDER_SIZE_SHARES,
+        maxSlippage: cfg.BEAT_MAX_SLIPPAGE,
+        buyCooldownMs: cfg.BEAT_BUY_COOLDOWN_MS,
+        maxSpendPerMarket: cfg.MAX_SPEND_PER_MARKET,
+        maxInventoryImbalance: cfg.MAX_INVENTORY_IMBALANCE,
+        moments: momentsForLog,
+      },
+      auditLogPath: getMarketLogFilePath(this.market.slug),
+    });
 
     this._startBtcFeed();
 
@@ -125,6 +162,7 @@ export class BeatTrader {
       const waitMs = msUntil(windowTs);
       if (waitMs > 0) {
         this.log.debug('BeatTrader: waiting for market open', { waitMs: Math.round(waitMs) });
+        this._recordAudit('wait_for_market_open', { waitMs: Math.round(waitMs) });
         await sleep(waitMs);
       }
 
@@ -140,6 +178,11 @@ export class BeatTrader {
           tradeStatus: BEAT_LIFECYCLE.WAITING_SKIP,
         });
         this.log.info('BeatTrader: waiting until first buy moment', {
+          firstStart,
+          beatPrice: this.beatPrice,
+          waitMs: Math.round(remainingSkipMs),
+        });
+        this._recordAudit('wait_for_first_buy_moment', {
           firstStart,
           beatPrice: this.beatPrice,
           waitMs: Math.round(remainingSkipMs),
@@ -171,6 +214,14 @@ export class BeatTrader {
       redeemedUsdc: this.redeemedUsdc.toFixed(4),
       netPnl: (this.redeemedUsdc - this.totalSpent).toFixed(4),
     });
+    this._recordAudit('market_complete', {
+      beatPrice: this.beatPrice,
+      totalSpent: this.totalSpent,
+      redeemedUsdc: this.redeemedUsdc,
+      netPnl: this.redeemedUsdc - this.totalSpent,
+      tradeSummary: this.tradeSummary,
+      outcome: this.lastOutcome,
+    });
   }
 
   _startBtcFeed() {
@@ -198,8 +249,22 @@ export class BeatTrader {
 
   async _captureBeatPrice(windowTs) {
     let tick = null;
+    const windowOpenMs = windowTs * 1000;
+    const marketAlreadyOpen = Date.now() > (windowOpenMs + 2_000);
+    if (marketAlreadyOpen) {
+      try {
+        tick = await this._btcFeed.fetchHistoricalTickAt(windowOpenMs);
+        this.log.info('BeatTrader: recovered historical beat price for already-open market', {
+          beatPrice: tick.price,
+          btcTime: tick.isoTime,
+          source: tick.source,
+        });
+      } catch (err) {
+        this.log.warn('BeatTrader: historical beat capture failed, falling back to current price', { err: err.message });
+      }
+    }
     try {
-      tick = await this._btcFeed.fetchRestTick();
+      tick = tick ?? await this._btcFeed.fetchRestTick();
     } catch (err) {
       this.log.warn('BeatTrader: REST beat capture failed, falling back to live BTC tick', { err: err.message });
       tick = this._btcFeed.getLatest();
@@ -218,8 +283,19 @@ export class BeatTrader {
     this.log.info('BeatTrader: captured BTC beat price', {
       beatPrice: tick.price,
       btcTime: tick.isoTime,
+      historical: Boolean(tick.historical),
+      source: tick.source,
       bestBid: tick.bestBid,
       bestAsk: tick.bestAsk,
+    });
+    this._recordAudit('beat_price_captured', {
+      beatPrice: tick.price,
+      btcTime: tick.isoTime,
+      historical: Boolean(tick.historical),
+      source: tick.source,
+      bestBid: tick.bestBid ?? null,
+      bestAsk: tick.bestAsk ?? null,
+      tick,
     });
     return tick.price;
   }
@@ -228,11 +304,18 @@ export class BeatTrader {
     const cfg = this.config;
       while (true) {
       const nowSec = Math.floor(Date.now() / 1000);
+      this._loopCount += 1;
       // Stop buying when past the last moment's end (seconds after open)
       const momentsLocal = momentsForConfig(this.market, cfg);
       const lastEnd = Number(momentsLocal.length ? momentsLocal[momentsLocal.length - 1].end ?? cfg.MARKET_WINDOW_SECONDS : cfg.MARKET_WINDOW_SECONDS);
       if (nowSec >= (this.market.windowTs + lastEnd)) {
         this.log.info('BeatTrader: buy window closed (moments end)', { lastEnd });
+        this._recordAudit('buy_window_closed', {
+          loop: this._loopCount,
+          nowSec,
+          lastEnd,
+          secondsAfterOpen: nowSec - this.market.windowTs,
+        });
         break;
       }
 
@@ -240,6 +323,20 @@ export class BeatTrader {
 
       try {
         const snapshot = await this._snapshotMarketState();
+        this._recordAudit('market_snapshot', {
+          loop: this._loopCount,
+          secondsAfterOpen: nowSec - this.market.windowTs,
+          snapshot,
+          latestBtcTick: this.latestBtcTick,
+          quoteBooks: {
+            up: summarizeBook(this.latestQuotes.up?.book),
+            down: summarizeBook(this.latestQuotes.down?.book),
+          },
+          balances: {
+            up: this.balanceUp,
+            down: this.balanceDown,
+          },
+        });
         this._publishMarket({
           ...snapshot,
           lifecycle: BEAT_LIFECYCLE.MONITORING,
@@ -248,6 +345,11 @@ export class BeatTrader {
         await this._maybeBuy(snapshot);
       } catch (err) {
         this.log.warn('BeatTrader: monitor iteration failed', { err: err.message });
+        this._recordAudit('monitor_iteration_failed', {
+          loop: this._loopCount,
+          err: err.message,
+          stack: err.stack ?? null,
+        });
       }
 
       if (nowSec % 30 === 0) {
@@ -286,11 +388,24 @@ export class BeatTrader {
 
   async _maybeBuy(snapshot = {}) {
     const cfg = this.config;
-    if (!this.beatPrice) return;
-    if (Date.now() - this.lastBuyAt < cfg.BEAT_BUY_COOLDOWN_MS) return;
+    if (!this.beatPrice) {
+      this._recordAudit('decision_skip', { reason: 'missing-beat-price', snapshot });
+      return;
+    }
+    if (Date.now() - this.lastBuyAt < cfg.BEAT_BUY_COOLDOWN_MS) {
+      this._recordAudit('decision_skip', {
+        reason: 'buy-cooldown',
+        cooldownMs: cfg.BEAT_BUY_COOLDOWN_MS,
+        msSinceLastBuy: Date.now() - this.lastBuyAt,
+      });
+      return;
+    }
 
     let tick = this.latestBtcTick;
-    if (!tick) return;
+    if (!tick) {
+      this._recordAudit('decision_skip', { reason: 'missing-btc-tick', snapshot });
+      return;
+    }
 
     let ageMs = Date.now() - tick.timeMs;
     if (ageMs > cfg.BTC_PRICE_MAX_AGE_MS) {
@@ -301,9 +416,16 @@ export class BeatTrader {
         ageMs = Date.now() - refreshed.timeMs;
       } catch (err) {
         this.log.debug('BeatTrader: stale tick refresh failed', { err: err.message });
+        this._recordAudit('stale_tick_refresh_failed', { err: err.message });
       }
       if (ageMs > cfg.BTC_PRICE_MAX_AGE_MS) {
         this.log.debug('BeatTrader: skipping stale BTC tick', { ageMs, maxAgeMs: cfg.BTC_PRICE_MAX_AGE_MS });
+        this._recordAudit('decision_skip', {
+          reason: 'stale-btc-tick',
+          ageMs,
+          maxAgeMs: cfg.BTC_PRICE_MAX_AGE_MS,
+          tick,
+        });
         return;
       }
     }
@@ -315,6 +437,14 @@ export class BeatTrader {
     const moment = moments.find((m) => secondsAfterOpen >= Number(m.start ?? 0) && secondsAfterOpen < Number(m.end ?? cfg.MARKET_WINDOW_SECONDS)) || null;
     // Require an explicit moment with thresholds to allow buys. If no moment or missing values, do not buy.
     if (!moment || !Number.isFinite(Number(moment.btcmoveMax)) || !Number.isFinite(Number(moment.buyMax))) {
+      this._recordAudit('decision_skip', {
+        reason: 'no-active-moment',
+        secondsAfterOpen,
+        delta,
+        beatPrice: this.beatPrice,
+        btcPrice: tick.price,
+        availableMoments: moments,
+      });
       return;
     }
 
@@ -338,23 +468,100 @@ export class BeatTrader {
       },
     };
 
-    // Recompute signal using per-moment thresholds
-    const adaptedSignal = (function (deltaVal, thresholdsVal) {
-      if (deltaVal > 0 && deltaVal <= thresholdsVal.upMax) return { side: 'Up' };
-      const downMove = Math.abs(deltaVal);
-      if (deltaVal <= 0 && downMove <= thresholdsVal.downMax) return { side: 'Down' };
-      return null;
-    })(delta, thresholds);
-    if (!adaptedSignal) return;
+    const absoluteMove = Math.abs(delta);
+    if (absoluteMove > Math.max(thresholds.upMax, thresholds.downMax)) {
+      this._recordAudit('decision_skip', {
+        reason: 'delta-outside-thresholds',
+        secondsAfterOpen,
+        delta,
+        absoluteMove,
+        beatPrice: this.beatPrice,
+        btcPrice: tick.price,
+        thresholds,
+        moment,
+        snapshot,
+      });
+      return;
+    }
+    const preferredSide = delta > 0 ? 'Up' : (delta < 0 ? 'Down' : null);
+    const candidateLegs = Object.entries(bookState)
+      .map(([side, leg]) => {
+        if (!leg.ask) {
+          return { side, leg, affordable: false, maxPrice: null, reason: 'missing-best-ask' };
+        }
+        if (leg.ask.price > leg.maxBuyPrice) {
+          return { side, leg, affordable: false, maxPrice: null, reason: 'ask-above-buy-max' };
+        }
+        const maxPrice = clampMaxPrice(leg.ask.price, leg.maxBuyPrice, cfg.BEAT_MAX_SLIPPAGE);
+        if (maxPrice + 1e-9 < leg.ask.price) {
+          return { side, leg, affordable: false, maxPrice, reason: 'clamped-price-below-ask' };
+        }
+        return { side, leg, affordable: true, maxPrice, reason: null };
+      });
 
-    const leg = bookState[adaptedSignal.side];
-    if (!leg.ask || leg.ask.price > leg.maxBuyPrice) return;
+    const affordableLegs = candidateLegs.filter((entry) => entry.affordable);
+    if (!affordableLegs.length) {
+      this._recordAudit('decision_skip', {
+        reason: 'no-affordable-side',
+        preferredSide,
+        delta,
+        absoluteMove,
+        moment,
+        bookState,
+        candidateLegs: candidateLegs.map((entry) => ({
+          side: entry.side,
+          reason: entry.reason,
+          askPrice: entry.leg.ask?.price ?? null,
+          maxBuyPrice: entry.leg.maxBuyPrice,
+          maxPrice: entry.maxPrice,
+        })),
+      });
+      return;
+    }
 
-    const maxPrice = clampMaxPrice(leg.ask.price, leg.maxBuyPrice, cfg.BEAT_MAX_SLIPPAGE);
-    if (maxPrice + 1e-9 < leg.ask.price) return;
+    const selected = affordableLegs
+      .sort((a, b) => {
+        const aPreferred = a.side === preferredSide ? 0 : 1;
+        const bPreferred = b.side === preferredSide ? 0 : 1;
+        if (aPreferred !== bPreferred) return aPreferred - bPreferred;
+        const askDiff = Number(a.leg.ask?.price ?? Infinity) - Number(b.leg.ask?.price ?? Infinity);
+        if (askDiff !== 0) return askDiff;
+        return String(a.side).localeCompare(String(b.side));
+      })[0];
+    const leg = selected.leg;
+    const chosenSide = selected.side;
+    const maxPrice = selected.maxPrice;
+
+    this._recordAudit('decision_buy_signal', {
+      secondsAfterOpen,
+      chosenSide,
+      preferredSide,
+      delta,
+      absoluteMove,
+      beatPrice: this.beatPrice,
+      btcPrice: tick.price,
+      thresholds,
+      moment,
+      snapshot,
+      candidateLegs: candidateLegs.map((entry) => ({
+        side: entry.side,
+        affordable: entry.affordable,
+        reason: entry.reason,
+        askPrice: entry.leg.ask?.price ?? null,
+        maxBuyPrice: entry.leg.maxBuyPrice,
+        maxPrice: entry.maxPrice,
+      })),
+      selectedLeg: {
+        tokenId: leg.tokenId,
+        bestBid: leg.bid,
+        bestAsk: leg.ask,
+        maxBuyPrice: leg.maxBuyPrice,
+        maxPrice,
+      },
+    });
 
     await this._executeBuy({
-      side: adaptedSignal.side,
+      side: chosenSide,
       tokenId: leg.tokenId,
       book: leg.book,
       bestBid: leg.bid,
@@ -372,6 +579,12 @@ export class BeatTrader {
     const remainingBudget = cfg.MAX_SPEND_PER_MARKET - this.totalSpent;
     if (remainingBudget < 1) {
       this.halted = true;
+      this._recordAudit('decision_skip', {
+        reason: 'remaining-budget-too-low',
+        side,
+        remainingBudget,
+        totalSpent: this.totalSpent,
+      });
       return;
     }
 
@@ -380,17 +593,78 @@ export class BeatTrader {
         cfg.BEAT_ORDER_SIZE_SHARES,
         remainingBudget / Math.max(bestAsk.price, 0.0001),
       );
-      if (requestedShares <= 0) return;
+      if (requestedShares <= 0) {
+        this._recordAudit('decision_skip', {
+          reason: 'requested-shares-nonpositive',
+          side,
+          remainingBudget,
+          bestAsk: bestAsk?.price ?? null,
+          requestedShares,
+        });
+        return;
+      }
 
       const plan = estimateSharesFromBook(book, maxPrice, requestedShares);
-      if (!plan.fullyFilled || plan.fillShares <= 0 || plan.spentUsdc <= 0) return;
+      this._recordAudit('order_plan', {
+        side,
+        orderMode: cfg.BEAT_ORDER_MODE,
+        tokenId,
+        requestedShares,
+        remainingBudget,
+        maxPrice,
+        bestBid: bestBid ?? null,
+        bestAsk: bestAsk ?? null,
+        delta,
+        btcPrice,
+        plan,
+        book: summarizeBook(book),
+      });
+      if (!plan.fullyFilled || plan.fillShares <= 0 || plan.spentUsdc <= 0) {
+        this._recordAudit('decision_skip', {
+          reason: 'share-plan-not-fillable',
+          side,
+          tokenId,
+          requestedShares,
+          plan,
+          maxPrice,
+        });
+        return;
+      }
 
       if (!cfg.BEAT_DRY_RUN) {
         try {
+          this._recordAudit('order_submit', {
+            side,
+            orderMode: cfg.BEAT_ORDER_MODE,
+            tokenId,
+            maxPrice,
+            shares: plan.fillShares,
+          });
           const response = await ClobClient.postFOKLimitBuy(this.wallet, tokenId, maxPrice, plan.fillShares);
-          if (response?.success === false) return;
+          this._recordAudit('order_result', {
+            side,
+            orderMode: cfg.BEAT_ORDER_MODE,
+            tokenId,
+            response,
+          });
+          if (response?.success === false) {
+            this._recordAudit('decision_skip', {
+              reason: 'share-order-rejected',
+              side,
+              tokenId,
+              response,
+            });
+            return;
+          }
         } catch (err) {
           this.log.warn('BeatTrader: directional share buy failed', { side, err: err.message });
+          this._recordAudit('order_error', {
+            side,
+            orderMode: cfg.BEAT_ORDER_MODE,
+            tokenId,
+            err: err.message,
+            stack: err.stack ?? null,
+          });
           return;
         }
       }
@@ -417,21 +691,97 @@ export class BeatTrader {
         btcPrice,
         beatPrice: this.beatPrice,
       });
+      this._recordAudit('order_filled', {
+        side,
+        orderMode: cfg.BEAT_ORDER_MODE,
+        tokenId,
+        dryRun: cfg.BEAT_DRY_RUN,
+        plan,
+        maxPrice,
+        delta,
+        btcPrice,
+        beatPrice: this.beatPrice,
+        balances: {
+          up: this.balanceUp,
+          down: this.balanceDown,
+        },
+        tradeSummary: this.tradeSummary,
+      });
       return;
     }
 
     const amountUsdc = Math.min(cfg.BEAT_ORDER_SIZE_USDC, remainingBudget);
-    if (amountUsdc <= 0) return;
+    if (amountUsdc <= 0) {
+      this._recordAudit('decision_skip', {
+        reason: 'amount-usdc-nonpositive',
+        side,
+        remainingBudget,
+        amountUsdc,
+      });
+      return;
+    }
 
     const plan = ClobClient.estimateMarketBuyFillFromBook(book, maxPrice, amountUsdc, 0);
-    if (!plan || plan.fillShares <= 0 || plan.spentUsdc <= 0) return;
+    this._recordAudit('order_plan', {
+      side,
+      orderMode: cfg.BEAT_ORDER_MODE,
+      tokenId,
+      requestedUsdc: amountUsdc,
+      remainingBudget,
+      maxPrice,
+      bestBid: bestBid ?? null,
+      bestAsk: bestAsk ?? null,
+      delta,
+      btcPrice,
+      plan,
+      book: summarizeBook(book),
+    });
+    if (!plan || plan.fillShares <= 0 || plan.spentUsdc <= 0) {
+      this._recordAudit('decision_skip', {
+        reason: 'usdc-plan-not-fillable',
+        side,
+        tokenId,
+        amountUsdc,
+        plan,
+        maxPrice,
+      });
+      return;
+    }
 
     if (!cfg.BEAT_DRY_RUN) {
       try {
+        this._recordAudit('order_submit', {
+          side,
+          orderMode: cfg.BEAT_ORDER_MODE,
+          tokenId,
+          maxPrice,
+          requestedUsdc: amountUsdc,
+        });
         const response = await ClobClient.postIOCBuy(this.wallet, tokenId, maxPrice, amountUsdc);
-        if (response?.success === false) return;
+        this._recordAudit('order_result', {
+          side,
+          orderMode: cfg.BEAT_ORDER_MODE,
+          tokenId,
+          response,
+        });
+        if (response?.success === false) {
+          this._recordAudit('decision_skip', {
+            reason: 'usdc-order-rejected',
+            side,
+            tokenId,
+            response,
+          });
+          return;
+        }
       } catch (err) {
         this.log.warn('BeatTrader: directional USDC buy failed', { side, err: err.message });
+        this._recordAudit('order_error', {
+          side,
+          orderMode: cfg.BEAT_ORDER_MODE,
+          tokenId,
+          err: err.message,
+          stack: err.stack ?? null,
+        });
         return;
       }
     }
@@ -458,6 +808,22 @@ export class BeatTrader {
       delta,
       btcPrice,
       beatPrice: this.beatPrice,
+    });
+    this._recordAudit('order_filled', {
+      side,
+      orderMode: cfg.BEAT_ORDER_MODE,
+      tokenId,
+      dryRun: cfg.BEAT_DRY_RUN,
+      plan,
+      maxPrice,
+      delta,
+      btcPrice,
+      beatPrice: this.beatPrice,
+      balances: {
+        up: this.balanceUp,
+        down: this.balanceDown,
+      },
+      tradeSummary: this.tradeSummary,
     });
   }
 
@@ -506,6 +872,18 @@ export class BeatTrader {
       ? (moveAtBuyUsd / this.beatPrice) * 100
       : this.tradeSummary.moveAtBuyPct;
     this.tradeSummary.btcPriceAtBuy = btcPriceAtBuy ?? this.tradeSummary.btcPriceAtBuy;
+    this._recordAudit('buy_recorded', {
+      side,
+      avgPrice,
+      shares,
+      spentUsdc,
+      moveAtBuyUsd,
+      btcPriceAtBuy,
+      balanceUp: this.balanceUp,
+      balanceDown: this.balanceDown,
+      totalSpent: this.totalSpent,
+      tradeSummary: this.tradeSummary,
+    });
   }
 
   _checkCircuitBreakers() {
@@ -519,6 +897,12 @@ export class BeatTrader {
         balanceUp: this.balanceUp,
         balanceDown: this.balanceDown,
       });
+      this._recordAudit('circuit_breaker', {
+        reason: 'inventory-imbalance',
+        imbalanceShares,
+        balanceUp: this.balanceUp,
+        balanceDown: this.balanceDown,
+      });
       this.halted = true;
       this.lifecycle = BEAT_LIFECYCLE.HALTED;
       return true;
@@ -526,6 +910,11 @@ export class BeatTrader {
 
     if (this.totalSpent >= cfg.MAX_SPEND_PER_MARKET) {
       this.log.info('BeatTrader: spend cap reached', { totalSpent: this.totalSpent.toFixed(2) });
+      this._recordAudit('circuit_breaker', {
+        reason: 'spend-cap',
+        totalSpent: this.totalSpent,
+        maxSpendPerMarket: cfg.MAX_SPEND_PER_MARKET,
+      });
       this.halted = true;
       this.lifecycle = BEAT_LIFECYCLE.HALTED;
       return true;
@@ -537,16 +926,31 @@ export class BeatTrader {
   async _cancelAllOrders(conditionId) {
     if (this.config.BEAT_DRY_RUN) {
       this.log.info('BeatTrader: dry-run cancel skipped', { conditionId });
+      this._recordAudit('cancel_skipped', { reason: 'dry-run', conditionId });
       return;
     }
     try {
+      this._recordAudit('cancel_submit', { strategy: 'cancelMarket', conditionId });
       await ClobClient.cancelMarket(conditionId);
+      this._recordAudit('cancel_result', { strategy: 'cancelMarket', conditionId, success: true });
     } catch (err) {
       this.log.warn('BeatTrader: cancelMarket failed, trying cancelAll', { err: err.message });
+      this._recordAudit('cancel_error', {
+        strategy: 'cancelMarket',
+        conditionId,
+        err: err.message,
+      });
       try {
+        this._recordAudit('cancel_submit', { strategy: 'cancelAll', conditionId });
         await ClobClient.cancelAll();
+        this._recordAudit('cancel_result', { strategy: 'cancelAll', conditionId, success: true });
       } catch (fallbackErr) {
         this.log.warn('BeatTrader: cancelAll failed', { err: fallbackErr.message });
+        this._recordAudit('cancel_error', {
+          strategy: 'cancelAll',
+          conditionId,
+          err: fallbackErr.message,
+        });
       }
     }
   }
@@ -554,14 +958,35 @@ export class BeatTrader {
   async _syncBalances(upTokenId, downTokenId) {
     try {
       const balances = await getTokenBalances([upTokenId, downTokenId]);
-      this.balanceUp = balances[upTokenId] ?? this.balanceUp;
-      this.balanceDown = balances[downTokenId] ?? this.balanceDown;
+      this.walletBalanceUp = balances[upTokenId] ?? this.walletBalanceUp;
+      this.walletBalanceDown = balances[downTokenId] ?? this.walletBalanceDown;
+      if (!this.config.BEAT_DRY_RUN) {
+        this.balanceUp = this.walletBalanceUp;
+        this.balanceDown = this.walletBalanceDown;
+      }
       this.log.debug('BeatTrader: balances synced', {
         up: this.balanceUp,
         down: this.balanceDown,
+        walletUp: this.walletBalanceUp,
+        walletDown: this.walletBalanceDown,
+        dryRun: this.config.BEAT_DRY_RUN,
+      });
+      this._recordAudit('balances_synced', {
+        upTokenId,
+        downTokenId,
+        up: this.balanceUp,
+        down: this.balanceDown,
+        walletUp: this.walletBalanceUp,
+        walletDown: this.walletBalanceDown,
+        dryRun: this.config.BEAT_DRY_RUN,
       });
     } catch (err) {
       this.log.warn('BeatTrader: balance sync failed', { err: err.message });
+      this._recordAudit('balance_sync_error', {
+        upTokenId,
+        downTokenId,
+        err: err.message,
+      });
     }
   }
 
@@ -571,6 +996,7 @@ export class BeatTrader {
     const waitMs = redeemNotBeforeMs - Date.now();
     if (waitMs > 0) {
       this.log.debug('BeatTrader: waiting for resolution window', { waitMs });
+      this._recordAudit('wait_for_resolution', { waitMs, windowClose });
       await sleep(waitMs);
     }
 
@@ -579,6 +1005,7 @@ export class BeatTrader {
       resolvedMarket = await waitForResolution(this.market, 400_000, 10_000);
     } catch (err) {
       this.log.warn('BeatTrader: resolution poll timed out, redeeming anyway', { err: err.message });
+      this._recordAudit('resolution_timeout', { err: err.message });
     }
 
     const outcome = this._resolveOutcome(resolvedMarket);
@@ -601,6 +1028,17 @@ export class BeatTrader {
       buyPrice: this.tradeSummary?.buyPrice ?? null,
       tradeOccurred: Boolean(this.tradeSummary?.buyShares > 0),
     });
+    this._recordAudit('settlement_evaluated', {
+      outcome,
+      estimatedPayout,
+      marketPnl,
+      resolvedPayouts: resolvedMarket?.resolvedPayouts ?? null,
+      balances: {
+        up: this.balanceUp,
+        down: this.balanceDown,
+      },
+      tradeSummary: this.tradeSummary,
+    });
 
     if (cfg.BEAT_DRY_RUN) {
       this.pnl.recordRedeem(this.market.slug, marketPnl, 'dry-run');
@@ -611,6 +1049,12 @@ export class BeatTrader {
         upHeld: this.balanceUp,
         downHeld: this.balanceDown,
       });
+      this._recordAudit('redeem_skipped', {
+        reason: 'dry-run',
+        outcome,
+        estimatedPayout,
+        marketPnl,
+      });
       return;
     }
 
@@ -618,10 +1062,17 @@ export class BeatTrader {
     if (totalHeld < 0.001) {
       this.log.info('BeatTrader: no tokens to redeem');
       this.pnl.recordRedeem(this.market.slug, marketPnl, 'none');
+      this._recordAudit('redeem_skipped', {
+        reason: 'no-tokens-held',
+        totalHeld,
+        outcome,
+        estimatedPayout,
+      });
       return;
     }
 
     try {
+      this._recordAudit('redeem_submit', { conditionId, totalHeld, outcome });
       const txHash = await redeemPositions(conditionId);
       this.pnl.recordRedeem(this.market.slug, marketPnl, txHash);
       this.log.info('BeatTrader: redeemed winning position', {
@@ -632,9 +1083,38 @@ export class BeatTrader {
         upHeld: this.balanceUp,
         downHeld: this.balanceDown,
       });
+      this._recordAudit('redeem_result', {
+        conditionId,
+        txHash,
+        outcome,
+        estimatedPayout,
+        marketPnl,
+        upHeld: this.balanceUp,
+        downHeld: this.balanceDown,
+      });
     } catch (err) {
       this.log.error('BeatTrader: redeem failed', { err: err.message });
+      this._recordAudit('redeem_error', {
+        conditionId,
+        err: err.message,
+        stack: err.stack ?? null,
+      });
     }
+  }
+
+  _recordAudit(eventType, payload = {}) {
+    this.auditLog.write(eventType, {
+      slug: this.market.slug,
+      marketSymbol: traderSymbol(this.market, this.config),
+      lifecycle: this.lifecycle,
+      totalSpent: this.totalSpent,
+      redeemedUsdc: this.redeemedUsdc,
+      balanceUp: this.balanceUp,
+      balanceDown: this.balanceDown,
+      walletBalanceUp: this.walletBalanceUp,
+      walletBalanceDown: this.walletBalanceDown,
+      ...payload,
+    });
   }
 
   _resolveOutcome(resolvedMarket) {

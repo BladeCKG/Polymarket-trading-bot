@@ -88,6 +88,197 @@ export class BtcPriceFeed extends EventEmitter {
     return this._latest;
   }
 
+  _baseSymbol() {
+    const raw = String(this.productId ?? '').trim().toUpperCase();
+    if (!raw) return 'BTC';
+    if (raw.includes('-')) return raw.split('-')[0] || 'BTC';
+    if (raw.endsWith('USDT')) return raw.slice(0, -4) || 'BTC';
+    if (raw.endsWith('USD')) return raw.slice(0, -3) || 'BTC';
+    return raw.replace(/[^A-Z]/g, '') || 'BTC';
+  }
+
+  _binanceSymbol() {
+    return `${this._baseSymbol()}USDT`;
+  }
+
+  _coinbaseProductId() {
+    return `${this._baseSymbol()}-USD`;
+  }
+
+  _okxInstId() {
+    return `${this._baseSymbol()}-USDT`;
+  }
+
+  _historicalTick(price, timeMs, source, extra = {}) {
+    return {
+      source,
+      symbol: this.productId?.toLowerCase?.() ?? this._baseSymbol().toLowerCase(),
+      price,
+      bestBid: null,
+      bestAsk: null,
+      productId: this.productId,
+      timeMs,
+      isoTime: new Date(timeMs).toISOString(),
+      historical: true,
+      ...extra,
+    };
+  }
+
+  async _fetchHistoricalTickFromBinance(timestampMs) {
+    const baseParams = {
+      symbol: this._binanceSymbol(),
+      interval: '1s',
+      startTime: timestampMs,
+      endTime: timestampMs + 1_000,
+      limit: 1,
+    };
+    let rows = [];
+    try {
+      const res = await axios.get('https://api.binance.com/api/v3/klines', { params: baseParams, timeout: 5_000 });
+      rows = Array.isArray(res?.data) ? res.data : [];
+    } catch {
+      rows = [];
+    }
+
+    if (!rows.length) {
+      const minuteStartMs = Math.floor(timestampMs / 60_000) * 60_000;
+      const res = await axios.get('https://api.binance.com/api/v3/klines', {
+        params: {
+          symbol: this._binanceSymbol(),
+          interval: '1m',
+          startTime: minuteStartMs,
+          endTime: minuteStartMs + 60_000,
+          limit: 1,
+        },
+        timeout: 5_000,
+      });
+      rows = Array.isArray(res?.data) ? res.data : [];
+    }
+
+    const candle = rows[0];
+    const candleStartMs = Number(candle?.[0]);
+    const openPrice = Number(candle?.[1]);
+    if (!Number.isFinite(candleStartMs) || !Number.isFinite(openPrice)) {
+      throw new Error('Binance historical response missing candle open price');
+    }
+    return this._historicalTick(openPrice, candleStartMs, 'binance', {
+      candleOpenTimeMs: candleStartMs,
+      candleCloseTimeMs: Number(candle?.[6] ?? candleStartMs),
+    });
+  }
+
+  async _fetchHistoricalTickFromCoinbase(timestampMs) {
+    const candleStartMs = Math.floor(timestampMs / 60_000) * 60_000;
+    const startSec = Math.floor(candleStartMs / 1_000);
+    const endSec = startSec + 60;
+    const res = await axios.get(`https://api.exchange.coinbase.com/products/${this._coinbaseProductId()}/candles`, {
+      params: {
+        granularity: 60,
+        start: startSec,
+        end: endSec,
+      },
+      timeout: 5_000,
+    });
+    const rows = Array.isArray(res?.data) ? res.data : [];
+    const candle = rows.find((row) => Number(row?.[0]) === startSec) ?? rows[0];
+    const rowStartSec = Number(candle?.[0]);
+    const openPrice = Number(candle?.[3]);
+    if (!Number.isFinite(rowStartSec) || !Number.isFinite(openPrice)) {
+      throw new Error('Coinbase historical response missing candle open price');
+    }
+    return this._historicalTick(openPrice, rowStartSec * 1_000, 'coinbase', {
+      candleOpenTimeMs: rowStartSec * 1_000,
+      candleCloseTimeMs: (rowStartSec + 60) * 1_000 - 1,
+    });
+  }
+
+  async _fetchHistoricalTickFromOkx(timestampMs) {
+    const params = {
+      instId: this._okxInstId(),
+      bar: '1s',
+      after: timestampMs + 1,
+      limit: 1,
+    };
+    let rows = [];
+    try {
+      const res = await axios.get('https://www.okx.com/api/v5/market/history-candles', { params, timeout: 5_000 });
+      rows = Array.isArray(res?.data?.data) ? res.data.data : [];
+    } catch {
+      rows = [];
+    }
+
+    if (!rows.length) {
+      const minuteStartMs = Math.floor(timestampMs / 60_000) * 60_000;
+      const res = await axios.get('https://www.okx.com/api/v5/market/history-candles', {
+        params: {
+          instId: this._okxInstId(),
+          bar: '1m',
+          after: minuteStartMs + 1,
+          limit: 1,
+        },
+        timeout: 5_000,
+      });
+      rows = Array.isArray(res?.data?.data) ? res.data.data : [];
+    }
+
+    const candle = rows[0];
+    const candleStartMs = Number(candle?.[0]);
+    const openPrice = Number(candle?.[1]);
+    if (!Number.isFinite(candleStartMs) || !Number.isFinite(openPrice)) {
+      throw new Error('OKX historical response missing candle open price');
+    }
+    const barMs = candle?.[8] === '1' ? 60_000 : 1_000;
+    return this._historicalTick(openPrice, candleStartMs, 'okx', {
+      candleOpenTimeMs: candleStartMs,
+      candleCloseTimeMs: candleStartMs + barMs - 1,
+    });
+  }
+
+  async _fetchHistoricalTickFromHyperliquid(timestampMs) {
+    const candleStartMs = Math.floor(timestampMs / 60_000) * 60_000;
+    const body = {
+      type: 'candleSnapshot',
+      req: {
+        coin: this._baseSymbol(),
+        interval: '1m',
+        startTime: candleStartMs,
+        endTime: candleStartMs + 60_000,
+      },
+    };
+    const res = await axios.post('https://api.hyperliquid.xyz/info', body, { timeout: 5_000 });
+    const rows = Array.isArray(res?.data)
+      ? res.data
+      : (typeof res?.data === 'string' ? JSON.parse(res.data) : []);
+    const candle = rows.find((row) => Number(row?.t) === candleStartMs) ?? rows[0];
+    const rowStartMs = Number(candle?.t);
+    const openPrice = Number(candle?.o);
+    if (!Number.isFinite(rowStartMs) || !Number.isFinite(openPrice)) {
+      throw new Error('Hyperliquid historical response missing candle open price');
+    }
+    return this._historicalTick(openPrice, rowStartMs, 'hyperliquid', {
+      candleOpenTimeMs: rowStartMs,
+      candleCloseTimeMs: Number(candle?.T ?? (rowStartMs + 60_000 - 1)),
+    });
+  }
+
+  async fetchHistoricalTickAt(timestampMs) {
+    const attempts = [
+      ['binance', () => this._fetchHistoricalTickFromBinance(timestampMs)],
+      ['coinbase', () => this._fetchHistoricalTickFromCoinbase(timestampMs)],
+      ['okx', () => this._fetchHistoricalTickFromOkx(timestampMs)],
+      ['hyperliquid', () => this._fetchHistoricalTickFromHyperliquid(timestampMs)],
+    ];
+    const failures = [];
+    for (const [name, fn] of attempts) {
+      try {
+        return await fn();
+      } catch (err) {
+        failures.push(`${name}: ${err.message}`);
+      }
+    }
+    throw new Error(`No historical price source available for ${new Date(timestampMs).toISOString()} (${failures.join('; ')})`);
+  }
+
   async fetchRestTick(timeoutMs = 5_000) {
     if (!this.restUrl) {
       throw new Error(`No REST price URL configured for ${this.source}`);
