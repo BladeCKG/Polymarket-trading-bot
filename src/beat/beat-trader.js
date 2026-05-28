@@ -430,7 +430,7 @@ export class BeatTrader {
       down: { book: downBook, bid: downBid, ask: downAsk },
     };
 
-    const secondsAfterOpen = Math.max(0, Math.round((Date.now() - (this.market.windowTs * 1000)) / 1000));
+    const secondsAfterOpen = Math.max(0, (Date.now() - (this.market.windowTs * 1000)) / 1000);
     const btcPrice = Number.isFinite(Number(this.latestBtcTick?.price)) ? Number(this.latestBtcTick.price) : null;
     const beatPrice = Number.isFinite(Number(this.beatPrice)) ? Number(this.beatPrice) : null;
     let upAskPrice = positiveFiniteOrNull(upAsk?.price);
@@ -440,7 +440,7 @@ export class BeatTrader {
       downAskPrice = null;
     }
     const chartPoint = {
-      second: secondsAfterOpen,
+      second: Math.min(this.config.MARKET_WINDOW_SECONDS, secondsAfterOpen),
       move: Number.isFinite(btcPrice) && Number.isFinite(beatPrice) ? btcPrice - beatPrice : null,
       upAsk: upAskPrice,
       downAsk: downAskPrice,
