@@ -664,6 +664,7 @@ export class BeatTrader {
     const settled = patch.settled ?? lifecycle === BEAT_LIFECYCLE.SETTLED;
     this.dashboard.recordMarket({
       slug: this.market.slug,
+      marketSymbol: cfg.BEAT_MARKET_SYMBOL,
       windowTs: this.market.windowTs,
       windowOpenAt: this.market.windowTs * 1000,
       windowCloseAt: (this.market.windowTs + cfg.MARKET_WINDOW_SECONDS) * 1000,

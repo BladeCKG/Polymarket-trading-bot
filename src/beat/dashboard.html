@@ -493,10 +493,7 @@
       stats: {},
       logs: [],
       markets: [],
-      btcPrice: null,
-      btcBestBid: null,
-      btcBestAsk: null,
-      btcUpdatedAt: null,
+      prices: {},
       config: {},
     };
 
@@ -577,8 +574,25 @@
         .replaceAll("'", '&#39;');
     }
 
-    function beatSymbol() {
-      return String(state.config?.BEAT_MARKET_SYMBOL ?? state.runtime?.marketSymbol ?? 'BTC').toUpperCase();
+    function activeBeatSymbols() {
+      const raw = Array.isArray(state.config?.BEAT_SYMBOLS) && state.config.BEAT_SYMBOLS.length
+        ? state.config.BEAT_SYMBOLS
+        : (Array.isArray(state.runtime?.marketSymbols) ? state.runtime.marketSymbols : [state.config?.BEAT_MARKET_SYMBOL ?? 'BTC']);
+      return raw
+        .map((sym) => String(sym ?? '').trim().toUpperCase())
+        .filter((sym) => sym !== '');
+    }
+
+    function priceFor(symbol) {
+      return state.prices?.[String(symbol ?? 'BTC').toUpperCase()]?.price ?? null;
+    }
+
+    function beatSymbol(market) {
+      if (market?.marketSymbol) return String(market.marketSymbol).toUpperCase();
+      if (Array.isArray(state.runtime?.marketSymbols) && state.runtime.marketSymbols.length) {
+        return String(state.runtime.marketSymbols[0]).toUpperCase();
+      }
+      return String(state.config?.BEAT_MARKET_SYMBOL ?? 'BTC').toUpperCase();
     }
 
     function getWindowOpenMs(market) {
@@ -741,16 +755,17 @@
       const settled = sortMarketsForView(markets.filter((m) => isSettledMarket(m)));
       const traded = markets.filter((m) => Number(m.buyShares || 0) > 0);
       const pnl = settled.reduce((sum, m) => sum + Number(m.pnl || 0), 0);
-      const btc = state.btcPrice ?? live[0]?.btcPrice ?? settled[0]?.btcPrice ?? live[0]?.beatPrice ?? settled[0]?.beatPrice;
-      const symbol = beatSymbol();
-
-      topStatsEl.innerHTML = [
-        [`${symbol} Price`, money(btc)],
+      const symbols = activeBeatSymbols();
+      const priceStats = symbols.map((symbol) => [`${symbol} Price`, money(priceFor(symbol))]);
+      const stats = [
+        ...priceStats,
         ['Live Markets', String(live.length)],
         ['Settled Markets', String(settled.length)],
         ['Traded Markets', String(traded.length)],
         ['Realized PnL', money(pnl)],
-      ].map(([label, value]) => `
+      ];
+
+      topStatsEl.innerHTML = stats.map(([label, value]) => `
         <article class="stat">
           <div class="label">${label}</div>
           <div class="value">${value}</div>
@@ -764,15 +779,16 @@
       const settled = lifecycle === 'settled';
       const preOpen = lifecycle === 'upcoming';
       const statusText = marketStatusText(market);
-      const symbol = beatSymbol();
+      const symbol = beatSymbol(market);
       const traded = Boolean(market.tradeOccurred || Number(market.buyShares || 0) > 0);
-      const beat = market.beatPrice ?? state.btcPrice;
-      const liveBtc = market.btcPrice ?? state.btcPrice;
-      const btcMove = !settled && Number.isFinite(Number(liveBtc)) && Number.isFinite(Number(beat))
-        ? Number(liveBtc) - Number(beat)
+      const symbolPrice = priceFor(symbol);
+      const beat = market.beatPrice ?? symbolPrice;
+      const livePrice = market.btcPrice ?? symbolPrice;
+      const move = !settled && Number.isFinite(Number(livePrice)) && Number.isFinite(Number(beat))
+        ? Number(livePrice) - Number(beat)
         : null;
-      const btcMovePct = !settled && Number.isFinite(btcMove) && Number.isFinite(Number(beat)) && Number(beat) !== 0
-        ? (btcMove / Number(beat)) * 100
+      const movePct = !settled && Number.isFinite(move) && Number.isFinite(Number(beat)) && Number(beat) !== 0
+        ? (move / Number(beat)) * 100
         : null;
       const buyEvents = Array.isArray(market.buyEvents) ? market.buyEvents : [];
       const totalBuyUsdc = buyEvents.reduce((sum, buy) => sum + Number(buy?.usdc ?? 0), 0);
@@ -783,10 +799,10 @@
       const moveLabel = settled ? null : `${symbol} Move`;
       const moveValueText = settled
         ? null
-        : `${signedMoney(btcMove)}${btcMovePct != null ? ` (${btcMovePct >= 0 ? '+' : ''}${btcMovePct.toFixed(2)}%)` : ''}`;
+        : `${signedMoney(move)}${movePct != null ? ` (${movePct >= 0 ? '+' : ''}${movePct.toFixed(2)}%)` : ''}`;
       const moveValueClass = settled
         ? ''
-        : (Number(btcMove) >= 0 ? 'summary-positive' : 'summary-negative');
+        : (Number(move) >= 0 ? 'summary-positive' : 'summary-negative');
       return `
         <article class="market-card ${settled ? 'settled' : ''}">
           <div class="market-head">
@@ -982,18 +998,18 @@
         state.logs = [data, ...state.logs].slice(0, 250);
         scheduleRender('logs');
       } else if (type === 'price') {
-        if (data?.price != null && Number.isFinite(Number(data.price))) {
-          state.btcPrice = Number(data.price);
-        } else if (data != null && Number.isFinite(Number(data))) {
-          state.btcPrice = Number(data);
-        }
-        if (data?.bestBid != null && Number.isFinite(Number(data.bestBid))) {
-          state.btcBestBid = Number(data.bestBid);
-        }
-        if (data?.bestAsk != null && Number.isFinite(Number(data.bestAsk))) {
-          state.btcBestAsk = Number(data.bestAsk);
-        }
-        state.btcUpdatedAt = data?.timeMs ?? Date.now();
+        const symbol = String(data?.symbol ?? 'BTC').toUpperCase();
+        const next = {
+          symbol,
+          price: data?.price != null && Number.isFinite(Number(data.price)) ? Number(data.price) : null,
+          bestBid: data?.bestBid != null && Number.isFinite(Number(data.bestBid)) ? Number(data.bestBid) : null,
+          bestAsk: data?.bestAsk != null && Number.isFinite(Number(data.bestAsk)) ? Number(data.bestAsk) : null,
+          updatedAt: data?.updatedAt ?? Date.now(),
+        };
+        state.prices = {
+          ...state.prices,
+          [symbol]: next,
+        };
         scheduleRender('topStats', 'markets');
       } else if (type === 'market') {
         const slug = data?.slug;

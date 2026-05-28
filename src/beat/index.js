@@ -14,6 +14,20 @@ import { BtcPriceFeed } from './btc-price-feed.js';
 import { BEAT_LIFECYCLE } from './lifecycle.js';
 import { applyBeatRuntimeConfigPatch, createBeatRuntimeConfig } from './runtime-config.js';
 
+function feedDefaultsFor(symbol) {
+  const normalized = String(symbol ?? 'BTC').trim().toUpperCase();
+  return {
+    wsUrl: `wss://stream.binance.com:9443/ws/${normalized.toLowerCase()}usdt@ticker`,
+    productId: `${normalized.toUpperCase()}USDT`,
+    restUrl: `https://api.binance.com/api/v3/ticker/price?symbol=${normalized.toUpperCase()}USDT`,
+  };
+}
+
+function symbolFromSlug(slug) {
+  if (!slug || typeof slug !== 'string') return 'BTC';
+  return String(slug).split('-')[0].toUpperCase();
+}
+
 const MIN_WEB3_PRC_PRICE = 0.983;
 let beatConfig = createBeatRuntimeConfig();
 
@@ -69,7 +83,10 @@ export async function main() {
   const wallet = getSigner();
   await startup(wallet);
 
-  let btcFeed = null;
+  const symbols = Array.isArray(beatConfig.BEAT_SYMBOLS) && beatConfig.BEAT_SYMBOLS.length
+    ? beatConfig.BEAT_SYMBOLS
+    : [beatConfig.BEAT_MARKET_SYMBOL];
+  const priceFeeds = new Map();
   let dashboard = null;
   if (beatConfig.BEAT_DASHBOARD_ENABLED) {
     dashboard = new BeatDashboardServer({
@@ -78,14 +95,13 @@ export async function main() {
       runtime: {
         mode: 'beat',
         wallet: wallet.address,
-        marketSymbol: beatConfig.BEAT_MARKET_SYMBOL,
+        marketSymbols: symbols,
         dryRun: beatConfig.BEAT_DRY_RUN,
         startedAt: Date.now(),
       },
       config: beatConfig,
       onConfigUpdate: (patch) => {
         applyBeatRuntimeConfigPatch(beatConfig, patch);
-        btcFeed?.updateConfig(beatConfig);
         return beatConfig;
       },
     });
@@ -93,18 +109,27 @@ export async function main() {
     logger.info('beat.main: dashboard available', { url });
   }
 
+  for (const symbol of symbols) {
+    const defaults = feedDefaultsFor(symbol);
+    const feed = new BtcPriceFeed({
+      url: defaults.wsUrl,
+      productId: defaults.productId,
+      restUrl: defaults.restUrl,
+    });
+    feed.on('tick', (tick) => {
+      dashboard?.recordPrice({ ...tick, symbol });
+    });
+    feed.on('error', (err) => {
+      logger.warn('Beat main: price feed error', { symbol, err: err.message });
+    });
+    feed.start();
+    priceFeeds.set(symbol, feed);
+  }
+
   const pnl = new PnlTracker();
-  btcFeed = new BtcPriceFeed({ config: beatConfig });
-  btcFeed.on('tick', (tick) => {
-    dashboard?.recordPrice(tick);
-  });
-  btcFeed.on('error', (err) => {
-    logger.warn('Beat main: BTC feed error', { err: err.message });
-  });
-  btcFeed.start();
   const runningTasks = new Set();
-  let latestUpcomingSlug = null;
-  let latestFetchedSlug = null;
+  const latestUpcomingSlug = new Map();
+  const latestFetchedSlug = new Map();
   let stopping = false;
   const onStop = (sig) => {
     if (stopping) return;
@@ -122,28 +147,33 @@ export async function main() {
   const upcomingDiscoveryTask = (async () => {
     while (!stopping) {
       const wts = nextWindowTs(beatConfig.MARKET_WINDOW_SECONDS);
-      const slug = slugFor(wts, beatConfig.BEAT_MARKET_SYMBOL);
       const openMs = wts * 1000;
       const closeMs = (wts + beatConfig.MARKET_WINDOW_SECONDS) * 1000;
 
-      if (slug !== latestUpcomingSlug) {
-        latestUpcomingSlug = slug;
-        logger.info('Beat main: staging upcoming market', {
-          slug,
-          opensIn: Math.round(msUntil(wts) / 1000) + 's',
-        });
-        if (dashboard) {
-          dashboard.recordMarket({
+      for (const symbol of symbols) {
+        const slug = slugFor(wts, symbol);
+        const latestUpcoming = latestUpcomingSlug.get(symbol);
+        if (slug !== latestUpcoming) {
+          latestUpcomingSlug.set(symbol, slug);
+          logger.info('Beat main: staging upcoming market', {
             slug,
-            windowTs: wts,
-            windowOpenAt: openMs,
-            windowCloseAt: closeMs,
-            conditionId: null,
-            lifecycle: BEAT_LIFECYCLE.UPCOMING,
-            tradeStatus: 'upcoming',
-            settled: false,
-            updatedAt: Date.now(),
+            symbol,
+            opensIn: Math.round(msUntil(wts) / 1000) + 's',
           });
+          if (dashboard) {
+            dashboard.recordMarket({
+              slug,
+              marketSymbol: symbol,
+              windowTs: wts,
+              windowOpenAt: openMs,
+              windowCloseAt: closeMs,
+              conditionId: null,
+              lifecycle: BEAT_LIFECYCLE.UPCOMING,
+              tradeStatus: 'upcoming',
+              settled: false,
+              updatedAt: Date.now(),
+            });
+          }
         }
       }
 
@@ -153,28 +183,34 @@ export async function main() {
         continue;
       }
 
-      if (slug !== latestFetchedSlug) {
-        try {
-          const market = await fetchMarketWithRetry(slug, 30, 3_000);
-          latestFetchedSlug = slug;
-          if (dashboard) {
-            dashboard.recordMarket({
+      for (const symbol of symbols) {
+        const slug = slugFor(wts, symbol);
+        const latestFetched = latestFetchedSlug.get(symbol);
+        if (slug !== latestFetched) {
+          try {
+            const market = await fetchMarketWithRetry(slug, 30, 3_000);
+            latestFetchedSlug.set(symbol, slug);
+            if (dashboard) {
+              dashboard.recordMarket({
+                slug,
+                marketSymbol: symbol,
+                windowTs: wts,
+                windowOpenAt: openMs,
+                windowCloseAt: closeMs,
+                conditionId: market?.conditionId ?? null,
+                lifecycle: BEAT_LIFECYCLE.UPCOMING,
+                tradeStatus: 'upcoming',
+                settled: false,
+                updatedAt: Date.now(),
+              });
+            }
+          } catch (err) {
+            logger.warn('Beat main: upcoming market fetch not ready yet', {
               slug,
-              windowTs: wts,
-              windowOpenAt: openMs,
-              windowCloseAt: closeMs,
-              conditionId: market?.conditionId ?? null,
-              lifecycle: BEAT_LIFECYCLE.UPCOMING,
-              tradeStatus: 'upcoming',
-              settled: false,
-              updatedAt: Date.now(),
+              symbol,
+              err: err.message,
             });
           }
-        } catch (err) {
-          logger.warn('Beat main: upcoming market fetch not ready yet', {
-            slug,
-            err: err.message,
-          });
         }
       }
 
@@ -203,51 +239,64 @@ export async function main() {
     }
 
     const wts = currentWindowTs(beatConfig.MARKET_WINDOW_SECONDS);
-    const slug = slugFor(wts, beatConfig.BEAT_MARKET_SYMBOL);
-
-    let market;
-    try {
-      market = await fetchMarketWithRetry(slug, 30, 3_000);
-      if (dashboard) {
-        dashboard.recordMarket({
+    const symbolTasks = symbols.map(async (symbol) => {
+      const slug = slugFor(wts, symbol);
+      let market;
+      try {
+        market = await fetchMarketWithRetry(slug, 30, 3_000);
+        if (dashboard) {
+          dashboard.recordMarket({
+            slug,
+            marketSymbol: symbol,
+            windowTs: wts,
+            windowOpenAt: wts * 1000,
+            windowCloseAt: (wts + beatConfig.MARKET_WINDOW_SECONDS) * 1000,
+            conditionId: market?.conditionId ?? null,
+            lifecycle: BEAT_LIFECYCLE.UPCOMING,
+            tradeStatus: 'upcoming',
+            settled: false,
+            updatedAt: Date.now(),
+          });
+        }
+      } catch (err) {
+        logger.error('Beat main: failed to discover market, skipping window', {
           slug,
-          windowTs: wts,
-          windowOpenAt: wts * 1000,
-          windowCloseAt: (wts + beatConfig.MARKET_WINDOW_SECONDS) * 1000,
-          conditionId: market?.conditionId ?? null,
-          lifecycle: BEAT_LIFECYCLE.UPCOMING,
-          tradeStatus: 'upcoming',
-          settled: false,
-          updatedAt: Date.now(),
-        });
-      }
-    } catch (err) {
-      logger.error('Beat main: failed to discover market, skipping window', {
-        slug,
-        err: err.message,
-      });
-      const skipMs = msUntil(wts + beatConfig.MARKET_WINDOW_SECONDS);
-      if (skipMs > 0) await sleep(skipMs);
-      continue;
-    }
-
-    if (stopping) break;
-
-    const trader = new BeatTrader(market, wallet, pnl, { dashboard, btcFeed, config: beatConfig });
-    const task = trader.run()
-      .then(() => {
-        runningTasks.delete(task);
-        pnl.printSessionSummary();
-      })
-      .catch((err) => {
-        runningTasks.delete(task);
-        logger.error('Beat main: trader threw', {
-          slug,
+          symbol,
           err: err.message,
-          stack: err.stack,
         });
-      });
-    runningTasks.add(task);
+        return;
+      }
+
+      if (stopping) return;
+
+      const symbolFeed = priceFeeds.get(symbol);
+      const symbolMomentsKey = `BEAT_MOMENTS_${String(symbol ?? '').toUpperCase()}`;
+      const symbolMoments = beatConfig[symbolMomentsKey] || beatConfig.BEAT_MOMENTS;
+      const traderConfig = {
+        ...beatConfig,
+        BEAT_MARKET_SYMBOL: symbol,
+        BEAT_MOMENTS: Array.isArray(symbolMoments) ? symbolMoments : beatConfig.BEAT_MOMENTS,
+      };
+
+      const trader = new BeatTrader(market, wallet, pnl, { dashboard, btcFeed: symbolFeed, config: traderConfig });
+      const task = trader.run()
+        .then(() => {
+          runningTasks.delete(task);
+          pnl.printSessionSummary();
+        })
+        .catch((err) => {
+          runningTasks.delete(task);
+          logger.error('Beat main: trader threw', {
+            slug,
+            symbol,
+            err: err.message,
+            stack: err.stack,
+          });
+        });
+      runningTasks.add(task);
+    });
+
+    await Promise.all(symbolTasks);
 
     const nextLoopMs = msUntil(wts + beatConfig.MARKET_WINDOW_SECONDS);
     if (nextLoopMs > 0) {
@@ -261,7 +310,9 @@ export async function main() {
   await Promise.allSettled([...runningTasks]);
   await upcomingDiscoveryTask;
   pnl.printSessionSummary();
-  btcFeed.stop();
+  for (const feed of priceFeeds.values()) {
+    feed.stop();
+  }
   dashboard?.stop();
   logger.info('Beat main: stopped');
   process.exit(0);

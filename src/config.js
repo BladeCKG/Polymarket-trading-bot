@@ -36,26 +36,104 @@ function parseEnum_(key, allowed, fallback) {
   return allowed.includes(raw) ? raw : fallback;
 }
 
-function parseMoments_(key, fallback) {
+function parseArray_(key, fallback) {
   const v = process.env[key];
   if (v === undefined) return fallback;
+  if (Array.isArray(v)) return v;
+  if (typeof v !== 'string') return fallback;
+
+  const trimmed = v.trim();
+  if (!trimmed) return fallback;
+
   try {
-    const parsed = JSON.parse(v);
-    if (!Array.isArray(parsed)) return fallback;
-    // Expect compact double-array format: [[start,end,btcmoveMax,buyMax], ...]
-    return parsed.map((it) => {
-      if (!Array.isArray(it) || it.length < 4) throw new Error('Invalid BEAT_MOMENTS format');
-      const [s, e, bm, bk] = it;
-      return {
+    const parsed = JSON.parse(trimmed);
+    if (Array.isArray(parsed)) return parsed;
+  } catch (err) {
+    // fall back to comma-separated list
+  }
+
+  return trimmed.split(/[,\s]+/).filter(Boolean);
+}
+
+const SUPPORTED_BEAT_SYMBOLS = ['BTC', 'ETH', 'SOL', 'XRP', 'BNB', 'DOGE', 'HYPE'];
+
+function normalizeBeatSymbol(value, fallback) {
+  const raw = String(value ?? '').trim().toUpperCase();
+  return SUPPORTED_BEAT_SYMBOLS.includes(raw) ? raw : fallback;
+}
+
+function parseSymbol_(key, fallback) {
+  const raw = String(optional(key, '')).trim().toUpperCase();
+  return SUPPORTED_BEAT_SYMBOLS.includes(raw) ? raw : fallback;
+}
+
+function parseSymbolList_(key, fallback) {
+  const values = parseArray_(key, fallback);
+  const symbols = values.map((value) => normalizeBeatSymbol(value, null)).filter(Boolean);
+  return symbols.length ? [...new Set(symbols)] : fallback;
+}
+
+function normalizeMoments_(value, fallback) {
+  if (!Array.isArray(value)) return fallback;
+  const next = [];
+  for (const item of value) {
+    if (Array.isArray(item)) {
+      if (item.length < 4) return fallback;
+      const [s, e, bm, bk] = item;
+      const normalized = {
         start: Number(s ?? 0),
-        end: Number(e ?? 300),
+        end: Number(e ?? MARKET_WINDOW_SECONDS),
         btcmoveMax: Number(bm),
         buyMax: Number(bk),
       };
-    });
-  } catch (err) {
+      if (
+        !Number.isFinite(normalized.start) ||
+        !Number.isFinite(normalized.end) ||
+        !Number.isFinite(normalized.btcmoveMax) ||
+        !Number.isFinite(normalized.buyMax)
+      ) {
+        return fallback;
+      }
+      next.push(normalized);
+      continue;
+    }
+    if (item && typeof item === 'object') {
+      const normalized = {
+        start: Number(item.start ?? 0),
+        end: Number(item.end ?? MARKET_WINDOW_SECONDS),
+        btcmoveMax: Number(item.btcmoveMax),
+        buyMax: Number(item.buyMax),
+      };
+      if (
+        !Number.isFinite(normalized.start) ||
+        !Number.isFinite(normalized.end) ||
+        !Number.isFinite(normalized.btcmoveMax) ||
+        !Number.isFinite(normalized.buyMax)
+      ) {
+        return fallback;
+      }
+      next.push(normalized);
+      continue;
+    }
     return fallback;
   }
+  return next.length ? next : fallback;
+}
+
+function parseMoments_(key, fallback) {
+  const normalizedFallback = normalizeMoments_(fallback, []);
+  const v = process.env[key];
+  if (v === undefined) return normalizedFallback;
+  try {
+    const parsed = JSON.parse(v);
+    return normalizeMoments_(parsed, normalizedFallback);
+  } catch (err) {
+    return normalizedFallback;
+  }
+}
+
+function parseSymbolMoments_(symbol, fallback) {
+  return parseMoments_(`BEAT_MOMENTS_${String(symbol ?? '').toUpperCase()}`, fallback);
 }
 
 // ── Wallet ───────────────────────────────────────────────────────────────────
@@ -133,22 +211,32 @@ export const HEARTBEAT_INTERVAL_MS      = Math.max(
   parseInt(optional('HEARTBEAT_INTERVAL_MS', '30000'), 10) || 30_000,
 );
 
-// ── BTC beat strategy ────────────────────────────────────────────────────────
-export const BEAT_MARKET_SYMBOL          = parseEnum_('BEAT_MARKET_SYMBOL', ['BTC', 'ETH'], 'BTC');
-const PRICE_FEED_DEFAULTS = BEAT_MARKET_SYMBOL === 'ETH'
-  ? {
+// ── Beat strategy symbols ───────────────────────────────────────────────────
+// `BEAT_SYMBOLS` can contain multiple assets to trade in parallel.
+// `BEAT_MARKET_SYMBOL` remains a backward-compatible primary symbol.
+const BEAT_MARKET_SYMBOL_RAW = parseSymbol_('BEAT_MARKET_SYMBOL', 'BTC');
+export const BEAT_SYMBOLS = parseSymbolList_('BEAT_SYMBOLS', [BEAT_MARKET_SYMBOL_RAW]);
+export const BEAT_MARKET_SYMBOL = parseSymbol_('BEAT_MARKET_SYMBOL', BEAT_SYMBOLS[0] ?? 'BTC');
+
+function priceFeedDefaultsFor(symbol) {
+  const normalized = normalizeBeatSymbol(symbol, 'BTC');
+  if (normalized === 'ETH') {
+    return {
       wsUrl: 'wss://stream.binance.com:9443/ws/ethusdt@ticker',
       productId: 'ETHUSDT',
       restUrl: 'https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT',
-    }
-  : {
-      wsUrl: 'wss://stream.binance.com:9443/ws/btcusdt@ticker',
-      productId: 'BTCUSDT',
-      restUrl: 'https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT',
     };
-export const BTC_PRICE_WS_URL            = optional('BTC_PRICE_WS_URL', PRICE_FEED_DEFAULTS.wsUrl);
-export const BTC_PRICE_PRODUCT_ID        = optional('BTC_PRICE_PRODUCT_ID', PRICE_FEED_DEFAULTS.productId);
-export const BTC_PRICE_REST_URL          = optional('BTC_PRICE_REST_URL', PRICE_FEED_DEFAULTS.restUrl);
+  }
+  return {
+    wsUrl: `wss://stream.binance.com:9443/ws/${normalized.toLowerCase()}usdt@ticker`,
+    productId: `${normalized.toUpperCase()}USDT`,
+    restUrl: `https://api.binance.com/api/v3/ticker/price?symbol=${normalized.toUpperCase()}USDT`,
+  };
+}
+
+export const BTC_PRICE_WS_URL            = optional('BTC_PRICE_WS_URL', priceFeedDefaultsFor(BEAT_MARKET_SYMBOL).wsUrl);
+export const BTC_PRICE_PRODUCT_ID        = optional('BTC_PRICE_PRODUCT_ID', priceFeedDefaultsFor(BEAT_MARKET_SYMBOL).productId);
+export const BTC_PRICE_REST_URL          = optional('BTC_PRICE_REST_URL', priceFeedDefaultsFor(BEAT_MARKET_SYMBOL).restUrl);
 export const BTC_PRICE_MAX_AGE_MS        = parseInt_('BTC_PRICE_MAX_AGE_MS', 2_000);
 export const BEAT_DRY_RUN                = parseBool_('BEAT_DRY_RUN', true);
 // Entry delay is now controlled by `BEAT_MOMENTS` (per-moment starts)
@@ -173,8 +261,16 @@ export const BEAT_DASHBOARD_PORT = parseInt_('BEAT_DASHBOARD_PORT', 8798);
 // Compact form: [[start,end,btcmoveMax,buyMax], ...]
 export const BEAT_MOMENTS = parseMoments_('BEAT_MOMENTS', [
   // Default: allow reasonable moves and buy price across full window
-  [0, MARKET_WINDOW_SECONDS, 120, 0.46],
+  { start: 0, end: MARKET_WINDOW_SECONDS, btcmoveMax: 120, buyMax: 0.46 },
 ]);
+
+export const BEAT_MOMENTS_BTC = parseSymbolMoments_('BTC', BEAT_MOMENTS);
+export const BEAT_MOMENTS_ETH = parseSymbolMoments_('ETH', BEAT_MOMENTS);
+export const BEAT_MOMENTS_SOL = parseSymbolMoments_('SOL', BEAT_MOMENTS);
+export const BEAT_MOMENTS_XRP = parseSymbolMoments_('XRP', BEAT_MOMENTS);
+export const BEAT_MOMENTS_BNB = parseSymbolMoments_('BNB', BEAT_MOMENTS);
+export const BEAT_MOMENTS_DOGE = parseSymbolMoments_('DOGE', BEAT_MOMENTS);
+export const BEAT_MOMENTS_HYPE = parseSymbolMoments_('HYPE', BEAT_MOMENTS);
 
 // ── EIP-712 domains for CLOB order signing ───────────────────────────────────
 // Polymarket has TWO exchange contracts. Orders MUST be signed against the

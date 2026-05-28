@@ -32,10 +32,7 @@ export class BeatDashboardServer {
       config,
       stats: {},
       logs: [],
-      btcPrice: null,
-      btcBestBid: null,
-      btcBestAsk: null,
-      btcUpdatedAt: null,
+      prices: {},
       markets: [],
     };
     this._server = null;
@@ -116,24 +113,34 @@ export class BeatDashboardServer {
 
   recordPrice(tick) {
     if (tick && typeof tick === 'object') {
-      if (tick.price != null && Number.isFinite(Number(tick.price))) {
-        this.state.btcPrice = Number(tick.price);
-      }
-      if (tick.bestBid != null && Number.isFinite(Number(tick.bestBid))) {
-        this.state.btcBestBid = Number(tick.bestBid);
-      }
-      if (tick.bestAsk != null && Number.isFinite(Number(tick.bestAsk))) {
-        this.state.btcBestAsk = Number(tick.bestAsk);
-      }
-      this.state.btcUpdatedAt = tick.timeMs ?? Date.now();
-      this.broadcast('price', tick);
+      const symbol = String(tick.symbol ?? 'BTC').toUpperCase();
+      const next = {
+        symbol,
+        price: Number.isFinite(Number(tick.price)) ? Number(tick.price) : null,
+        bestBid: Number.isFinite(Number(tick.bestBid)) ? Number(tick.bestBid) : null,
+        bestAsk: Number.isFinite(Number(tick.bestAsk)) ? Number(tick.bestAsk) : null,
+        updatedAt: tick.timeMs ?? Date.now(),
+      };
+      this.state.prices = {
+        ...this.state.prices,
+        [symbol]: next,
+      };
+      this.broadcast('price', next);
       return;
     }
-    if (tick != null && Number.isFinite(Number(tick))) {
-      this.state.btcPrice = Number(tick);
-    }
-    this.state.btcUpdatedAt = Date.now();
-    this.broadcast('price', { price: tick });
+    const symbol = 'BTC';
+    const next = {
+      symbol,
+      price: Number.isFinite(Number(tick)) ? Number(tick) : null,
+      bestBid: null,
+      bestAsk: null,
+      updatedAt: Date.now(),
+    };
+    this.state.prices = {
+      ...this.state.prices,
+      [symbol]: next,
+    };
+    this.broadcast('price', next);
   }
 
   recordMarket(patch) {
