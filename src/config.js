@@ -215,19 +215,6 @@ export const HEARTBEAT_INTERVAL_MS      = Math.max(
 // `BEAT_SYMBOLS` contains the assets to trade in parallel.
 export const BEAT_SYMBOLS = parseSymbolList_('BEAT_SYMBOLS', ['BTC']);
 
-function priceFeedDefaultsFor(symbol) {
-  const normalized = normalizeBeatSymbol(symbol, 'BTC');
-  const filterSymbol = `${normalized.toLowerCase()}usdt`;
-  return {
-    wsUrl: 'wss://ws-live-data.polymarket.com',
-    productId: filterSymbol,
-    restUrl: `https://api.binance.com/api/v3/ticker/price?symbol=${normalized.toUpperCase()}USDT`,
-  };
-}
-
-export const BTC_PRICE_WS_URL            = optional('BTC_PRICE_WS_URL', priceFeedDefaultsFor(BEAT_SYMBOLS[0] ?? 'BTC').wsUrl);
-export const BTC_PRICE_PRODUCT_ID        = optional('BTC_PRICE_PRODUCT_ID', priceFeedDefaultsFor(BEAT_SYMBOLS[0] ?? 'BTC').productId);
-export const BTC_PRICE_REST_URL          = optional('BTC_PRICE_REST_URL', priceFeedDefaultsFor(BEAT_SYMBOLS[0] ?? 'BTC').restUrl);
 export const BTC_PRICE_MAX_AGE_MS        = parseInt_('BTC_PRICE_MAX_AGE_MS', 2_000);
 export const BTC_PRICE_STALL_RECONNECT_MS = parseInt_('BTC_PRICE_STALL_RECONNECT_MS', 12_000);
 export const BEAT_DRY_RUN                = parseBool_('BEAT_DRY_RUN', true);

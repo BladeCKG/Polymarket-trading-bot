@@ -19,9 +19,6 @@ import {
   BEAT_ORDER_SIZE_USDC,
   BTC_PRICE_MAX_AGE_MS,
   BTC_PRICE_STALL_RECONNECT_MS,
-  BTC_PRICE_PRODUCT_ID,
-  BTC_PRICE_REST_URL,
-  BTC_PRICE_WS_URL,
   MAX_INVENTORY_IMBALANCE,
   MAX_SPEND_PER_MARKET,
   MARKET_WINDOW_SECONDS,
@@ -30,9 +27,6 @@ import {
 
 const DEFAULTS = Object.freeze({
   BEAT_SYMBOLS,
-  BTC_PRICE_WS_URL,
-  BTC_PRICE_PRODUCT_ID,
-  BTC_PRICE_REST_URL,
   BTC_PRICE_MAX_AGE_MS,
   BTC_PRICE_STALL_RECONNECT_MS,
   MARKET_WINDOW_SECONDS,
@@ -76,12 +70,6 @@ function normalizeBeatSymbols(value, fallback) {
     .map((item) => String(item ?? '').trim().toUpperCase())
     .filter((item) => SUPPORTED_BEAT_SYMBOLS.has(item));
   return normalized.length ? [...new Set(normalized)] : fallback;
-}
-
-function primaryBeatSymbol(configLike) {
-  const symbols = Array.isArray(configLike?.BEAT_SYMBOLS) ? configLike.BEAT_SYMBOLS : [];
-  const first = symbols.find((item) => SUPPORTED_BEAT_SYMBOLS.has(String(item ?? '').trim().toUpperCase()));
-  return String(first ?? 'BTC').trim().toUpperCase();
 }
 
 function normalizeMoments(value, fallback) {
@@ -171,18 +159,8 @@ function coerceValue(key, value) {
   return String(value ?? fallback);
 }
 
-function priceFeedDefaultsFor(symbol) {
-  const normalized = String(symbol ?? 'BTC').trim().toUpperCase();
-  const filterSymbol = `${normalized.toLowerCase()}usdt`;
-  return {
-    BTC_PRICE_WS_URL: 'wss://ws-live-data.polymarket.com',
-    BTC_PRICE_PRODUCT_ID: filterSymbol,
-    BTC_PRICE_REST_URL: `https://api.binance.com/api/v3/ticker/price?symbol=${normalized}USDT`,
-  };
-}
-
 export function createBeatRuntimeConfig(overrides = {}) {
-  const next = {
+  return {
     ...DEFAULTS,
     ...Object.fromEntries(
       Object.entries(overrides)
@@ -190,31 +168,13 @@ export function createBeatRuntimeConfig(overrides = {}) {
         .map(([key, value]) => [key, coerceValue(key, value)]),
     ),
   };
-
-  const feedDefaults = priceFeedDefaultsFor(primaryBeatSymbol(next));
-  for (const [key, value] of Object.entries(feedDefaults)) {
-    if (!(key in overrides)) {
-      next[key] = value;
-    }
-  }
-
-  return next;
 }
 
 export function applyBeatRuntimeConfigPatch(target, patch = {}) {
   if (!target || typeof target !== 'object') return target;
-  const beatSymbolsChanged = Object.prototype.hasOwnProperty.call(patch, 'BEAT_SYMBOLS');
   for (const [key, value] of Object.entries(patch)) {
     if (!(key in DEFAULTS)) continue;
     target[key] = coerceValue(key, value);
-  }
-  if (beatSymbolsChanged) {
-    const feedDefaults = priceFeedDefaultsFor(primaryBeatSymbol(target));
-    for (const [key, value] of Object.entries(feedDefaults)) {
-      if (!Object.prototype.hasOwnProperty.call(patch, key)) {
-        target[key] = value;
-      }
-    }
   }
   return target;
 }

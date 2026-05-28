@@ -2,30 +2,72 @@ import axios from 'axios';
 import { EventEmitter } from 'events';
 import WebSocket from 'ws';
 import {
-  BTC_PRICE_PRODUCT_ID,
-  BTC_PRICE_REST_URL,
   BTC_PRICE_STALL_RECONNECT_MS,
-  BTC_PRICE_WS_URL,
 } from '../config.js';
 import logger from '../logger.js';
 
 const PING_INTERVAL_MS = 5_000;
+
+function defaultFeedConfigFor(productId = 'btcusdt', source = 'rtds') {
+  const raw = String(productId ?? 'btcusdt').trim();
+  const symbol = raw.toUpperCase().includes('-')
+    ? raw.toUpperCase().split('-')[0]
+    : raw.toUpperCase().replace(/USDT$|USD$/g, '').replace(/[^A-Z]/g, '') || 'BTC';
+  const normalized = symbol || 'BTC';
+  const restUrl = `https://api.binance.com/api/v3/ticker/price?symbol=${normalized}USDT`;
+  const configBySource = {
+    rtds: {
+      url: 'wss://ws-live-data.polymarket.com',
+      productId: `${normalized.toLowerCase()}usdt`,
+      topic: 'crypto_prices',
+      restUrl,
+    },
+    binance: {
+      url: `wss://stream.binance.com:9443/ws/${normalized.toLowerCase()}usdt@ticker`,
+      productId: `${normalized}USDT`,
+      topic: 'crypto_prices',
+      restUrl,
+    },
+    coinbase: {
+      url: 'wss://ws-feed.exchange.coinbase.com',
+      productId: `${normalized}-USD`,
+      topic: 'crypto_prices',
+      restUrl,
+    },
+    okx: {
+      url: 'wss://ws.okx.com:8443/ws/v5/public',
+      productId: `${normalized}-USDT`,
+      topic: 'crypto_prices',
+      restUrl,
+    },
+    hyperliquid: {
+      url: 'wss://api.hyperliquid.xyz/ws',
+      productId: normalized,
+      topic: 'crypto_prices',
+      restUrl,
+    },
+  };
+  return configBySource[source] ?? configBySource.rtds;
+}
+
 export class BtcPriceFeed extends EventEmitter {
   constructor({
     config = null,
-    url = BTC_PRICE_WS_URL,
-    productId = BTC_PRICE_PRODUCT_ID,
-    restUrl = BTC_PRICE_REST_URL,
-    topic = 'crypto_prices',
+    url = null,
+    productId = null,
+    restUrl = null,
+    topic = null,
     source = null,
   } = {}) {
     super();
+    const resolvedSource = source || (url ? this._detectSource(url) : 'rtds');
+    const defaults = defaultFeedConfigFor(productId, resolvedSource);
     this.config = config;
-    this.url = config?.BTC_PRICE_WS_URL ?? url;
-    this.source = source || this._detectSource(this.url);
-    this.topic = config?.BTC_PRICE_TOPIC ?? topic;
-    this.productId = config?.BTC_PRICE_PRODUCT_ID ?? productId;
-    this.restUrl = config?.BTC_PRICE_REST_URL ?? restUrl;
+    this.url = url ?? defaults.url;
+    this.source = resolvedSource;
+    this.topic = config?.BTC_PRICE_TOPIC ?? topic ?? defaults.topic;
+    this.productId = productId ?? defaults.productId;
+    this.restUrl = restUrl ?? defaults.restUrl;
     this.stallReconnectMs = Number(config?.BTC_PRICE_STALL_RECONNECT_MS ?? BTC_PRICE_STALL_RECONNECT_MS) || BTC_PRICE_STALL_RECONNECT_MS;
     this._ws = null;
     this._closed = false;
@@ -68,10 +110,10 @@ export class BtcPriceFeed extends EventEmitter {
 
   updateConfig(config) {
     this.config = config ?? this.config;
-    const nextUrl = this.config?.BTC_PRICE_WS_URL ?? BTC_PRICE_WS_URL;
-    const nextTopic = this.config?.BTC_PRICE_TOPIC ?? 'crypto_prices';
-    const nextProductId = this.config?.BTC_PRICE_PRODUCT_ID ?? BTC_PRICE_PRODUCT_ID;
-    const nextRestUrl = this.config?.BTC_PRICE_REST_URL ?? BTC_PRICE_REST_URL;
+    const nextUrl = this.url;
+    const nextTopic = this.config?.BTC_PRICE_TOPIC ?? this.topic ?? 'crypto_prices';
+    const nextProductId = this.productId;
+    const nextRestUrl = this.restUrl;
     const nextStallReconnectMs = Number(this.config?.BTC_PRICE_STALL_RECONNECT_MS ?? BTC_PRICE_STALL_RECONNECT_MS) || BTC_PRICE_STALL_RECONNECT_MS;
     const changed = nextUrl !== this.url || nextTopic !== this.topic || nextProductId !== this.productId || nextRestUrl !== this.restUrl;
     this.url = nextUrl;
