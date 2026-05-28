@@ -136,14 +136,15 @@ export const BEAT_ORDER_MODE             = parseEnum_('BEAT_ORDER_MODE', ['USDC'
 export const BEAT_ORDER_SIZE_USDC        = parseFloat_('BEAT_ORDER_SIZE_USDC', 25);
 export const BEAT_ORDER_SIZE_SHARES      = parseFloat_('BEAT_ORDER_SIZE_SHARES', 10);
 export const BEAT_MAX_SLIPPAGE           = parseFloat_('BEAT_MAX_SLIPPAGE', 0.01);
-export const BEAT_UP_MOVE_MIN_USD        = parseFloat_('BEAT_UP_MOVE_MIN_USD', 15);
-export const BEAT_UP_MOVE_MAX_USD        = parseFloat_('BEAT_UP_MOVE_MAX_USD', 120);
-export const BEAT_DOWN_MOVE_MIN_USD      = parseFloat_('BEAT_DOWN_MOVE_MIN_USD', 15);
-export const BEAT_DOWN_MOVE_MAX_USD      = parseFloat_('BEAT_DOWN_MOVE_MAX_USD', 120);
-export const BEAT_ETH_UP_MOVE_MAX_USD    = parseFloat_('BEAT_ETH_UP_MOVE_MAX_USD', 180);
-export const BEAT_ETH_DOWN_MOVE_MAX_USD  = parseFloat_('BEAT_ETH_DOWN_MOVE_MAX_USD', 180);
-export const BEAT_UP_MAX_BUY_PRICE       = parseFloat_('BEAT_UP_MAX_BUY_PRICE', 0.46);
-export const BEAT_DOWN_MAX_BUY_PRICE       = parseFloat_('BEAT_DOWN_MAX_BUY_PRICE', 0.46);
+// Deprecated per-side move minimums removed (use unified thresholds instead)
+// Unified move maximum (USD): supports legacy env names for fallback
+export const BEAT_MOVE_MAX_USD =
+  parseFloat_('BEAT_MOVE_MAX_USD', parseFloat_('BEAT_UP_MOVE_MAX_USD', parseFloat_('BEAT_DOWN_MOVE_MAX_USD', 120)));
+// Per-symbol ETH override (kept for compatibility with older env names)
+export const BEAT_ETH_MOVE_MAX_USD =
+  parseFloat_('BEAT_ETH_MOVE_MAX_USD', parseFloat_('BEAT_ETH_UP_MOVE_MAX_USD', parseFloat_('BEAT_ETH_DOWN_MOVE_MAX_USD', 180)));
+// Unified max buy price (single setting for both sides)
+export const BEAT_MAX_BUY_PRICE = parseFloat_('BEAT_MAX_BUY_PRICE', parseFloat_('BEAT_UP_MAX_BUY_PRICE', parseFloat_('BEAT_DOWN_MAX_BUY_PRICE', 0.46)));
 export const BEAT_DASHBOARD_ENABLED = parseBool_('BEAT_DASHBOARD_ENABLED', false);
 export const BEAT_DASHBOARD_HOST = optional('BEAT_DASHBOARD_HOST', '127.0.0.1');
 export const BEAT_DASHBOARD_PORT = parseInt_('BEAT_DASHBOARD_PORT', 8798);

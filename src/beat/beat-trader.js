@@ -65,17 +65,13 @@ function moveThresholdsForConfig(cfg) {
   const symbol = String(cfg.BEAT_MARKET_SYMBOL ?? 'BTC').toUpperCase();
   if (symbol === 'ETH') {
     return {
-      upMin: cfg.BEAT_UP_MOVE_MIN_USD,
-      upMax: cfg.BEAT_ETH_UP_MOVE_MAX_USD ?? cfg.BEAT_UP_MOVE_MAX_USD,
-      downMin: cfg.BEAT_DOWN_MOVE_MIN_USD,
-      downMax: cfg.BEAT_ETH_DOWN_MOVE_MAX_USD ?? cfg.BEAT_DOWN_MOVE_MAX_USD,
+      upMax: cfg.BEAT_ETH_MOVE_MAX_USD ?? cfg.BEAT_MOVE_MAX_USD,
+      downMax: cfg.BEAT_ETH_MOVE_MAX_USD ?? cfg.BEAT_MOVE_MAX_USD,
     };
   }
   return {
-    upMin: cfg.BEAT_UP_MOVE_MIN_USD,
-    upMax: cfg.BEAT_UP_MOVE_MAX_USD,
-    downMin: cfg.BEAT_DOWN_MOVE_MIN_USD,
-    downMax: cfg.BEAT_DOWN_MOVE_MAX_USD,
+    upMax: cfg.BEAT_MOVE_MAX_USD,
+    downMax: cfg.BEAT_MOVE_MAX_USD,
   };
 }
 
@@ -306,14 +302,14 @@ export class BeatTrader {
         book: this.latestQuotes.up?.book ?? null,
         bid: this.latestQuotes.up?.bid ?? null,
         ask: this.latestQuotes.up?.ask ?? null,
-        maxBuyPrice: cfg.BEAT_UP_MAX_BUY_PRICE,
+        maxBuyPrice: cfg.BEAT_MAX_BUY_PRICE,
       },
       Down: {
         tokenId: this.market.downToken.tokenId,
         book: this.latestQuotes.down?.book ?? null,
         bid: this.latestQuotes.down?.bid ?? null,
         ask: this.latestQuotes.down?.ask ?? null,
-        maxBuyPrice: cfg.BEAT_DOWN_MAX_BUY_PRICE,
+        maxBuyPrice: cfg.BEAT_MAX_BUY_PRICE,
       },
     };
 
