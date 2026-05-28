@@ -148,14 +148,23 @@
     .live-section-layout {
       display: grid;
       gap: 16px;
-      grid-template-columns: minmax(0, 1.35fr) minmax(340px, 0.9fr);
+      grid-template-columns: minmax(0, 1fr) 560px;
       align-items: start;
+      width: min(calc(100vw - 40px), 2200px);
+      margin-left: calc(50% - 50vw + 20px);
+      margin-right: calc(50% - 50vw + 20px);
     }
 
     .sections-main {
       display: grid;
       gap: 16px;
       min-width: 0;
+    }
+
+    .centered-stack {
+      max-width: 1460px;
+      width: 100%;
+      margin: 0 auto;
     }
 
     .sections-side {
@@ -326,13 +335,13 @@
     }
 
     .graph-card {
-      min-height: 214px;
-      padding: 12px 14px 10px;
+      min-height: 300px;
+      padding: 16px 18px 14px;
       border-radius: 18px;
       background: linear-gradient(180deg, rgba(248, 252, 251, 0.98), rgba(238, 247, 244, 0.92));
       border: 1px solid rgba(15, 118, 110, 0.12);
       display: grid;
-      gap: 10px;
+      gap: 14px;
     }
 
     .graph-head {
@@ -378,18 +387,18 @@
 
     .graph-svg {
       width: 100%;
-      height: 148px;
+      height: 228px;
       display: block;
       overflow: visible;
     }
 
     .graph-shell {
       position: relative;
-      min-height: 148px;
+      min-height: 228px;
     }
 
     .graph-empty {
-      height: 148px;
+      height: 228px;
       display: grid;
       place-items: center;
       color: var(--muted);
@@ -652,6 +661,9 @@
     @media (max-width: 1120px) {
       .live-section-layout {
         grid-template-columns: 1fr;
+        width: 100%;
+        margin-left: 0;
+        margin-right: 0;
       }
 
       .monitoring-graphs-panel {
@@ -1063,10 +1075,10 @@
     }
 
     function chartSvg(seriesList, { centerValue, minRadius = 0.01, fixedRadius = null, yFormatter }) {
-      const width = 360;
-      const height = 148;
-      const paddingX = 28;
-      const paddingY = 16;
+      const width = 520;
+      const height = 228;
+      const paddingX = 34;
+      const paddingY = 20;
       const allValues = seriesList.flatMap((series) => series.points.map((point) => point.value));
       if (!allValues.length) {
         return `<div class="graph-empty">Waiting for monitoring samples...</div>`;
@@ -1313,7 +1325,7 @@
             ${renderMonitoringGraphsPanel(live)}
           </aside>
         </div>
-        <div class="sections-main">
+        <div class="sections-main centered-stack">
           <section class="panel">
             <div class="panel-head">
               <div>
