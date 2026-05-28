@@ -107,6 +107,7 @@ export class BeatTrader {
 
     this.lifecycle = BEAT_LIFECYCLE.UPCOMING;
     this.halted = false;
+    this.stopBuying = false;
     this.balanceUp = 0;
     this.balanceDown = 0;
     this.walletBalanceUp = 0;
@@ -514,6 +515,15 @@ export class BeatTrader {
       this._recordAudit('decision_skip', { reason: 'missing-beat-price', snapshot });
       return;
     }
+    if (this.stopBuying) {
+      this._recordAudit('decision_skip', {
+        reason: 'buying-stopped',
+        stopReason: this.halted ? 'halted' : 'spend-cap',
+        totalSpent: this.totalSpent,
+        maxSpendPerMarket: cfg.MAX_SPEND_PER_MARKET,
+      });
+      return;
+    }
     if (Date.now() - this.lastBuyAt < cfg.BEAT_BUY_COOLDOWN_MS) {
       this._recordAudit('decision_skip', {
         reason: 'buy-cooldown',
@@ -740,7 +750,7 @@ export class BeatTrader {
     const cfg = this.config;
     const remainingBudget = cfg.MAX_SPEND_PER_MARKET - this.totalSpent;
     if (remainingBudget < 1) {
-      this.halted = true;
+      this.stopBuying = true;
       this._recordAudit('decision_skip', {
         reason: 'remaining-budget-too-low',
         side,
@@ -1079,9 +1089,8 @@ export class BeatTrader {
         totalSpent: this.totalSpent,
         maxSpendPerMarket: cfg.MAX_SPEND_PER_MARKET,
       });
-      this.halted = true;
-      this.lifecycle = BEAT_LIFECYCLE.HALTED;
-      return true;
+      this.stopBuying = true;
+      return false;
     }
 
     return false;
