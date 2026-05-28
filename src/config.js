@@ -238,6 +238,7 @@ export const BTC_PRICE_WS_URL            = optional('BTC_PRICE_WS_URL', priceFee
 export const BTC_PRICE_PRODUCT_ID        = optional('BTC_PRICE_PRODUCT_ID', priceFeedDefaultsFor(BEAT_MARKET_SYMBOL).productId);
 export const BTC_PRICE_REST_URL          = optional('BTC_PRICE_REST_URL', priceFeedDefaultsFor(BEAT_MARKET_SYMBOL).restUrl);
 export const BTC_PRICE_MAX_AGE_MS        = parseInt_('BTC_PRICE_MAX_AGE_MS', 2_000);
+export const BTC_PRICE_STALL_RECONNECT_MS = parseInt_('BTC_PRICE_STALL_RECONNECT_MS', 12_000);
 export const BEAT_DRY_RUN                = parseBool_('BEAT_DRY_RUN', true);
 // Entry delay is now controlled by `BEAT_MOMENTS` (per-moment starts)
 export const BEAT_BOOK_POLL_MS           = parseInt_('BEAT_BOOK_POLL_MS', 1_000);

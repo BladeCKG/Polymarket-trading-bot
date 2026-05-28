@@ -1,7 +1,12 @@
 import axios from 'axios';
 import { EventEmitter } from 'events';
 import WebSocket from 'ws';
-import { BTC_PRICE_PRODUCT_ID, BTC_PRICE_REST_URL, BTC_PRICE_WS_URL } from '../config.js';
+import {
+  BTC_PRICE_PRODUCT_ID,
+  BTC_PRICE_REST_URL,
+  BTC_PRICE_STALL_RECONNECT_MS,
+  BTC_PRICE_WS_URL,
+} from '../config.js';
 import logger from '../logger.js';
 
 export class BtcPriceFeed extends EventEmitter {
@@ -16,15 +21,20 @@ export class BtcPriceFeed extends EventEmitter {
     this.url = config?.BTC_PRICE_WS_URL ?? url;
     this.productId = config?.BTC_PRICE_PRODUCT_ID ?? productId;
     this.restUrl = config?.BTC_PRICE_REST_URL ?? restUrl;
+    this.stallReconnectMs = Number(config?.BTC_PRICE_STALL_RECONNECT_MS ?? BTC_PRICE_STALL_RECONNECT_MS) || BTC_PRICE_STALL_RECONNECT_MS;
     this._ws = null;
     this._closed = false;
     this._reconnectDelayMs = 1_000;
     this._latest = null;
     this._waiters = new Set();
+    this._lastTickAtMs = 0;
+    this._stallCheckTimer = null;
   }
 
   start() {
     this._closed = false;
+    this._lastTickAtMs = Date.now();
+    this._startStallWatch();
     this._connect();
   }
 
@@ -35,6 +45,7 @@ export class BtcPriceFeed extends EventEmitter {
       waiter.reject(new Error('BTC price feed stopped'));
     }
     this._waiters.clear();
+    this._stopStallWatch();
     this._ws?.close();
   }
 
@@ -43,10 +54,12 @@ export class BtcPriceFeed extends EventEmitter {
     const nextUrl = this.config?.BTC_PRICE_WS_URL ?? BTC_PRICE_WS_URL;
     const nextProductId = this.config?.BTC_PRICE_PRODUCT_ID ?? BTC_PRICE_PRODUCT_ID;
     const nextRestUrl = this.config?.BTC_PRICE_REST_URL ?? BTC_PRICE_REST_URL;
+    const nextStallReconnectMs = Number(this.config?.BTC_PRICE_STALL_RECONNECT_MS ?? BTC_PRICE_STALL_RECONNECT_MS) || BTC_PRICE_STALL_RECONNECT_MS;
     const changed = nextUrl !== this.url || nextProductId !== this.productId || nextRestUrl !== this.restUrl;
     this.url = nextUrl;
     this.productId = nextProductId;
     this.restUrl = nextRestUrl;
+    this.stallReconnectMs = nextStallReconnectMs;
     if (changed && this._ws && !this._closed) {
       this._ws.close();
     }
@@ -74,6 +87,7 @@ export class BtcPriceFeed extends EventEmitter {
     };
 
     this._latest = tick;
+    this._lastTickAtMs = Date.now();
     this.emit('tick', tick);
     for (const waiter of [...this._waiters]) {
       if (tick.timeMs >= waiter.timestampMs) {
@@ -168,6 +182,7 @@ export class BtcPriceFeed extends EventEmitter {
       };
       if (!Number.isFinite(tick.price) || !Number.isFinite(tick.timeMs)) return;
       this._latest = tick;
+      this._lastTickAtMs = Date.now();
       this.emit('tick', tick);
       for (const waiter of [...this._waiters]) {
         if (tick.timeMs >= waiter.timestampMs) {
@@ -192,6 +207,7 @@ export class BtcPriceFeed extends EventEmitter {
     if (!Number.isFinite(tick.price) || !Number.isFinite(tick.timeMs)) return;
 
     this._latest = tick;
+    this._lastTickAtMs = Date.now();
     this.emit('tick', tick);
 
     for (const waiter of [...this._waiters]) {
@@ -203,5 +219,35 @@ export class BtcPriceFeed extends EventEmitter {
 
   _isBinanceUrl() {
     return /binance/i.test(this.url);
+  }
+
+  _startStallWatch() {
+    this._stopStallWatch();
+    this._stallCheckTimer = setInterval(() => {
+      if (this._closed || !this._ws) return;
+      if (this._ws.readyState !== WebSocket.OPEN) return;
+      const idleMs = Date.now() - this._lastTickAtMs;
+      if (idleMs <= this.stallReconnectMs) return;
+      logger.warn('BtcPriceFeed: tick stream stalled, forcing reconnect', {
+        productId: this.productId,
+        idleMs,
+        stallReconnectMs: this.stallReconnectMs,
+      });
+      try {
+        this._ws.terminate();
+      } catch (err) {
+        logger.warn('BtcPriceFeed: terminate failed after stall', {
+          productId: this.productId,
+          err: err.message,
+        });
+      }
+    }, 1_000);
+    this._stallCheckTimer.unref?.();
+  }
+
+  _stopStallWatch() {
+    if (!this._stallCheckTimer) return;
+    clearInterval(this._stallCheckTimer);
+    this._stallCheckTimer = null;
   }
 }

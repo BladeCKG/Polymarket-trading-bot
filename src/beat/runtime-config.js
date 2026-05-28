@@ -20,6 +20,7 @@ import {
   BEAT_ORDER_SIZE_SHARES,
   BEAT_ORDER_SIZE_USDC,
   BTC_PRICE_MAX_AGE_MS,
+  BTC_PRICE_STALL_RECONNECT_MS,
   BTC_PRICE_PRODUCT_ID,
   BTC_PRICE_REST_URL,
   BTC_PRICE_WS_URL,
@@ -36,6 +37,7 @@ const DEFAULTS = Object.freeze({
   BTC_PRICE_PRODUCT_ID,
   BTC_PRICE_REST_URL,
   BTC_PRICE_MAX_AGE_MS,
+  BTC_PRICE_STALL_RECONNECT_MS,
   MARKET_WINDOW_SECONDS,
   REDEEM_DELAY_AFTER_CLOSE,
   BEAT_DRY_RUN,
@@ -166,7 +168,7 @@ function coerceValue(key, value) {
 
   if (key === 'BEAT_MARKET_SYMBOL') {
     const text = String(value ?? '').trim().toUpperCase();
-    return text === 'ETH' ? 'ETH' : 'BTC';
+    return SUPPORTED_BEAT_SYMBOLS.has(text) ? text : 'BTC';
   }
 
   return String(value ?? fallback);
