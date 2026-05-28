@@ -225,6 +225,7 @@ export const BEAT_ORDER_MODE             = parseEnum_('BEAT_ORDER_MODE', ['USDC'
 export const BEAT_ORDER_SIZE_USDC        = parseFloat_('BEAT_ORDER_SIZE_USDC', 25);
 export const BEAT_ORDER_SIZE_SHARES      = parseFloat_('BEAT_ORDER_SIZE_SHARES', 10);
 export const BEAT_MAX_SLIPPAGE           = parseFloat_('BEAT_MAX_SLIPPAGE', 0.01);
+export const BEAT_MAX_INVENTORY_IMBALANCE_SHARES = parseFloat_('BEAT_MAX_INVENTORY_IMBALANCE_SHARES', 200);
 // Deprecated per-side move minimums removed (use unified thresholds instead)
 export const BEAT_DASHBOARD_ENABLED = parseBool_('BEAT_DASHBOARD_ENABLED', false);
 export const BEAT_DASHBOARD_HOST = optional('BEAT_DASHBOARD_HOST', '127.0.0.1');

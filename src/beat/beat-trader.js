@@ -156,7 +156,7 @@ export class BeatTrader {
         maxSlippage: cfg.BEAT_MAX_SLIPPAGE,
         buyCooldownMs: cfg.BEAT_BUY_COOLDOWN_MS,
         maxSpendPerMarket: cfg.MAX_SPEND_PER_MARKET,
-        maxInventoryImbalance: cfg.MAX_INVENTORY_IMBALANCE,
+        maxInventoryImbalanceShares: cfg.BEAT_MAX_INVENTORY_IMBALANCE_SHARES,
         moments: momentsForLog,
       },
       auditLogPath: getMarketLogFilePath(this.market.slug),
@@ -962,17 +962,19 @@ export class BeatTrader {
     if (this.halted) return true;
 
     const imbalanceShares = Math.abs(this.balanceUp - this.balanceDown);
-    if (imbalanceShares > cfg.MAX_INVENTORY_IMBALANCE) {
+    if (imbalanceShares > cfg.BEAT_MAX_INVENTORY_IMBALANCE_SHARES) {
       this.log.warn('BeatTrader: inventory imbalance limit reached', {
         imbalanceShares,
         balanceUp: this.balanceUp,
         balanceDown: this.balanceDown,
+        maxInventoryImbalanceShares: cfg.BEAT_MAX_INVENTORY_IMBALANCE_SHARES,
       });
       this._recordAudit('circuit_breaker', {
         reason: 'inventory-imbalance',
         imbalanceShares,
         balanceUp: this.balanceUp,
         balanceDown: this.balanceDown,
+        maxInventoryImbalanceShares: cfg.BEAT_MAX_INVENTORY_IMBALANCE_SHARES,
       });
       this.halted = true;
       this.lifecycle = BEAT_LIFECYCLE.HALTED;
