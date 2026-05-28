@@ -826,9 +826,9 @@
     function renderTop() {
       const markets = Array.isArray(state.markets) ? state.markets : [];
       const live = sortMarketsForView(markets.filter((m) => !isSettledMarket(m)));
-      const settled = sortMarketsForView(markets.filter((m) => isSettledMarket(m)));
-      const traded = markets.filter((m) => Number(m.buyShares || 0) > 0);
-      const pnl = settled.reduce((sum, m) => sum + Number(m.pnl || 0), 0);
+      const settledMarkets = Number(state.stats?.settledMarkets ?? 0);
+      const tradedMarkets = Number(state.stats?.tradedMarkets ?? 0);
+      const realizedPnl = Number(state.stats?.realizedPnl ?? 0);
       const symbols = activeBeatSymbols();
       
       const priceStats = symbols.map((symbol) => {
@@ -865,9 +865,9 @@
       const stats = [
         ...priceStats,
         { label: 'Live Markets', value: String(live.length), hint: state.runtime.mode ? `Mode: ${state.runtime.mode}` : '' },
-        { label: 'Settled Markets', value: String(settled.length), hint: state.runtime.mode ? `Mode: ${state.runtime.mode}` : '' },
-        { label: 'Traded Markets', value: String(traded.length), hint: state.runtime.mode ? `Mode: ${state.runtime.mode}` : '' },
-        { label: 'Realized PnL', value: money(pnl), hint: state.runtime.mode ? `Mode: ${state.runtime.mode}` : '' },
+        { label: 'Settled Markets', value: String(settledMarkets), hint: state.runtime.mode ? `Mode: ${state.runtime.mode}` : '' },
+        { label: 'Traded Markets', value: String(tradedMarkets), hint: state.runtime.mode ? `Mode: ${state.runtime.mode}` : '' },
+        { label: 'Realized PnL', value: money(realizedPnl), hint: state.runtime.mode ? `Mode: ${state.runtime.mode}` : '' },
       ];
 
       topStatsEl.innerHTML = stats.map(({ label, value, hint, html, isTable }) => {

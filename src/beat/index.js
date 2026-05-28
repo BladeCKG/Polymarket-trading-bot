@@ -110,6 +110,33 @@ export async function main() {
   const priceFeeds = new Map();
   const primaryPriceFeeds = new Map();
   let dashboard = null;
+  const beatSessionStats = {
+    settledMarkets: 0,
+    tradedMarkets: 0,
+    realizedPnl: 0,
+  };
+  const settledMarketSlugs = new Set();
+  const tradedSettledMarketSlugs = new Set();
+  const publishBeatSessionStats = () => {
+    dashboard?.setStats(beatSessionStats);
+  };
+  const recordSettledMarketStats = ({ slug, pnl: marketPnl, tradeOccurred }) => {
+    const marketSlug = String(slug ?? '').trim();
+    if (!marketSlug || settledMarketSlugs.has(marketSlug)) {
+      return;
+    }
+
+    settledMarketSlugs.add(marketSlug);
+    beatSessionStats.settledMarkets += 1;
+    beatSessionStats.realizedPnl += Number.isFinite(Number(marketPnl)) ? Number(marketPnl) : 0;
+
+    if (tradeOccurred && !tradedSettledMarketSlugs.has(marketSlug)) {
+      tradedSettledMarketSlugs.add(marketSlug);
+      beatSessionStats.tradedMarkets += 1;
+    }
+
+    publishBeatSessionStats();
+  };
   if (beatConfig.BEAT_DASHBOARD_ENABLED) {
     dashboard = new BeatDashboardServer({
       host: beatConfig.BEAT_DASHBOARD_HOST,
@@ -128,6 +155,7 @@ export async function main() {
       },
     });
     const url = await dashboard.start();
+    publishBeatSessionStats();
     logger.info('beat.main: dashboard available', { url });
   }
 
@@ -298,7 +326,12 @@ export async function main() {
       if (stopping) return;
 
       const symbolFeed = primaryPriceFeeds.get(symbol) ?? priceFeeds.get(`${symbol}-rtds`) ?? priceFeeds.get(`${symbol}-binance`);
-      const trader = new BeatTrader(market, wallet, pnl, { dashboard, btcFeed: symbolFeed, config: beatConfig });
+      const trader = new BeatTrader(market, wallet, pnl, {
+        dashboard,
+        btcFeed: symbolFeed,
+        config: beatConfig,
+        onSettled: recordSettledMarketStats,
+      });
       const task = trader.run()
         .then(() => {
           runningTasks.delete(task);

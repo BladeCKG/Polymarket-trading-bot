@@ -89,11 +89,12 @@ function summarizeBook(book) {
 }
 
 export class BeatTrader {
-  constructor(market, wallet, pnl, { dashboard = null, btcFeed = null, config = null } = {}) {
+  constructor(market, wallet, pnl, { dashboard = null, btcFeed = null, config = null, onSettled = null } = {}) {
     this.market = market;
     this.wallet = wallet;
     this.pnl = pnl;
     this.dashboard = dashboard;
+    this.onSettled = typeof onSettled === 'function' ? onSettled : null;
     this.log = marketLogger(market.slug);
     this.auditLog = marketFileLogger(market.slug);
     this.config = config ?? createBeatRuntimeConfig();
@@ -1048,6 +1049,13 @@ export class BeatTrader {
       buyShares: this.tradeSummary?.buyShares ?? 0,
       buyUsdc: this.tradeSummary?.buyUsdc ?? 0,
       buyPrice: this.tradeSummary?.buyPrice ?? null,
+      tradeOccurred: Boolean(this.tradeSummary?.buyShares > 0),
+    });
+    this.onSettled?.({
+      slug: this.market.slug,
+      settledAt: this.lastSettledAt,
+      outcome,
+      pnl: marketPnl,
       tradeOccurred: Boolean(this.tradeSummary?.buyShares > 0),
     });
     this._recordAudit('settlement_evaluated', {
