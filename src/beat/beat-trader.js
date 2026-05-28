@@ -515,10 +515,10 @@ export class BeatTrader {
       this._recordAudit('decision_skip', { reason: 'missing-beat-price', snapshot });
       return;
     }
-    if (this.stopBuying) {
+    if (this.stopBuying && this.halted) {
       this._recordAudit('decision_skip', {
         reason: 'buying-stopped',
-        stopReason: this.halted ? 'halted' : 'spend-cap',
+        stopReason: 'halted',
         totalSpent: this.totalSpent,
         maxSpendPerMarket: cfg.MAX_SPEND_PER_MARKET,
       });
@@ -749,11 +749,12 @@ export class BeatTrader {
   async _executeBuy({ side, tokenId, book, bestBid, bestAsk, maxPrice, delta, btcPrice }) {
     const cfg = this.config;
     const remainingBudget = cfg.MAX_SPEND_PER_MARKET - this.totalSpent;
-    if (remainingBudget < 1) {
-      this.stopBuying = true;
+    const reducesImbalance = this._buyReducesImbalance(side);
+    if (remainingBudget < 1 && !reducesImbalance) {
       this._recordAudit('decision_skip', {
         reason: 'remaining-budget-too-low',
         side,
+        reducesImbalance,
         remainingBudget,
         totalSpent: this.totalSpent,
       });
@@ -761,14 +762,17 @@ export class BeatTrader {
     }
 
     if (cfg.BEAT_ORDER_MODE === 'SHARES') {
-      const requestedShares = Math.min(
-        cfg.BEAT_ORDER_SIZE_SHARES,
-        remainingBudget / Math.max(bestAsk.price, 0.0001),
-      );
+      const requestedShares = reducesImbalance
+        ? cfg.BEAT_ORDER_SIZE_SHARES
+        : Math.min(
+          cfg.BEAT_ORDER_SIZE_SHARES,
+          remainingBudget / Math.max(bestAsk.price, 0.0001),
+        );
       if (requestedShares <= 0) {
         this._recordAudit('decision_skip', {
           reason: 'requested-shares-nonpositive',
           side,
+          reducesImbalance,
           remainingBudget,
           bestAsk: bestAsk?.price ?? null,
           requestedShares,
@@ -781,6 +785,7 @@ export class BeatTrader {
         side,
         orderMode: cfg.BEAT_ORDER_MODE,
         tokenId,
+        reducesImbalance,
         requestedShares,
         remainingBudget,
         maxPrice,
@@ -882,11 +887,14 @@ export class BeatTrader {
       return;
     }
 
-    const amountUsdc = Math.min(cfg.BEAT_ORDER_SIZE_USDC, remainingBudget);
+    const amountUsdc = reducesImbalance
+      ? cfg.BEAT_ORDER_SIZE_USDC
+      : Math.min(cfg.BEAT_ORDER_SIZE_USDC, remainingBudget);
     if (amountUsdc <= 0) {
       this._recordAudit('decision_skip', {
         reason: 'amount-usdc-nonpositive',
         side,
+        reducesImbalance,
         remainingBudget,
         amountUsdc,
       });
@@ -898,6 +906,7 @@ export class BeatTrader {
       side,
       orderMode: cfg.BEAT_ORDER_MODE,
       tokenId,
+      reducesImbalance,
       requestedUsdc: amountUsdc,
       remainingBudget,
       maxPrice,
@@ -1083,16 +1092,25 @@ export class BeatTrader {
     }
 
     if (this.totalSpent >= cfg.MAX_SPEND_PER_MARKET) {
-      this.log.info('BeatTrader: spend cap reached', { totalSpent: this.totalSpent.toFixed(2) });
-      this._recordAudit('circuit_breaker', {
-        reason: 'spend-cap',
-        totalSpent: this.totalSpent,
-        maxSpendPerMarket: cfg.MAX_SPEND_PER_MARKET,
-      });
+      if (!this.stopBuying) {
+        this.log.info('BeatTrader: spend cap reached', { totalSpent: this.totalSpent.toFixed(2) });
+        this._recordAudit('circuit_breaker', {
+          reason: 'spend-cap',
+          totalSpent: this.totalSpent,
+          maxSpendPerMarket: cfg.MAX_SPEND_PER_MARKET,
+        });
+      }
       this.stopBuying = true;
       return false;
     }
 
+    return false;
+  }
+
+  _buyReducesImbalance(side) {
+    const imbalance = this.balanceUp - this.balanceDown;
+    if (side === 'Up') return imbalance < -1e-9;
+    if (side === 'Down') return imbalance > 1e-9;
     return false;
   }
 
