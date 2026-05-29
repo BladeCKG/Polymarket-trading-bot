@@ -599,35 +599,52 @@ export class BeatTrader {
     this.signalHistory = this.signalHistory.filter((entry) => Number(entry?.timestampMs ?? 0) >= keepAfterMs);
   }
 
-  _seedSignalHistoryFromBtcHistory(nowMs = Date.now()) {
-    if (!Number.isFinite(Number(this.beatPrice))) return;
+  _providerBackedSignalEntries(nowMs = Date.now()) {
+    if (!Number.isFinite(Number(this.beatPrice))) return [];
     const historyWindowMs = Math.max(15_000, Number(this.config.BEAT_PROBABILITY_HISTORY_MS) || 15_000);
     const rawHistory = Array.isArray(this._btcHistoryProvider?.()) ? this._btcHistoryProvider() : [];
-    if (!rawHistory.length) return;
+    if (!rawHistory.length) return [];
 
     const keepAfterMs = nowMs - historyWindowMs;
-    const seeded = rawHistory
+    const normalized = rawHistory
       .map((entry) => ({
         timestampMs: Number(entry?.timeMs),
         price: Number(entry?.price),
       }))
-      .filter((entry) => Number.isFinite(entry.timestampMs) && Number.isFinite(entry.price) && entry.timestampMs >= keepAfterMs && entry.timestampMs <= nowMs)
-      .sort((a, b) => a.timestampMs - b.timestampMs)
+      .filter((entry) => (
+        Number.isFinite(entry.timestampMs) &&
+        Number.isFinite(entry.price) &&
+        entry.timestampMs <= nowMs
+      ))
+      .sort((a, b) => a.timestampMs - b.timestampMs);
+
+    if (!normalized.length) return [];
+
+    const anchorBeforeWindow = [...normalized]
+      .reverse()
+      .find((entry) => entry.timestampMs < keepAfterMs) ?? null;
+    const inWindow = normalized.filter((entry) => entry.timestampMs >= keepAfterMs);
+    const selected = anchorBeforeWindow ? [anchorBeforeWindow, ...inWindow] : inWindow;
+
+    return selected
       .map((entry) => ({
         timestampMs: entry.timestampMs,
         move: entry.price - Number(this.beatPrice),
         upAsk: null,
         downAsk: null,
       }));
+  }
 
-    if (!seeded.length) return;
-
-    const merged = [...this.signalHistory, ...seeded]
+  _mergeSignalHistory(entries = [], nowMs = Date.now()) {
+    const historyWindowMs = Math.max(15_000, Number(this.config.BEAT_PROBABILITY_HISTORY_MS) || 15_000);
+    const keepAfterMs = nowMs - historyWindowMs;
+    const merged = [...entries]
+      .filter((entry) => Number.isFinite(Number(entry?.timestampMs ?? 0)))
       .sort((a, b) => Number(a?.timestampMs ?? 0) - Number(b?.timestampMs ?? 0));
+
     const deduped = [];
     for (const entry of merged) {
       const ts = Number(entry?.timestampMs ?? 0);
-      if (!Number.isFinite(ts)) continue;
       const prev = deduped[deduped.length - 1];
       if (prev && Math.abs(Number(prev.timestampMs) - ts) <= 1) {
         deduped[deduped.length - 1] = {
@@ -645,33 +662,56 @@ export class BeatTrader {
         downAsk: entry.downAsk ?? null,
       });
     }
-    this.signalHistory = deduped.filter((entry) => Number(entry?.timestampMs ?? 0) >= keepAfterMs);
+
+    const anchorBeforeWindow = [...deduped]
+      .reverse()
+      .find((entry) => Number(entry?.timestampMs ?? 0) < keepAfterMs) ?? null;
+    const inWindow = deduped.filter((entry) => Number(entry?.timestampMs ?? 0) >= keepAfterMs);
+    return anchorBeforeWindow ? [anchorBeforeWindow, ...inWindow] : inWindow;
+  }
+
+  _effectiveSignalHistory(nowMs = Date.now()) {
+    return this._mergeSignalHistory([
+      ...this.signalHistory,
+      ...this._providerBackedSignalEntries(nowMs),
+    ], nowMs);
+  }
+
+  _seedSignalHistoryFromBtcHistory(nowMs = Date.now()) {
+    this.signalHistory = this._effectiveSignalHistory(nowMs);
   }
 
   _hasGuaranteedProbabilityHistory(nowMs = Date.now()) {
     const historyWindowMs = Math.max(15_000, Number(this.config.BEAT_PROBABILITY_HISTORY_MS) || 15_000);
-    if (!this.signalHistory.length) return false;
-    const earliestTs = Number(this.signalHistory[0]?.timestampMs ?? 0);
-    const latestTs = Number(this.signalHistory[this.signalHistory.length - 1]?.timestampMs ?? 0);
+    const history = this._effectiveSignalHistory(nowMs);
+    if (!history.length) return false;
+    const earliestTs = Number(history[0]?.timestampMs ?? 0);
+    const latestTs = Number(history[history.length - 1]?.timestampMs ?? 0);
     if (!Number.isFinite(earliestTs) || !Number.isFinite(latestTs)) return false;
     return earliestTs <= (nowMs - historyWindowMs) && latestTs <= nowMs;
   }
 
-  _sampleAgo(msAgo, nowMs = Date.now()) {
+  _sampleAgo(msAgo, nowMs = Date.now(), history = this.signalHistory) {
     const cutoffMs = nowMs - msAgo;
-    for (let i = this.signalHistory.length - 1; i >= 0; i -= 1) {
-      const sample = this.signalHistory[i];
+    for (let i = history.length - 1; i >= 0; i -= 1) {
+      const sample = history[i];
       if (Number(sample?.timestampMs ?? 0) <= cutoffMs) {
         return sample;
       }
     }
-    return this.signalHistory[0] ?? null;
+    return history[0] ?? null;
   }
 
   _probabilityModel(snapshot = {}) {
     const nowMs = Number(snapshot.snapshotAtMs ?? Date.now());
     const historyWindowMs = Math.max(15_000, Number(this.config.BEAT_PROBABILITY_HISTORY_MS) || 15_000);
-    if (!this._hasGuaranteedProbabilityHistory(nowMs)) {
+    const history = this._effectiveSignalHistory(nowMs);
+    if (!history.length) {
+      return null;
+    }
+    const earliestTs = Number(history[0]?.timestampMs ?? 0);
+    const latestTs = Number(history[history.length - 1]?.timestampMs ?? 0);
+    if (!Number.isFinite(earliestTs) || !Number.isFinite(latestTs) || earliestTs > (nowMs - historyWindowMs) || latestTs > nowMs) {
       return null;
     }
     const checkpointsMs = [
@@ -690,7 +730,7 @@ export class BeatTrader {
     const pairCost = Number.isFinite(upAsk) && Number.isFinite(downAsk) ? upAsk + downAsk : null;
 
     const checkpointMoves = Object.fromEntries(checkpointsMs.map((ms) => {
-      const sample = this._sampleAgo(ms, nowMs);
+      const sample = this._sampleAgo(ms, nowMs, history);
       const sampleMove = Number.isFinite(Number(sample?.move)) ? Number(sample.move) : move;
       return [ms, sampleMove];
     }));
@@ -854,10 +894,11 @@ export class BeatTrader {
     const delta = tick.price - this.beatPrice;
     const probabilityModel = cfg.BEAT_PROBABILITY_ENABLED ? this._probabilityModel(snapshot) : null;
     if (cfg.BEAT_PROBABILITY_ENABLED && !probabilityModel) {
+      const effectiveHistory = this._effectiveSignalHistory(Number(snapshot?.snapshotAtMs ?? Date.now()));
       this._recordAudit('decision_skip', {
         reason: 'insufficient-btc-history',
         requiredHistoryMs: cfg.BEAT_PROBABILITY_HISTORY_MS,
-        availableFromMs: Number(this.signalHistory[0]?.timestampMs ?? null),
+        availableFromMs: Number(effectiveHistory[0]?.timestampMs ?? null),
         snapshotAtMs: Number(snapshot?.snapshotAtMs ?? Date.now()),
       });
       return;
