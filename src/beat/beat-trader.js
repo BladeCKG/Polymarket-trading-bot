@@ -423,7 +423,6 @@ export class BeatTrader {
 
       this.lifecycle = BEAT_LIFECYCLE.RESOLVING;
       this._publishMarket({ lifecycle: BEAT_LIFECYCLE.RESOLVING, tradeStatus: BEAT_LIFECYCLE.RESOLVING });
-      await this._cancelAllOrders(conditionId);
     } finally {
       if (this._ownsBtcFeed) {
         this._btcFeed?.stop();
@@ -3159,38 +3158,6 @@ export class BeatTrader {
       response,
     });
     return fallback;
-  }
-
-  async _cancelAllOrders(conditionId) {
-    if (this.config.BEAT_DRY_RUN) {
-      this.log.info('BeatTrader: dry-run cancel skipped', { conditionId });
-      this._recordAudit('cancel_skipped', { reason: 'dry-run', conditionId });
-      return;
-    }
-    try {
-      this._recordAudit('cancel_submit', { strategy: 'cancelMarket', conditionId });
-      await ClobClient.cancelMarket(conditionId);
-      this._recordAudit('cancel_result', { strategy: 'cancelMarket', conditionId, success: true });
-    } catch (err) {
-      this.log.warn('BeatTrader: cancelMarket failed, trying cancelAll', { err: err.message });
-      this._recordAudit('cancel_error', {
-        strategy: 'cancelMarket',
-        conditionId,
-        err: err.message,
-      });
-      try {
-        this._recordAudit('cancel_submit', { strategy: 'cancelAll', conditionId });
-        await ClobClient.cancelAll();
-        this._recordAudit('cancel_result', { strategy: 'cancelAll', conditionId, success: true });
-      } catch (fallbackErr) {
-        this.log.warn('BeatTrader: cancelAll failed', { err: fallbackErr.message });
-        this._recordAudit('cancel_error', {
-          strategy: 'cancelAll',
-          conditionId,
-          err: fallbackErr.message,
-        });
-      }
-    }
   }
 
   async _syncBalances(upTokenId, downTokenId) {
