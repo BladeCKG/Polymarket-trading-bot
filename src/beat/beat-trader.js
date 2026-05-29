@@ -148,6 +148,9 @@ export class BeatTrader {
     this.walletBalanceDown = 0;
     this.totalSpent = 0;
     this.redeemedUsdc = 0;
+    this.redeemed = false;
+    this.redeemStatus = 'pending';
+    this.redeemTxHash = null;
     this.lastBuyAt = 0;
     this.beatPrice = null;
     this.latestBtcTick = null;
@@ -2598,7 +2601,9 @@ export class BeatTrader {
 
     this.lastSettledAt = Date.now();
     const marketPnl = estimatedPayout - this.totalSpent;
-    this.redeemedUsdc += estimatedPayout;
+    this.redeemed = false;
+    this.redeemStatus = 'pending';
+    this.redeemTxHash = null;
 
     this._publishMarket({
       lifecycle: BEAT_LIFECYCLE.SETTLED,
@@ -2612,6 +2617,10 @@ export class BeatTrader {
       buyUsdc: this.tradeSummary?.buyUsdc ?? 0,
       buyPrice: this.tradeSummary?.buyPrice ?? null,
       tradeOccurred: Boolean(this.tradeSummary?.buyShares > 0),
+      redeemed: false,
+      redeemStatus: cfg.BEAT_DRY_RUN ? 'pending' : 'pending',
+      redeemTxHash: null,
+      redeemedUsdc: this.redeemedUsdc,
     });
     this.onSettled?.({
       slug: this.market.slug,
@@ -2634,6 +2643,10 @@ export class BeatTrader {
     });
 
     if (cfg.BEAT_DRY_RUN) {
+      this.redeemed = true;
+      this.redeemStatus = 'redeemed';
+      this.redeemTxHash = 'dry-run';
+      this.redeemedUsdc += estimatedPayout;
       this.pnl.recordRedeem(this.market.slug, estimatedPayout, 'dry-run');
       this.log.info('BeatTrader: dry-run settlement simulated', {
         outcome,
@@ -2648,6 +2661,18 @@ export class BeatTrader {
         estimatedPayout,
         marketPnl,
       });
+      this._publishMarket({
+        lifecycle: BEAT_LIFECYCLE.SETTLED,
+        settled: true,
+        settledAt: this.lastSettledAt,
+        outcome,
+        pnl: marketPnl,
+        tradeStatus: this.tradeSummary?.buyShares > 0 ? 'settled' : 'settled without trade',
+        redeemed: true,
+        redeemStatus: 'redeemed',
+        redeemTxHash: 'dry-run',
+        redeemedUsdc: this.redeemedUsdc,
+      });
       return true;
     }
 
@@ -2655,11 +2680,24 @@ export class BeatTrader {
     if (totalHeld < 0.001) {
       this.log.info('BeatTrader: no tokens to redeem');
       this.pnl.recordRedeem(this.market.slug, estimatedPayout, 'none');
+      this.redeemStatus = 'not-needed';
       this._recordAudit('redeem_skipped', {
         reason: 'no-tokens-held',
         totalHeld,
         outcome,
         estimatedPayout,
+      });
+      this._publishMarket({
+        lifecycle: BEAT_LIFECYCLE.SETTLED,
+        settled: true,
+        settledAt: this.lastSettledAt,
+        outcome,
+        pnl: marketPnl,
+        tradeStatus: this.tradeSummary?.buyShares > 0 ? 'settled' : 'settled without trade',
+        redeemed: false,
+        redeemStatus: 'not-needed',
+        redeemTxHash: null,
+        redeemedUsdc: this.redeemedUsdc,
       });
       return true;
     }
@@ -2667,6 +2705,10 @@ export class BeatTrader {
     try {
       this._recordAudit('redeem_submit', { conditionId, totalHeld, outcome });
       const txHash = await redeemPositions(conditionId);
+      this.redeemed = true;
+      this.redeemStatus = 'redeemed';
+      this.redeemTxHash = txHash;
+      this.redeemedUsdc += estimatedPayout;
       this.pnl.recordRedeem(this.market.slug, estimatedPayout, txHash);
       this.log.info('BeatTrader: redeemed winning position', {
         txHash,
@@ -2685,13 +2727,38 @@ export class BeatTrader {
         upHeld: this.balanceUp,
         downHeld: this.balanceDown,
       });
+      this._publishMarket({
+        lifecycle: BEAT_LIFECYCLE.SETTLED,
+        settled: true,
+        settledAt: this.lastSettledAt,
+        outcome,
+        pnl: marketPnl,
+        tradeStatus: this.tradeSummary?.buyShares > 0 ? 'settled' : 'settled without trade',
+        redeemed: true,
+        redeemStatus: 'redeemed',
+        redeemTxHash: txHash,
+        redeemedUsdc: this.redeemedUsdc,
+      });
       return true;
     } catch (err) {
       this.log.error('BeatTrader: redeem failed', { err: err.message });
+      this.redeemStatus = 'error';
       this._recordAudit('redeem_error', {
         conditionId,
         err: err.message,
         stack: err.stack ?? null,
+      });
+      this._publishMarket({
+        lifecycle: BEAT_LIFECYCLE.SETTLED,
+        settled: true,
+        settledAt: this.lastSettledAt,
+        outcome,
+        pnl: marketPnl,
+        tradeStatus: this.tradeSummary?.buyShares > 0 ? 'settled' : 'settled without trade',
+        redeemed: false,
+        redeemStatus: 'error',
+        redeemTxHash: null,
+        redeemedUsdc: this.redeemedUsdc,
       });
       return false;
     }
@@ -2755,6 +2822,14 @@ export class BeatTrader {
     this._publishMarket(patch);
   }
 
+  _defaultRedeemStatus() {
+    if (this.redeemed) return 'redeemed';
+    if (this.lifecycle === BEAT_LIFECYCLE.SETTLED || this.lifecycle === BEAT_LIFECYCLE.RESOLVING) {
+      return this.redeemStatus ?? 'pending';
+    }
+    return 'pending';
+  }
+
   _publishMarket(patch = {}) {
     if (!this.dashboard) return;
     const cfg = this.config;
@@ -2797,6 +2872,10 @@ export class BeatTrader {
       tradeOccurred: patch.tradeOccurred ?? Boolean(this.tradeSummary?.buyShares > 0),
       outcome: patch.outcome ?? this.lastOutcome ?? null,
       pnl: patch.pnl ?? (this.redeemedUsdc - this.totalSpent),
+      redeemed: patch.redeemed ?? this.redeemed,
+      redeemStatus: patch.redeemStatus ?? this._defaultRedeemStatus(),
+      redeemTxHash: patch.redeemTxHash ?? this.redeemTxHash ?? null,
+      redeemedUsdc: patch.redeemedUsdc ?? this.redeemedUsdc,
       settledAt: patch.settledAt ?? null,
       updatedAt: Date.now(),
     });

@@ -1305,6 +1305,7 @@
       const pairedShares = Number(market.pairedShares ?? 0);
       const unpairedUpShares = Number(market.unpairedUpShares ?? 0);
       const unpairedDownShares = Number(market.unpairedDownShares ?? 0);
+      const redeemStatus = String(market.redeemStatus || (market.redeemed ? 'redeemed' : 'pending'));
       const pnlIfUp = traded && !settled ? (pairedShares + unpairedUpShares - totalBuyUsdc) : null;
       const pnlIfDown = traded && !settled ? (pairedShares + unpairedDownShares - totalBuyUsdc) : null;
       const moveLabel = settled ? null : `${symbol} Move`;
@@ -1337,6 +1338,7 @@
             <div class="metric"><div class="label">Down Bid</div><div class="value">${price(market.downBestBid)}</div></div>
             <div class="metric"><div class="label">Down Ask</div><div class="value">${price(market.downBestAsk)}</div></div>
             <div class="metric"><div class="label">Trade Status</div><div class="value small">${statusText}</div></div>
+            <div class="metric"><div class="label">Redeemed</div><div class="value small">${escapeHtml(redeemStatus)}</div></div>
             <div class="metric"><div class="label">Settlement</div><div class="value small">${settled ? (market.outcome || '-') : (preOpen ? '' : countdown(market.windowCloseAt))}</div></div>
           </div>
           ${traded ? tradeSummary(market) : ''}
