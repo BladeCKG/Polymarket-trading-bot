@@ -105,6 +105,33 @@ function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
 }
 
+function erf(x) {
+  const sign = x >= 0 ? 1 : -1;
+  const absX = Math.abs(x);
+  const a1 = 0.254829592;
+  const a2 = -0.284496736;
+  const a3 = 1.421413741;
+  const a4 = -1.453152027;
+  const a5 = 1.061405429;
+  const p = 0.3275911;
+  const t = 1 / (1 + (p * absX));
+  const y = 1 - ((((((a5 * t) + a4) * t) + a3) * t + a2) * t + a1) * t * Math.exp(-(absX * absX));
+  return sign * y;
+}
+
+function normalCDF(x) {
+  return 0.5 * (1 + erf(x / Math.sqrt(2)));
+}
+
+function logReturn(currentPrice, priorPrice) {
+  const current = Number(currentPrice);
+  const prior = Number(priorPrice);
+  if (!Number.isFinite(current) || !Number.isFinite(prior) || current <= 0 || prior <= 0) {
+    return null;
+  }
+  return Math.log(current / prior);
+}
+
 function roundShareAmount(value, precision = 1e-9) {
   const num = Number(value);
   if (!Number.isFinite(num)) return 0;
@@ -646,6 +673,7 @@ export class BeatTrader {
 
     this.signalHistory.push({
       timestampMs,
+      price: Number.isFinite(btcPrice) ? btcPrice : null,
       move,
       upAsk: positiveFiniteOrNull(snapshot.upBestAsk),
       downAsk: positiveFiniteOrNull(snapshot.downBestAsk),
@@ -658,7 +686,7 @@ export class BeatTrader {
 
   _providerBackedSignalEntries(nowMs = Date.now()) {
     if (!Number.isFinite(Number(this.beatPrice))) return [];
-    const historyWindowMs = Math.max(15_000, Number(this.config.BEAT_PROBABILITY_HISTORY_MS) || 15_000);
+    const historyWindowMs = Math.max(30_000, Number(this.config.BEAT_PROBABILITY_HISTORY_MS) || 30_000);
     const rawHistory = Array.isArray(this._btcHistoryProvider?.()) ? this._btcHistoryProvider() : [];
     if (!rawHistory.length) return [];
 
@@ -686,6 +714,7 @@ export class BeatTrader {
     return selected
       .map((entry) => ({
         timestampMs: entry.timestampMs,
+        price: entry.price,
         move: entry.price - Number(this.beatPrice),
         upAsk: null,
         downAsk: null,
@@ -693,7 +722,7 @@ export class BeatTrader {
   }
 
   _mergeSignalHistory(entries = [], nowMs = Date.now()) {
-    const historyWindowMs = Math.max(15_000, Number(this.config.BEAT_PROBABILITY_HISTORY_MS) || 15_000);
+    const historyWindowMs = Math.max(30_000, Number(this.config.BEAT_PROBABILITY_HISTORY_MS) || 30_000);
     const keepAfterMs = nowMs - historyWindowMs;
     const merged = [...entries]
       .filter((entry) => Number.isFinite(Number(entry?.timestampMs ?? 0)))
@@ -706,6 +735,7 @@ export class BeatTrader {
       if (prev && Math.abs(Number(prev.timestampMs) - ts) <= 1) {
         deduped[deduped.length - 1] = {
           timestampMs: ts,
+          price: Number.isFinite(Number(entry.price)) ? Number(entry.price) : (prev.price ?? null),
           move: Number.isFinite(Number(entry.move)) ? Number(entry.move) : prev.move,
           upAsk: entry.upAsk ?? prev.upAsk ?? null,
           downAsk: entry.downAsk ?? prev.downAsk ?? null,
@@ -714,6 +744,7 @@ export class BeatTrader {
       }
       deduped.push({
         timestampMs: ts,
+        price: Number.isFinite(Number(entry.price)) ? Number(entry.price) : null,
         move: Number.isFinite(Number(entry.move)) ? Number(entry.move) : null,
         upAsk: entry.upAsk ?? null,
         downAsk: entry.downAsk ?? null,
@@ -739,7 +770,7 @@ export class BeatTrader {
   }
 
   _hasGuaranteedProbabilityHistory(nowMs = Date.now()) {
-    const historyWindowMs = Math.max(15_000, Number(this.config.BEAT_PROBABILITY_HISTORY_MS) || 15_000);
+    const historyWindowMs = Math.max(30_000, Number(this.config.BEAT_PROBABILITY_HISTORY_MS) || 30_000);
     const history = this._effectiveSignalHistory(nowMs);
     if (!history.length) return false;
     const earliestTs = Number(history[0]?.timestampMs ?? 0);
@@ -759,9 +790,33 @@ export class BeatTrader {
     return history[0] ?? null;
   }
 
+  _ewmaSigmaPerSqrtSecond(history = []) {
+    const lambda = clamp(Number(this.config.BEAT_PROBABILITY_VOL_LAMBDA) || 0.97, 0.5, 0.9999);
+    let variance = null;
+    for (let i = 1; i < history.length; i += 1) {
+      const prev = history[i - 1];
+      const next = history[i];
+      const prevPrice = Number(prev?.price);
+      const nextPrice = Number(next?.price);
+      const prevTs = Number(prev?.timestampMs);
+      const nextTs = Number(next?.timestampMs);
+      if (!Number.isFinite(prevPrice) || !Number.isFinite(nextPrice) || prevPrice <= 0 || nextPrice <= 0) continue;
+      if (!Number.isFinite(prevTs) || !Number.isFinite(nextTs) || nextTs <= prevTs) continue;
+      const dtSeconds = (nextTs - prevTs) / 1000;
+      if (!Number.isFinite(dtSeconds) || dtSeconds <= 0) continue;
+      const r = logReturn(nextPrice, prevPrice);
+      if (!Number.isFinite(r)) continue;
+      const perSecondVariance = (r * r) / dtSeconds;
+      variance = variance == null
+        ? perSecondVariance
+        : ((lambda * variance) + ((1 - lambda) * perSecondVariance));
+    }
+    return variance != null && variance > 0 ? Math.sqrt(variance) : null;
+  }
+
   _probabilityModel(snapshot = {}) {
     const nowMs = Number(snapshot.snapshotAtMs ?? Date.now());
-    const historyWindowMs = Math.max(15_000, Number(this.config.BEAT_PROBABILITY_HISTORY_MS) || 15_000);
+    const historyWindowMs = Math.max(30_000, Number(this.config.BEAT_PROBABILITY_HISTORY_MS) || 30_000);
     const history = this._effectiveSignalHistory(nowMs);
     if (!history.length) {
       return null;
@@ -771,12 +826,6 @@ export class BeatTrader {
     if (!Number.isFinite(earliestTs) || !Number.isFinite(latestTs) || earliestTs > (nowMs - historyWindowMs) || latestTs > nowMs) {
       return null;
     }
-    const checkpointsMs = [
-      3_000,
-      6_000,
-      10_000,
-      Math.min(historyWindowMs, 15_000),
-    ];
     const btcPrice = Number(snapshot.btcPrice);
     const beatPrice = Number(snapshot.beatPrice);
     const move = Number.isFinite(btcPrice) && Number.isFinite(beatPrice)
@@ -786,91 +835,110 @@ export class BeatTrader {
     const downAsk = positiveFiniteOrNull(snapshot.downBestAsk);
     const pairCost = Number.isFinite(upAsk) && Number.isFinite(downAsk) ? upAsk + downAsk : null;
 
-    const checkpointMoves = Object.fromEntries(checkpointsMs.map((ms) => {
+    const checkpointsMs = [500, 1_000, 2_000, 3_000, 10_000, 30_000];
+    const checkpointPrices = Object.fromEntries(checkpointsMs.map((ms) => {
       const sample = this._sampleAgo(ms, nowMs, history);
-      const sampleMove = Number.isFinite(Number(sample?.move)) ? Number(sample.move) : move;
-      return [ms, sampleMove];
+      const samplePrice = Number(sample?.price);
+      return [ms, Number.isFinite(samplePrice) && samplePrice > 0 ? samplePrice : btcPrice];
     }));
-    const velocity0To3 = (move - checkpointMoves[3_000]) / 3;
-    const velocity3To6 = (checkpointMoves[3_000] - checkpointMoves[6_000]) / 3;
-    const velocity6To10 = (checkpointMoves[6_000] - checkpointMoves[10_000]) / 4;
-    const velocity10To15 = (checkpointMoves[10_000] - checkpointMoves[15_000]) / 5;
+    const perSecondMomentum = Object.fromEntries(checkpointsMs.map((ms) => {
+      const priorPrice = checkpointPrices[ms];
+      const value = logReturn(btcPrice, priorPrice);
+      return [ms, Number.isFinite(value) ? value / (ms / 1000) : 0];
+    }));
+
+    const momentum0To0_5 = perSecondMomentum[500];
+    const momentum0To1 = perSecondMomentum[1_000];
+    const momentum0To2 = perSecondMomentum[2_000];
+    const momentum0To3 = perSecondMomentum[3_000];
+    const momentum0To10 = perSecondMomentum[10_000];
+    const momentum0To30 = perSecondMomentum[30_000];
+
+    const microMomentum = (
+      (0.50 * momentum0To0_5) +
+      (0.30 * momentum0To1) +
+      (0.20 * momentum0To2)
+    );
+    const slowMomentum = (
+      (0.50 * momentum0To3) +
+      (0.35 * momentum0To10) +
+      (0.15 * momentum0To30)
+    );
     const velocityComposite = (
-      (0.38 * velocity0To3) +
-      (0.27 * velocity3To6) +
-      (0.20 * velocity6To10) +
-      (0.15 * velocity10To15)
+      (0.45 * microMomentum) +
+      (0.55 * slowMomentum)
     );
-    const accelerationFast = velocity0To3 - velocity3To6;
-    const accelerationMid = velocity3To6 - velocity6To10;
-    const accelerationSlow = velocity6To10 - velocity10To15;
+    const accelerationFast = momentum0To0_5 - momentum0To1;
+    const accelerationMid = momentum0To1 - momentum0To3;
+    const accelerationSlow = momentum0To3 - momentum0To10;
     const accelerationComposite = (
-      (0.5 * accelerationFast) +
-      (0.3 * accelerationMid) +
-      (0.2 * accelerationSlow)
+      (0.50 * accelerationFast) +
+      (0.30 * accelerationMid) +
+      (0.20 * accelerationSlow)
     );
-    const momentumComposite = velocityComposite + (0.5 * accelerationComposite);
+    const momentumComposite = (
+      (0.65 * slowMomentum) +
+      (0.35 * microMomentum) +
+      (0.25 * accelerationComposite)
+    );
 
     const upOfi = this.ofi.snapshotFor(this.market.upToken.tokenId, nowMs);
     const downOfi = this.ofi.snapshotFor(this.market.downToken.tokenId, nowMs);
     const ofiDiff = Number(upOfi?.ofiScore ?? 0) - Number(downOfi?.ofiScore ?? 0);
 
-    const moveFeature = clamp(move / 20, -1, 1);
-    const velocity0To3Feature = clamp(velocity0To3 / 2, -1, 1);
-    const velocity3To6Feature = clamp(velocity3To6 / 2, -1, 1);
-    const velocity6To10Feature = clamp(velocity6To10 / 2, -1, 1);
-    const velocity10To15Feature = clamp(velocity10To15 / 2, -1, 1);
-    const velocityCompositeFeature = clamp(velocityComposite / 2, -1, 1);
-    const accelerationFeature = clamp(accelerationComposite / 2, -1, 1);
-    const momentumFeature = clamp(momentumComposite / 2, -1, 1);
-    const ofiFeature = clamp(ofiDiff / 200, -1, 1);
+    const sigmaPerSqrtSecond = this._ewmaSigmaPerSqrtSecond(history);
+    const secondsLeft = Math.max(1, ((this.market.windowTs + this.config.MARKET_WINDOW_SECONDS) * 1000 - nowMs) / 1000);
+    const x = logReturn(btcPrice, beatPrice);
+    const muRaw = (
+      (0.50 * momentum0To3) +
+      (0.35 * momentum0To10) +
+      (0.15 * momentum0To30)
+    );
+    const muMicro = microMomentum;
+    const muBlended = (
+      (0.75 * muRaw) +
+      (0.25 * muMicro)
+    );
+    const driftShrink = clamp(Number(this.config.BEAT_PROBABILITY_DRIFT_SHRINK) || 0.35, 0, 1);
+    const mu = driftShrink * muBlended;
     const upCheapness = Number.isFinite(upAsk) ? clamp((0.5 - upAsk) / 0.25, -1, 1) : -1;
     const downCheapness = Number.isFinite(downAsk) ? clamp((0.5 - downAsk) / 0.25, -1, 1) : -1;
     const pairFeature = Number.isFinite(pairCost) ? clamp((1 - pairCost) / 0.08, -1, 1) : -1;
     const flipPotential = clamp(1 - (Math.abs(move) / 40), 0, 1);
-
-    const upScore =
-      (0.9 * moveFeature) +
-      (0.18 * velocity0To3Feature) +
-      (0.14 * velocity3To6Feature) +
-      (0.10 * velocity6To10Feature) +
-      (0.08 * velocity10To15Feature) +
-      (0.18 * velocityCompositeFeature) +
-      (0.25 * accelerationFeature) +
-      (0.12 * momentumFeature) +
-      (0.45 * ofiFeature) +
-      (0.55 * upCheapness) +
-      (0.45 * pairFeature) +
-      (0.25 * flipPotential);
-    const downScore =
-      (-0.9 * moveFeature) +
-      (-0.18 * velocity0To3Feature) +
-      (-0.14 * velocity3To6Feature) +
-      (-0.10 * velocity6To10Feature) +
-      (-0.08 * velocity10To15Feature) +
-      (-0.18 * velocityCompositeFeature) +
-      (-0.25 * accelerationFeature) +
-      (-0.12 * momentumFeature) +
-      (-0.45 * ofiFeature) +
-      (0.55 * downCheapness) +
-      (0.45 * pairFeature) +
-      (0.25 * flipPotential);
-
-    const upExp = Math.exp(clamp(upScore, -8, 8));
-    const downExp = Math.exp(clamp(downScore, -8, 8));
-    const totalExp = upExp + downExp || 1;
+    const zDenominator = Number.isFinite(sigmaPerSqrtSecond) && sigmaPerSqrtSecond > 0
+      ? sigmaPerSqrtSecond * Math.sqrt(secondsLeft)
+      : null;
+    const zRaw = Number.isFinite(x) && Number.isFinite(mu) && Number.isFinite(zDenominator) && zDenominator > 0
+      ? (x + (mu * secondsLeft)) / zDenominator
+      : 0;
+    const pRaw = normalCDF(clamp(zRaw, -8, 8));
+    const confidence = clamp(Number(this.config.BEAT_PROBABILITY_CONFIDENCE) || 0.80, 0, 1);
+    const minProbability = clamp(Number(this.config.BEAT_PROBABILITY_MIN) || 0.05, 0, 0.5);
+    const maxProbability = clamp(Number(this.config.BEAT_PROBABILITY_MAX) || 0.95, 0.5, 1);
+    const pUpFair = clamp(0.5 + (confidence * (pRaw - 0.5)), minProbability, maxProbability);
+    const pDownFair = 1 - pUpFair;
+    const upScore = Math.log(Math.max(1e-9, pUpFair));
+    const downScore = Math.log(Math.max(1e-9, pDownFair));
 
     return {
       pairCost,
-      pUp: upExp / totalExp,
-      pDown: downExp / totalExp,
+      pUp: pUpFair,
+      pDown: pDownFair,
       features: {
         move,
         checkpointsMs,
-        velocity0To3,
-        velocity3To6,
-        velocity6To10,
-        velocity10To15,
+        priceLogDistance: x,
+        secondsLeft,
+        sigmaPerSqrtSecond,
+        driftPerSecond: mu,
+        driftRawPerSecond: muRaw,
+        microDriftPerSecond: muMicro,
+        momentum0To0_5,
+        momentum0To1,
+        momentum0To2,
+        momentum0To3,
+        momentum0To10,
+        momentum0To30,
         velocityComposite,
         accelerationFast,
         accelerationMid,
@@ -882,6 +950,8 @@ export class BeatTrader {
         downCheapness,
         pairFeature,
         flipPotential,
+        zRaw,
+        pRaw,
       },
       scores: {
         up: upScore,
