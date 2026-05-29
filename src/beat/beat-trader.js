@@ -2209,7 +2209,7 @@ export class BeatTrader {
     if (!oppositeSide) return [];
     const normalizedBuyPriceCap = Number(buyPriceCap);
     const pairCostCap = this._pairCostThreshold();
-    return this.openLots[oppositeSide]
+    const eligibleLots = this.openLots[oppositeSide]
       .filter((lot) => {
         const remainingShares = Number(lot?.remainingShares ?? 0);
         const lotPrice = Number(lot?.avgPrice ?? 0);
@@ -2223,6 +2223,37 @@ export class BeatTrader {
         if (Math.abs(priceDiff) > 1e-9) return priceDiff;
         return Number(a?.recordedAt ?? 0) - Number(b?.recordedAt ?? 0);
       });
+
+    const groupedLots = [];
+    for (const lot of eligibleLots) {
+      const lotPrice = Number(lot?.avgPrice ?? 0);
+      const lotShares = Number(lot?.remainingShares ?? 0);
+      if (!Number.isFinite(lotPrice) || lotShares <= 1e-9) continue;
+      const lastGroup = groupedLots[groupedLots.length - 1];
+      if (lastGroup && Math.abs(Number(lastGroup.avgPrice ?? 0) - lotPrice) <= 1e-9) {
+        lastGroup.remainingShares += lotShares;
+        lastGroup.memberLots.push({
+          id: lot.id,
+          remainingShares: lotShares,
+          avgPrice: lotPrice,
+          recordedAt: Number(lot?.recordedAt ?? 0),
+        });
+        continue;
+      }
+      groupedLots.push({
+        id: `price-group-${oppositeSide}-${lotPrice.toFixed(8)}`,
+        oppositeSide,
+        avgPrice: lotPrice,
+        remainingShares: lotShares,
+        memberLots: [{
+          id: lot.id,
+          remainingShares: lotShares,
+          avgPrice: lotPrice,
+          recordedAt: Number(lot?.recordedAt ?? 0),
+        }],
+      });
+    }
+    return groupedLots;
   }
 
   _pairCostThreshold() {
@@ -2251,12 +2282,19 @@ export class BeatTrader {
 
     const pairCostCap = this._pairCostThreshold();
     const eligibleLots = this._eligiblePairLots(side, Infinity)
-      .map((lot) => ({
-        ...lot,
-        remainingShares: Number(lot?.remainingShares ?? 0),
-        avgPrice: Number(lot?.avgPrice ?? 0),
+      .map((group) => ({
+        ...group,
+        remainingShares: Number(group?.remainingShares ?? 0),
+        avgPrice: Number(group?.avgPrice ?? 0),
+        memberLots: Array.isArray(group?.memberLots)
+          ? group.memberLots.map((lot) => ({
+            ...lot,
+            remainingShares: Number(lot?.remainingShares ?? 0),
+            avgPrice: Number(lot?.avgPrice ?? 0),
+          }))
+          : [],
       }))
-      .filter((lot) => lot.remainingShares > 1e-9 && Number.isFinite(lot.avgPrice));
+      .filter((group) => group.remainingShares > 1e-9 && Number.isFinite(group.avgPrice));
     if (!eligibleLots.length) return null;
 
     let fillShares = 0;
@@ -2270,14 +2308,14 @@ export class BeatTrader {
       let remainingAskShares = Number(ask.size);
       if (!Number.isFinite(remainingAskShares) || remainingAskShares <= 1e-9) continue;
 
-      for (const lot of eligibleLots) {
+      for (const group of eligibleLots) {
         if (remainingAskShares <= 1e-9) break;
-        if (lot.remainingShares <= 1e-9) continue;
+        if (group.remainingShares <= 1e-9) continue;
 
-        const pairCost = lot.avgPrice + Number(ask.price);
+        const pairCost = group.avgPrice + Number(ask.price);
         if (!Number.isFinite(pairCost) || pairCost > pairCostCap) continue;
 
-        const matchedShares = Math.min(lot.remainingShares, remainingAskShares);
+        const matchedShares = Math.min(group.remainingShares, remainingAskShares);
         if (matchedShares <= 1e-9) continue;
 
         const spentAtAsk = matchedShares * Number(ask.price);
@@ -2288,7 +2326,7 @@ export class BeatTrader {
         totalPairCostUsdc += pairCostUsdc;
         maxPrice = Math.max(maxPrice, Number(ask.price));
         remainingAskShares -= matchedShares;
-        lot.remainingShares = roundShareAmount(lot.remainingShares - matchedShares);
+        group.remainingShares = roundShareAmount(group.remainingShares - matchedShares);
 
         fills.push({
           price: Number(ask.price),
@@ -2297,9 +2335,10 @@ export class BeatTrader {
           feeUsdc: 0,
         });
         matches.push({
-          oppositeLotId: lot.id,
+          oppositeLotId: group.id,
+          oppositeLotIds: group.memberLots.map((lot) => lot.id),
           oppositeSide: this._oppositeSide(side),
-          oppositePrice: lot.avgPrice,
+          oppositePrice: group.avgPrice,
           shares: matchedShares,
           pairCost,
           pairEdge: 1 - pairCost,
