@@ -2166,19 +2166,13 @@ export class BeatTrader {
 
   _minUsdcRequired(book = null) {
     const cfgMin = Number(this.config.BEAT_MIN_BUY_USDC);
-    const bookMin = Number(book?.minOrderSize);
-    const values = [cfgMin, bookMin].filter((value) => Number.isFinite(value) && value > 0);
+    const values = [cfgMin].filter((value) => Number.isFinite(value) && value > 0);
     return values.length ? Math.max(...values) : 0;
   }
 
   _minSharesRequired(book = null, price = null) {
     const cfgMin = Number(this.config.BEAT_MIN_BUY_SHARES);
-    const minUsdc = this._minUsdcRequired(book);
-    const refPrice = Number(price);
-    const impliedShares = Number.isFinite(refPrice) && refPrice > 0
-      ? minUsdc / refPrice
-      : 0;
-    const values = [cfgMin, impliedShares].filter((value) => Number.isFinite(value) && value > 0);
+    const values = [cfgMin].filter((value) => Number.isFinite(value) && value > 0);
     return values.length ? Math.max(...values) : 0;
   }
 
