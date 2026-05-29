@@ -94,6 +94,10 @@ function positiveFiniteOrNull(value) {
   return Number.isFinite(num) && num > 0 ? num : null;
 }
 
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value));
+}
+
 function bookAgeMs(book, nowMs = Date.now()) {
   const sourceTs = Number(book?.sourceTimestampMs);
   if (Number.isFinite(sourceTs) && sourceTs > 0) {
@@ -138,6 +142,7 @@ export class BeatTrader {
     this._bookFeed = bookFeed;
     this._ownsBookFeed = !bookFeed;
     this._bookFeedAttached = false;
+    this.signalHistory = [];
     this.ofi = new BeatOfiTracker({
       enabled: this.config.BEAT_OFI_ENABLED,
       windowMs: this.config.BEAT_OFI_WINDOW_MS,
@@ -188,6 +193,10 @@ export class BeatTrader {
         ofiRatioEnter: cfg.BEAT_OFI_RATIO_ENTER,
         ofiRatioExit: cfg.BEAT_OFI_RATIO_EXIT,
         ofiExitRatio: cfg.BEAT_OFI_EXIT_RATIO,
+        probabilityEnabled: cfg.BEAT_PROBABILITY_ENABLED,
+        probabilityHistoryMs: cfg.BEAT_PROBABILITY_HISTORY_MS,
+        probabilityRequiredEdge: cfg.BEAT_PROBABILITY_REQUIRED_EDGE,
+        probabilityPairCostMax: cfg.BEAT_PROBABILITY_PAIR_COST_MAX,
         moments: momentsForLog,
       },
       auditLogPath: getMarketLogFilePath(this.market.slug),
@@ -459,6 +468,7 @@ export class BeatTrader {
           lifecycle: BEAT_LIFECYCLE.MONITORING,
           tradeStatus: tradeStatusFromLifecycle(this.lifecycle, this.tradeSummary?.buyShares > 0),
         });
+        this._recordSignalSample(snapshot);
         await this._maybeBuy(snapshot);
       } catch (err) {
         this.log.warn('BeatTrader: monitor iteration failed', { err: err.message });
@@ -511,6 +521,7 @@ export class BeatTrader {
     };
 
     return {
+      snapshotAtMs,
       upBestBid: upBid?.price ?? null,
       upBestAsk: upAsk?.price ?? null,
       upBookAgeMs: bookAgeMs(upBook, snapshotAtMs),
@@ -520,6 +531,154 @@ export class BeatTrader {
       beatPrice,
       btcPrice,
       chartPoint,
+    };
+  }
+
+  _recordSignalSample(snapshot = {}) {
+    const timestampMs = Number(snapshot.snapshotAtMs ?? Date.now());
+    const btcPrice = Number(snapshot.btcPrice);
+    const beatPrice = Number(snapshot.beatPrice);
+    const move = Number.isFinite(btcPrice) && Number.isFinite(beatPrice)
+      ? btcPrice - beatPrice
+      : null;
+
+    this.signalHistory.push({
+      timestampMs,
+      move,
+      upAsk: positiveFiniteOrNull(snapshot.upBestAsk),
+      downAsk: positiveFiniteOrNull(snapshot.downBestAsk),
+    });
+
+    const historyWindowMs = Math.max(1_000, Number(this.config.BEAT_PROBABILITY_HISTORY_MS) || 15_000);
+    const keepAfterMs = timestampMs - historyWindowMs;
+    this.signalHistory = this.signalHistory.filter((entry) => Number(entry?.timestampMs ?? 0) >= keepAfterMs);
+  }
+
+  _sampleAgo(msAgo, nowMs = Date.now()) {
+    const cutoffMs = nowMs - msAgo;
+    for (let i = this.signalHistory.length - 1; i >= 0; i -= 1) {
+      const sample = this.signalHistory[i];
+      if (Number(sample?.timestampMs ?? 0) <= cutoffMs) {
+        return sample;
+      }
+    }
+    return this.signalHistory[0] ?? null;
+  }
+
+  _probabilityModel(snapshot = {}) {
+    const nowMs = Number(snapshot.snapshotAtMs ?? Date.now());
+    const historyWindowMs = Math.max(15_000, Number(this.config.BEAT_PROBABILITY_HISTORY_MS) || 15_000);
+    const checkpointsMs = [
+      3_000,
+      6_000,
+      10_000,
+      Math.min(historyWindowMs, 15_000),
+    ];
+    const btcPrice = Number(snapshot.btcPrice);
+    const beatPrice = Number(snapshot.beatPrice);
+    const move = Number.isFinite(btcPrice) && Number.isFinite(beatPrice)
+      ? btcPrice - beatPrice
+      : 0;
+    const upAsk = positiveFiniteOrNull(snapshot.upBestAsk);
+    const downAsk = positiveFiniteOrNull(snapshot.downBestAsk);
+    const pairCost = Number.isFinite(upAsk) && Number.isFinite(downAsk) ? upAsk + downAsk : null;
+
+    const checkpointMoves = Object.fromEntries(checkpointsMs.map((ms) => {
+      const sample = this._sampleAgo(ms, nowMs);
+      const sampleMove = Number.isFinite(Number(sample?.move)) ? Number(sample.move) : move;
+      return [ms, sampleMove];
+    }));
+    const velocity0To3 = (move - checkpointMoves[3_000]) / 3;
+    const velocity3To6 = (checkpointMoves[3_000] - checkpointMoves[6_000]) / 3;
+    const velocity6To10 = (checkpointMoves[6_000] - checkpointMoves[10_000]) / 4;
+    const velocity10To15 = (checkpointMoves[10_000] - checkpointMoves[15_000]) / 5;
+    const velocityComposite = (
+      (0.38 * velocity0To3) +
+      (0.27 * velocity3To6) +
+      (0.20 * velocity6To10) +
+      (0.15 * velocity10To15)
+    );
+    const accelerationFast = velocity0To3 - velocity3To6;
+    const accelerationMid = velocity3To6 - velocity6To10;
+    const accelerationSlow = velocity6To10 - velocity10To15;
+    const accelerationComposite = (
+      (0.5 * accelerationFast) +
+      (0.3 * accelerationMid) +
+      (0.2 * accelerationSlow)
+    );
+
+    const upOfi = this.ofi.snapshotFor(this.market.upToken.tokenId, nowMs);
+    const downOfi = this.ofi.snapshotFor(this.market.downToken.tokenId, nowMs);
+    const ofiDiff = Number(upOfi?.ofiScore ?? 0) - Number(downOfi?.ofiScore ?? 0);
+
+    const moveFeature = clamp(move / 20, -1, 1);
+    const velocity0To3Feature = clamp(velocity0To3 / 2, -1, 1);
+    const velocity3To6Feature = clamp(velocity3To6 / 2, -1, 1);
+    const velocity6To10Feature = clamp(velocity6To10 / 2, -1, 1);
+    const velocity10To15Feature = clamp(velocity10To15 / 2, -1, 1);
+    const velocityCompositeFeature = clamp(velocityComposite / 2, -1, 1);
+    const accelerationFeature = clamp(accelerationComposite / 2, -1, 1);
+    const ofiFeature = clamp(ofiDiff / 200, -1, 1);
+    const upCheapness = Number.isFinite(upAsk) ? clamp((0.5 - upAsk) / 0.25, -1, 1) : -1;
+    const downCheapness = Number.isFinite(downAsk) ? clamp((0.5 - downAsk) / 0.25, -1, 1) : -1;
+    const pairFeature = Number.isFinite(pairCost) ? clamp((1 - pairCost) / 0.08, -1, 1) : -1;
+    const flipPotential = clamp(1 - (Math.abs(move) / 40), 0, 1);
+
+    const upScore =
+      (0.9 * moveFeature) +
+      (0.18 * velocity0To3Feature) +
+      (0.14 * velocity3To6Feature) +
+      (0.10 * velocity6To10Feature) +
+      (0.08 * velocity10To15Feature) +
+      (0.18 * velocityCompositeFeature) +
+      (0.25 * accelerationFeature) +
+      (0.45 * ofiFeature) +
+      (0.55 * upCheapness) +
+      (0.45 * pairFeature) +
+      (0.25 * flipPotential);
+    const downScore =
+      (-0.9 * moveFeature) +
+      (-0.18 * velocity0To3Feature) +
+      (-0.14 * velocity3To6Feature) +
+      (-0.10 * velocity6To10Feature) +
+      (-0.08 * velocity10To15Feature) +
+      (-0.18 * velocityCompositeFeature) +
+      (-0.25 * accelerationFeature) +
+      (-0.45 * ofiFeature) +
+      (0.55 * downCheapness) +
+      (0.45 * pairFeature) +
+      (0.25 * flipPotential);
+
+    const upExp = Math.exp(clamp(upScore, -8, 8));
+    const downExp = Math.exp(clamp(downScore, -8, 8));
+    const totalExp = upExp + downExp || 1;
+
+    return {
+      pairCost,
+      pUp: upExp / totalExp,
+      pDown: downExp / totalExp,
+      features: {
+        move,
+        checkpointsMs,
+        velocity0To3,
+        velocity3To6,
+        velocity6To10,
+        velocity10To15,
+        velocityComposite,
+        accelerationFast,
+        accelerationMid,
+        accelerationSlow,
+        accelerationComposite,
+        ofiDiff,
+        upCheapness,
+        downCheapness,
+        pairFeature,
+        flipPotential,
+      },
+      scores: {
+        up: upScore,
+        down: downScore,
+      },
     };
   }
 
@@ -597,6 +756,7 @@ export class BeatTrader {
 
     const thresholds = { upMax: Number(moment.btcmoveMax), downMax: Number(moment.btcmoveMax) };
     const resolvedBuyMax = Number(moment.buyMax);
+    const probabilityModel = cfg.BEAT_PROBABILITY_ENABLED ? this._probabilityModel(snapshot) : null;
 
     const bookState = {
       Up: {
@@ -618,7 +778,7 @@ export class BeatTrader {
     };
 
     const absoluteMove = Math.abs(delta);
-    if (absoluteMove > Math.max(thresholds.upMax, thresholds.downMax)) {
+    if (!probabilityModel && absoluteMove > Math.max(thresholds.upMax, thresholds.downMax)) {
       this._recordAudit('decision_skip', {
         reason: 'delta-outside-thresholds',
         secondsAfterOpen,
@@ -635,20 +795,54 @@ export class BeatTrader {
     const preferredSide = delta > 0 ? 'Up' : (delta < 0 ? 'Down' : null);
     const candidateLegs = Object.entries(bookState)
       .map(([side, leg]) => {
+        const sideProbability = probabilityModel
+          ? (side === 'Up' ? probabilityModel.pUp : probabilityModel.pDown)
+          : null;
+        const modelEdge = Number.isFinite(sideProbability) && Number.isFinite(leg.ask?.price)
+          ? sideProbability - leg.ask.price
+          : null;
+        const dynamicBuyMax = probabilityModel && Number.isFinite(sideProbability)
+          ? Math.min(
+            leg.maxBuyPrice,
+            Math.max(0, sideProbability - Number(cfg.BEAT_PROBABILITY_REQUIRED_EDGE)),
+          )
+          : leg.maxBuyPrice;
+        const edgeFactor = Number.isFinite(modelEdge)
+          ? clamp(modelEdge / Math.max(0.0001, Number(cfg.BEAT_PROBABILITY_REQUIRED_EDGE)), 0, 1)
+          : 0;
+        const baseMoveMax = side === 'Up' ? thresholds.upMax : thresholds.downMax;
+        const dynamicMoveMax = probabilityModel
+          ? Math.min(
+            baseMoveMax,
+            Math.max(5, baseMoveMax * (0.35 + (0.65 * edgeFactor))),
+          )
+          : baseMoveMax;
+
         if (!leg.ask) {
-          return { side, leg, affordable: false, maxPrice: null, reason: 'missing-best-ask' };
+          return { side, leg, affordable: false, maxPrice: null, reason: 'missing-best-ask', sideProbability, modelEdge, dynamicBuyMax, dynamicMoveMax };
         }
         if (!Number.isFinite(leg.bookAgeMs) || leg.bookAgeMs > cfg.BEAT_BOOK_MAX_AGE_MS) {
-          return { side, leg, affordable: false, maxPrice: null, reason: 'stale-book' };
+          return { side, leg, affordable: false, maxPrice: null, reason: 'stale-book', sideProbability, modelEdge, dynamicBuyMax, dynamicMoveMax };
         }
-        if (leg.ask.price > leg.maxBuyPrice) {
-          return { side, leg, affordable: false, maxPrice: null, reason: 'ask-above-buy-max' };
+        if (probabilityModel) {
+          if (!Number.isFinite(probabilityModel.pairCost) || probabilityModel.pairCost > Number(cfg.BEAT_PROBABILITY_PAIR_COST_MAX)) {
+            return { side, leg, affordable: false, maxPrice: null, reason: 'pair-cost-too-high', sideProbability, modelEdge, dynamicBuyMax, dynamicMoveMax };
+          }
+          if (!Number.isFinite(modelEdge) || modelEdge < Number(cfg.BEAT_PROBABILITY_REQUIRED_EDGE)) {
+            return { side, leg, affordable: false, maxPrice: null, reason: 'probability-edge-too-small', sideProbability, modelEdge, dynamicBuyMax, dynamicMoveMax };
+          }
+          if (absoluteMove > dynamicMoveMax) {
+            return { side, leg, affordable: false, maxPrice: null, reason: 'move-above-dynamic-cap', sideProbability, modelEdge, dynamicBuyMax, dynamicMoveMax };
+          }
         }
-        const maxPrice = clampMaxPrice(leg.ask.price, leg.maxBuyPrice, cfg.BEAT_MAX_SLIPPAGE);
+        if (leg.ask.price > dynamicBuyMax) {
+          return { side, leg, affordable: false, maxPrice: null, reason: 'ask-above-buy-max', sideProbability, modelEdge, dynamicBuyMax, dynamicMoveMax };
+        }
+        const maxPrice = clampMaxPrice(leg.ask.price, dynamicBuyMax, cfg.BEAT_MAX_SLIPPAGE);
         if (maxPrice + 1e-9 < leg.ask.price) {
-          return { side, leg, affordable: false, maxPrice, reason: 'clamped-price-below-ask' };
+          return { side, leg, affordable: false, maxPrice, reason: 'clamped-price-below-ask', sideProbability, modelEdge, dynamicBuyMax, dynamicMoveMax };
         }
-        return { side, leg, affordable: true, maxPrice, reason: null };
+        return { side, leg, affordable: true, maxPrice, reason: null, sideProbability, modelEdge, dynamicBuyMax, dynamicMoveMax };
       });
 
     const affordableLegs = candidateLegs.filter((entry) => entry.affordable);
@@ -665,15 +859,22 @@ export class BeatTrader {
           reason: entry.reason,
           askPrice: entry.leg.ask?.price ?? null,
           bookAgeMs: entry.leg.bookAgeMs ?? null,
-          maxBuyPrice: entry.leg.maxBuyPrice,
+          maxBuyPrice: entry.dynamicBuyMax ?? entry.leg.maxBuyPrice,
+          dynamicMoveMax: entry.dynamicMoveMax ?? null,
           maxPrice: entry.maxPrice,
+          sideProbability: entry.sideProbability ?? null,
+          modelEdge: entry.modelEdge ?? null,
         })),
+        probabilityModel,
       });
       return;
     }
 
     const selected = affordableLegs
       .sort((a, b) => {
+        const aEdge = Number.isFinite(a.modelEdge) ? -a.modelEdge : Infinity;
+        const bEdge = Number.isFinite(b.modelEdge) ? -b.modelEdge : Infinity;
+        if (aEdge !== bEdge) return aEdge - bEdge;
         const aPreferred = a.side === preferredSide ? 0 : 1;
         const bPreferred = b.side === preferredSide ? 0 : 1;
         if (aPreferred !== bPreferred) return aPreferred - bPreferred;
@@ -700,6 +901,7 @@ export class BeatTrader {
         btcPrice: tick.price,
         moment,
         ofiDecision,
+        probabilityModel,
       });
       return;
     }
@@ -720,6 +922,7 @@ export class BeatTrader {
         askPrice: leg.ask?.price ?? null,
         originalMaxPrice: selected.maxPrice,
         softenedMaxPrice: maxPrice,
+        probabilityModel,
       });
       return;
     }
@@ -741,18 +944,25 @@ export class BeatTrader {
         reason: entry.reason,
         askPrice: entry.leg.ask?.price ?? null,
         bookAgeMs: entry.leg.bookAgeMs ?? null,
-        maxBuyPrice: entry.leg.maxBuyPrice,
+        maxBuyPrice: entry.dynamicBuyMax ?? entry.leg.maxBuyPrice,
+        dynamicMoveMax: entry.dynamicMoveMax ?? null,
         maxPrice: entry.maxPrice,
+        sideProbability: entry.sideProbability ?? null,
+        modelEdge: entry.modelEdge ?? null,
       })),
       selectedLeg: {
         tokenId: leg.tokenId,
         bestBid: leg.bid,
         bestAsk: leg.ask,
         bookAgeMs: leg.bookAgeMs ?? null,
-        maxBuyPrice: leg.maxBuyPrice,
+        maxBuyPrice: selected.dynamicBuyMax ?? leg.maxBuyPrice,
+        dynamicMoveMax: selected.dynamicMoveMax ?? null,
         maxPrice,
+        sideProbability: selected.sideProbability ?? null,
+        modelEdge: selected.modelEdge ?? null,
       },
       ofiDecision,
+      probabilityModel,
     });
 
     await this._executeBuy({
