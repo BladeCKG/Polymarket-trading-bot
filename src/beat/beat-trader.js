@@ -1276,6 +1276,11 @@ export class BeatTrader {
               tokenId,
               response,
             });
+            this._publishOrderIssue({
+              side,
+              tradeStatus: 'buy rejected',
+              extra: { tokenId, orderMode: cfg.BEAT_ORDER_MODE, response },
+            });
             return;
           }
         } catch (err) {
@@ -1286,6 +1291,11 @@ export class BeatTrader {
             tokenId,
             err: err.message,
             stack: err.stack ?? null,
+          });
+          this._publishOrderIssue({
+            side,
+            tradeStatus: 'buy error',
+            extra: { tokenId, orderMode: cfg.BEAT_ORDER_MODE, err: err.message },
           });
           return;
         }
@@ -1429,6 +1439,11 @@ export class BeatTrader {
             tokenId,
             response,
           });
+          this._publishOrderIssue({
+            side,
+            tradeStatus: 'buy rejected',
+            extra: { tokenId, orderMode: cfg.BEAT_ORDER_MODE, response },
+          });
           return;
         }
         actualExecution = await this._resolveActualUsdcBuyExecution({
@@ -1449,6 +1464,11 @@ export class BeatTrader {
           err: err.message,
           stack: err.stack ?? null,
         });
+        this._publishOrderIssue({
+          side,
+          tradeStatus: 'buy error',
+          extra: { tokenId, orderMode: cfg.BEAT_ORDER_MODE, err: err.message },
+        });
         return;
       }
     }
@@ -1466,6 +1486,11 @@ export class BeatTrader {
         tokenId,
         execution,
         estimatedPlan: plan,
+      });
+      this._publishOrderIssue({
+        side,
+        tradeStatus: 'buy empty fill',
+        extra: { tokenId, orderMode: cfg.BEAT_ORDER_MODE, execution, estimatedPlan: plan },
       });
       return;
     }
@@ -1960,6 +1985,11 @@ export class BeatTrader {
             tokenId: candidate.tokenId,
             response,
           });
+          this._publishOrderIssue({
+            side: candidate.side,
+            tradeStatus: 'arb pair rejected',
+            extra: { tokenId: candidate.tokenId, orderMode: 'ARB_PAIR_SHARES', response },
+          });
           return false;
         }
       } catch (err) {
@@ -1970,6 +2000,11 @@ export class BeatTrader {
           tokenId: candidate.tokenId,
           err: err.message,
           stack: err.stack ?? null,
+        });
+        this._publishOrderIssue({
+          side: candidate.side,
+          tradeStatus: 'arb pair error',
+          extra: { tokenId: candidate.tokenId, orderMode: 'ARB_PAIR_SHARES', err: err.message },
         });
         return false;
       }
@@ -2312,6 +2347,18 @@ export class BeatTrader {
       }
     }
     return null;
+  }
+
+  _publishOrderIssue({ side = null, tradeStatus, extra = {} } = {}) {
+    this._publishTrade({
+      lifecycle: this.lifecycle ?? BEAT_LIFECYCLE.MONITORING,
+      tradeStatus,
+      chosenSide: side ?? this.tradeSummary?.chosenSide ?? null,
+      buyShares: this.tradeSummary?.buyShares ?? 0,
+      buyUsdc: this.tradeSummary?.buyUsdc ?? 0,
+      buyPrice: this.tradeSummary?.buyPrice ?? null,
+      ...extra,
+    });
   }
 
   async _resolveActualUsdcBuyExecution({
