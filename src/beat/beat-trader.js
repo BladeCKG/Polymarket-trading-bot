@@ -1166,36 +1166,27 @@ export class BeatTrader {
   async _executeBuy({ side, tokenId, book, bestBid, bestAsk, maxPrice, delta, btcPrice }) {
     const cfg = this.config;
     const remainingBudget = cfg.MAX_SPEND_PER_MARKET - this.totalSpent;
-    const reducesImbalance = this._buyReducesImbalance(side);
-    const positivePnlOverride = !reducesImbalance && remainingBudget < Number(cfg.BEAT_ORDER_SIZE_USDC ?? 0)
-      ? this._findPositivePnlOverridePlan({ side, book, maxPrice })
-      : null;
-    if (remainingBudget < 1 && !reducesImbalance && !positivePnlOverride) {
+    if (remainingBudget <= 1e-9) {
       this._recordAudit('decision_skip', {
-        reason: 'remaining-budget-too-low',
+        reason: 'max-spend-cap-reached',
         side,
-        reducesImbalance,
         remainingBudget,
         totalSpent: this.totalSpent,
+        maxSpendPerMarket: cfg.MAX_SPEND_PER_MARKET,
       });
       return;
     }
 
     if (cfg.BEAT_ORDER_MODE === 'SHARES') {
       const minSharesRequired = this._minSharesRequired(book, maxPrice);
-      const requestedShares = positivePnlOverride?.mode === 'SHARES'
-        ? Number(positivePnlOverride.requestedShares)
-        : reducesImbalance
-        ? cfg.BEAT_ORDER_SIZE_SHARES
-        : Math.min(
-          cfg.BEAT_ORDER_SIZE_SHARES,
-          remainingBudget / Math.max(bestAsk.price, 0.0001),
-        );
+      const requestedShares = Math.min(
+        cfg.BEAT_ORDER_SIZE_SHARES,
+        remainingBudget / Math.max(bestAsk.price, 0.0001),
+      );
       if (requestedShares <= 0) {
         this._recordAudit('decision_skip', {
           reason: 'requested-shares-nonpositive',
           side,
-          reducesImbalance,
           remainingBudget,
           bestAsk: bestAsk?.price ?? null,
           requestedShares,
@@ -1214,17 +1205,13 @@ export class BeatTrader {
         return;
       }
 
-      const plan = positivePnlOverride?.mode === 'SHARES'
-        ? positivePnlOverride.plan
-        : estimateSharesFromBook(book, maxPrice, requestedShares);
+      const plan = estimateSharesFromBook(book, maxPrice, requestedShares);
       this._recordAudit('order_plan', {
         side,
         orderMode: cfg.BEAT_ORDER_MODE,
         tokenId,
-        reducesImbalance,
         requestedShares,
         remainingBudget,
-        positivePnlOverride: positivePnlOverride?.mode === 'SHARES' ? positivePnlOverride : null,
         maxPrice,
         bestBid: bestBid ?? null,
         bestAsk: bestAsk ?? null,
@@ -1252,6 +1239,18 @@ export class BeatTrader {
           minSharesRequired,
           plan,
           maxPrice,
+        });
+        return;
+      }
+      if (plan.spentUsdc - remainingBudget > 1e-9) {
+        this._recordAudit('decision_skip', {
+          reason: 'max-spend-cap-would-be-exceeded',
+          side,
+          tokenId,
+          remainingBudget,
+          plan,
+          maxSpendPerMarket: cfg.MAX_SPEND_PER_MARKET,
+          totalSpent: this.totalSpent,
         });
         return;
       }
@@ -1346,16 +1345,11 @@ export class BeatTrader {
     }
 
     const minUsdcRequired = this._minUsdcRequired(book);
-    const amountUsdc = positivePnlOverride?.mode === 'USDC'
-      ? Number(positivePnlOverride.requestedUsdc)
-      : reducesImbalance
-      ? cfg.BEAT_ORDER_SIZE_USDC
-      : Math.min(cfg.BEAT_ORDER_SIZE_USDC, remainingBudget);
+    const amountUsdc = Math.min(cfg.BEAT_ORDER_SIZE_USDC, remainingBudget);
     if (amountUsdc <= 0) {
       this._recordAudit('decision_skip', {
         reason: 'amount-usdc-nonpositive',
         side,
-        reducesImbalance,
         remainingBudget,
         amountUsdc,
       });
@@ -1372,17 +1366,13 @@ export class BeatTrader {
       return;
     }
 
-    const plan = positivePnlOverride?.mode === 'USDC'
-      ? positivePnlOverride.plan
-      : ClobClient.estimateMarketBuyFillFromBook(book, maxPrice, amountUsdc, 0);
+    const plan = ClobClient.estimateMarketBuyFillFromBook(book, maxPrice, amountUsdc, 0);
     this._recordAudit('order_plan', {
       side,
       orderMode: cfg.BEAT_ORDER_MODE,
       tokenId,
-      reducesImbalance,
       requestedUsdc: amountUsdc,
       remainingBudget,
-      positivePnlOverride: positivePnlOverride?.mode === 'USDC' ? positivePnlOverride : null,
       maxPrice,
       bestBid: bestBid ?? null,
       bestAsk: bestAsk ?? null,
@@ -1399,6 +1389,19 @@ export class BeatTrader {
         amountUsdc,
         plan,
         maxPrice,
+      });
+      return;
+    }
+    if (plan.spentUsdc - remainingBudget > 1e-9) {
+      this._recordAudit('decision_skip', {
+        reason: 'max-spend-cap-would-be-exceeded',
+        side,
+        tokenId,
+        remainingBudget,
+        amountUsdc,
+        plan,
+        maxSpendPerMarket: cfg.MAX_SPEND_PER_MARKET,
+        totalSpent: this.totalSpent,
       });
       return;
     }
@@ -1960,6 +1963,18 @@ export class BeatTrader {
         tokenId: candidate.tokenId,
         targetShares,
         maxPrice: candidate.maxPrice,
+        plan,
+      });
+      return false;
+    }
+    if (plan.spentUsdc - remainingBudget > 1e-9) {
+      this._recordAudit('decision_skip', {
+        reason: 'arb-pair-max-spend-cap-would-be-exceeded',
+        side: candidate.side,
+        tokenId: candidate.tokenId,
+        remainingBudget,
+        totalSpent: this.totalSpent,
+        maxSpendPerMarket: cfg.MAX_SPEND_PER_MARKET,
         plan,
       });
       return false;
