@@ -290,6 +290,7 @@ export class BeatTrader {
     this.nextPairId = 1;
     this.openLots = { Up: [], Down: [] };
     this.pairedLots = [];
+    this._tokenFeeBpsCache = new Map();
     this._btcFeed = btcFeed;
     this._ownsBtcFeed = !btcFeed;
     this._btcFeedAttached = false;
@@ -354,7 +355,6 @@ export class BeatTrader {
         probabilityPairCostMax: cfg.BEAT_PROBABILITY_PAIR_COST_MAX,
         arbPairEnabled: cfg.BEAT_ARB_PAIR_ENABLED,
         arbPairCostMax: cfg.BEAT_ARB_PAIR_COST_MAX,
-        arbPairRequiredEdge: cfg.BEAT_ARB_PAIR_REQUIRED_EDGE,
         trendMinProbability: cfg.BEAT_TREND_MIN_PROBABILITY,
         trendMinSignalScore: cfg.BEAT_TREND_MIN_SIGNAL_SCORE,
         trendMoments: trendMomentsForConfig(this.market, cfg),
@@ -916,7 +916,57 @@ export class BeatTrader {
     return variance != null && variance > 0 ? Math.sqrt(variance) : null;
   }
 
-  _pairCompletionModel({ buySide, buyPrice, snapshot = {}, history = null } = {}) {
+  async _getTokenTakerFeeBps(tokenId) {
+    const key = String(tokenId ?? '').trim();
+    if (!key) return 0;
+    if (this._tokenFeeBpsCache.has(key)) {
+      return Number(this._tokenFeeBpsCache.get(key) ?? 0);
+    }
+    try {
+      const feeRateBps = Number(await ClobClient.getTakerFeeBps(key));
+      const normalized = Number.isFinite(feeRateBps) && feeRateBps > 0 ? feeRateBps : 0;
+      this._tokenFeeBpsCache.set(key, normalized);
+      return normalized;
+    } catch (err) {
+      this._recordAudit('token_fee_bps_lookup_failed', {
+        tokenId: key,
+        err: err.message,
+      });
+      this._tokenFeeBpsCache.set(key, 0);
+      return 0;
+    }
+  }
+
+  _pairFeeUsdc(shares, price, feeRateBps) {
+    return ClobClient.estimateTakerFeeUsdc({ shares, price, feeRateBps });
+  }
+
+  _pairTotalUnitCost(existingUnitCost, buyPrice, feeRateBps) {
+    const existing = Number(existingUnitCost);
+    const price = Number(buyPrice);
+    if (!Number.isFinite(existing) || !Number.isFinite(price) || price <= 0) return null;
+    return existing + price + this._pairFeeUsdc(1, price, feeRateBps);
+  }
+
+  _maxFeeAdjustedPairBuyPrice(existingUnitCost, feeRateBps, pairCostCap) {
+    const existing = Number(existingUnitCost);
+    const cap = Number(pairCostCap);
+    if (!Number.isFinite(existing) || !Number.isFinite(cap) || cap <= 0 || existing >= cap) {
+      return null;
+    }
+    let low = 0;
+    let high = Math.min(0.999999, cap - existing);
+    if (!(high > 0)) return null;
+    for (let i = 0; i < 40; i += 1) {
+      const mid = (low + high) / 2;
+      const totalUnitCost = this._pairTotalUnitCost(existing, mid, feeRateBps);
+      if (Number.isFinite(totalUnitCost) && totalUnitCost <= cap) low = mid;
+      else high = mid;
+    }
+    return low > 0 ? low : null;
+  }
+
+  async _pairCompletionModel({ buySide, buyPrice, snapshot = {}, history = null } = {}) {
     const cfg = this.config;
     if (!cfg.BEAT_PAIR_COMPLETION_ENABLED) {
       return null;
@@ -934,15 +984,20 @@ export class BeatTrader {
       oppositeSide === 'Up' ? snapshot.upBestAsk : snapshot.downBestAsk,
     );
     const pairCostThreshold = this._pairCostThreshold();
-    const targetOppositeAsk = Number.isFinite(pairCostThreshold)
-      ? pairCostThreshold - normalizedBuyPrice
-      : null;
+    const oppositeTokenId = oppositeSide === 'Up' ? this.market.upToken?.tokenId : this.market.downToken?.tokenId;
+    const oppositeFeeRateBps = await this._getTokenTakerFeeBps(oppositeTokenId);
+    const targetOppositeAsk = this._maxFeeAdjustedPairBuyPrice(
+      normalizedBuyPrice,
+      oppositeFeeRateBps,
+      pairCostThreshold,
+    );
     const secondsLeft = Math.max(1, ((this.market.windowTs + this.config.MARKET_WINDOW_SECONDS) * 1000 - nowMs) / 1000);
     if (!Number.isFinite(currentOppositeAsk) || !Number.isFinite(targetOppositeAsk) || targetOppositeAsk <= 0) {
       return {
         oppositeSide,
         currentOppositeAsk,
         targetOppositeAsk,
+        oppositeFeeRateBps,
         secondsLeft,
         completionProbability: 0,
         reason: 'missing-opposite-ask-or-target',
@@ -953,6 +1008,7 @@ export class BeatTrader {
         oppositeSide,
         currentOppositeAsk,
         targetOppositeAsk,
+        oppositeFeeRateBps,
         secondsLeft,
         completionProbability: 1,
         reason: 'already-pairable',
@@ -965,6 +1021,7 @@ export class BeatTrader {
         oppositeSide,
         currentOppositeAsk,
         targetOppositeAsk,
+        oppositeFeeRateBps,
         secondsLeft,
         completionProbability: 0,
         reason: 'insufficient-ask-history',
@@ -1004,6 +1061,7 @@ export class BeatTrader {
       oppositeSide,
       currentOppositeAsk,
       targetOppositeAsk,
+      oppositeFeeRateBps,
       secondsLeft,
       barrierLogDistance: Number.isFinite(barrierLogDistance) ? barrierLogDistance : null,
       sigmaPerSqrtSecond: askSigmaPerSqrtSecond,
@@ -1306,8 +1364,8 @@ export class BeatTrader {
       return;
     }
     const preferredSide = delta > 0 ? 'Up' : (delta < 0 ? 'Down' : null);
-    const candidateLegs = Object.entries(bookState)
-      .map(([side, leg]) => {
+    const candidateLegs = await Promise.all(Object.entries(bookState)
+      .map(async ([side, leg]) => {
         const sideProbability = probabilityModel
           ? (side === 'Up' ? probabilityModel.pUp : probabilityModel.pDown)
           : null;
@@ -1315,7 +1373,7 @@ export class BeatTrader {
           ? sideProbability - leg.ask.price
           : null;
         const pairCompletionModel = probabilityModel
-          ? this._pairCompletionModel({
+          ? await this._pairCompletionModel({
             buySide: side,
             buyPrice: leg.ask?.price,
             snapshot,
@@ -1371,7 +1429,7 @@ export class BeatTrader {
           return { side, leg, affordable: false, maxPrice, reason: 'clamped-price-below-ask', sideProbability, modelEdge, effectiveModelEdge, pairCompletionModel, dynamicBuyMax, dynamicMoveMax };
         }
         return { side, leg, affordable: true, maxPrice, reason: null, sideProbability, modelEdge, effectiveModelEdge, pairCompletionModel, dynamicBuyMax, dynamicMoveMax };
-      });
+      }));
 
     const affordableLegs = candidateLegs.filter((entry) => entry.affordable);
     if (!affordableLegs.length) {
@@ -2061,7 +2119,7 @@ export class BeatTrader {
     }
 
     const pairCompletionModel = probabilityModel
-      ? this._pairCompletionModel({
+      ? await this._pairCompletionModel({
         buySide: chosenSide,
         buyPrice: askPrice,
         snapshot,
@@ -2258,17 +2316,11 @@ export class BeatTrader {
 
   _pairCostThreshold() {
     const pairCostCap = Number(this.config.BEAT_ARB_PAIR_COST_MAX);
-    const requiredEdge = Number(this.config.BEAT_ARB_PAIR_REQUIRED_EDGE);
-    const edgeCostCap = Number.isFinite(requiredEdge) ? (1 - requiredEdge) : Infinity;
-    if (Number.isFinite(pairCostCap) && Number.isFinite(edgeCostCap)) {
-      return Math.min(pairCostCap, edgeCostCap);
-    }
     if (Number.isFinite(pairCostCap)) return pairCostCap;
-    if (Number.isFinite(edgeCostCap)) return edgeCostCap;
     return Infinity;
   }
 
-  _buildPerTradePairPlan(side, book) {
+  async _buildPerTradePairPlan(side, tokenId, book) {
     const asks = Array.isArray(book?.asks)
       ? [...book.asks]
         .filter((row) =>
@@ -2281,6 +2333,7 @@ export class BeatTrader {
     if (!asks.length) return null;
 
     const pairCostCap = this._pairCostThreshold();
+    const feeRateBps = await this._getTokenTakerFeeBps(tokenId);
     const eligibleLots = this._eligiblePairLots(side, Infinity)
       .map((group) => ({
         ...group,
@@ -2312,27 +2365,29 @@ export class BeatTrader {
         if (remainingAskShares <= 1e-9) break;
         if (group.remainingShares <= 1e-9) continue;
 
-        const pairCost = group.avgPrice + Number(ask.price);
+        const askPrice = Number(ask.price);
+        const pairCost = this._pairTotalUnitCost(group.avgPrice, askPrice, feeRateBps);
         if (!Number.isFinite(pairCost) || pairCost > pairCostCap) continue;
 
         const matchedShares = Math.min(group.remainingShares, remainingAskShares);
         if (matchedShares <= 1e-9) continue;
 
-        const spentAtAsk = matchedShares * Number(ask.price);
-        const pairCostUsdc = matchedShares * pairCost;
+        const spentAtAsk = matchedShares * askPrice;
+        const feeAtAsk = this._pairFeeUsdc(matchedShares, askPrice, feeRateBps);
+        const pairCostUsdc = (matchedShares * Number(group.avgPrice)) + spentAtAsk + feeAtAsk;
 
         fillShares += matchedShares;
         spentUsdc += spentAtAsk;
         totalPairCostUsdc += pairCostUsdc;
-        maxPrice = Math.max(maxPrice, Number(ask.price));
+        maxPrice = Math.max(maxPrice, askPrice);
         remainingAskShares -= matchedShares;
         group.remainingShares = roundShareAmount(group.remainingShares - matchedShares);
 
         fills.push({
-          price: Number(ask.price),
+          price: askPrice,
           shares: matchedShares,
           spentUsdc: spentAtAsk,
-          feeUsdc: 0,
+          feeUsdc: feeAtAsk,
         });
         matches.push({
           oppositeLotId: group.id,
@@ -2342,6 +2397,7 @@ export class BeatTrader {
           shares: matchedShares,
           pairCost,
           pairEdge: 1 - pairCost,
+          feeUsdc: feeAtAsk,
         });
       }
     }
@@ -2356,6 +2412,7 @@ export class BeatTrader {
       fullyFilled: true,
       fills,
       maxPrice,
+      feeRateBps,
       preview: {
         pairedShares: fillShares,
         totalCost: totalPairCostUsdc,
@@ -2363,14 +2420,17 @@ export class BeatTrader {
         pairEdge: 1 - averagePairCost,
         expectedProfitUsdc: fillShares - totalPairCostUsdc,
         matches,
+        feeRateBps,
       },
     };
   }
 
-  _pairingPreview(side, pairBuyPrice, targetShares = Infinity) {
+  async _pairingPreview(side, pairBuyPrice, targetShares = Infinity) {
     const remainingTarget = { value: Number.isFinite(Number(targetShares)) ? Math.max(0, Number(targetShares)) : Infinity };
     const oppositeSide = this._oppositeSide(side);
     const pairCostCap = this._pairCostThreshold();
+    const tokenId = side === 'Up' ? this.market.upToken?.tokenId : this.market.downToken?.tokenId;
+    const feeRateBps = await this._getTokenTakerFeeBps(tokenId);
     const matches = [];
     let pairedShares = 0;
     let totalCost = 0;
@@ -2379,20 +2439,21 @@ export class BeatTrader {
       if (remainingTarget.value <= 1e-9) break;
       const lotShares = Number(lot?.remainingShares ?? 0);
       const lotPrice = Number(lot?.avgPrice ?? 0);
-      if (lotShares <= 1e-9 || !Number.isFinite(lotPrice) || (lotPrice + pairBuyPrice) > pairCostCap) {
+      const pairCost = this._pairTotalUnitCost(lotPrice, pairBuyPrice, feeRateBps);
+      if (lotShares <= 1e-9 || !Number.isFinite(lotPrice) || !Number.isFinite(pairCost) || pairCost > pairCostCap) {
         continue;
       }
       const matchedShares = Math.min(lotShares, remainingTarget.value);
       if (matchedShares <= 1e-9) continue;
       pairedShares += matchedShares;
-      totalCost += matchedShares * (lotPrice + pairBuyPrice);
+      totalCost += (matchedShares * lotPrice) + (matchedShares * pairBuyPrice) + this._pairFeeUsdc(matchedShares, pairBuyPrice, feeRateBps);
       remainingTarget.value = remainingTarget.value === Infinity ? Infinity : (remainingTarget.value - matchedShares);
       matches.push({
         oppositeLotId: lot.id,
         oppositeSide,
         oppositePrice: lotPrice,
         shares: matchedShares,
-        pairCost: lotPrice + pairBuyPrice,
+        pairCost,
       });
     }
 
@@ -2402,16 +2463,17 @@ export class BeatTrader {
       averagePairCost: pairedShares > 0 ? totalCost / pairedShares : null,
       pairEdge: pairedShares > 0 ? (1 - (totalCost / pairedShares)) : null,
       matches,
+      feeRateBps,
     };
   }
 
-  _buildArbPairCandidate(side, leg, snapshot = {}) {
+  async _buildArbPairCandidate(side, leg, snapshot = {}) {
     const cfg = this.config;
     if (!cfg.BEAT_ARB_PAIR_ENABLED) return null;
     if (!leg?.ask || !Number.isFinite(Number(leg.ask.price))) return null;
     if (!Number.isFinite(leg.bookAgeMs) || leg.bookAgeMs > cfg.BEAT_BOOK_MAX_AGE_MS) return null;
 
-    const plan = this._buildPerTradePairPlan(side, leg.book);
+    const plan = await this._buildPerTradePairPlan(side, leg.tokenId, leg.book);
     if (!plan || plan.fillShares <= 1e-9 || plan.spentUsdc <= 0) return null;
 
     const preview = plan.preview;
@@ -2438,7 +2500,7 @@ export class BeatTrader {
     const cfg = this.config;
     if (!cfg.BEAT_ARB_PAIR_ENABLED) return false;
 
-    const candidates = [
+    const candidates = (await Promise.all([
       this._buildArbPairCandidate('Up', {
         tokenId: this.market.upToken.tokenId,
         book: this.latestQuotes.up?.book ?? null,
@@ -2453,7 +2515,7 @@ export class BeatTrader {
         ask: this.latestQuotes.down?.ask ?? null,
         bookAgeMs: bookAgeMs(this.latestQuotes.down?.book),
       }, snapshot),
-    ].filter(Boolean);
+    ])).filter(Boolean);
 
     if (!candidates.length) return false;
 
@@ -2472,7 +2534,6 @@ export class BeatTrader {
     this._recordAudit('arb_pair_candidate', {
       side: selected.side,
       pairCostCap: cfg.BEAT_ARB_PAIR_COST_MAX,
-      pairRequiredEdge: cfg.BEAT_ARB_PAIR_REQUIRED_EDGE,
       targetShares: selected.targetShares,
       bestAsk: selected.bestAsk?.price ?? null,
       maxPrice: selected.maxPrice,
@@ -2614,13 +2675,13 @@ export class BeatTrader {
       const fillPrice = Number(fill?.price);
       const fillShares = Number(fill?.shares);
       const fillSpentUsdc = Number(fill?.spentUsdc);
+      const fillFeeUsdc = Number(fill?.feeUsdc ?? 0);
       if (!Number.isFinite(fillPrice) || !Number.isFinite(fillShares) || !Number.isFinite(fillSpentUsdc) || fillPrice <= 0 || fillShares <= 0 || fillSpentUsdc <= 0) {
         return;
       }
-      this._recordBuy(candidate.side, fillPrice, fillShares, fillSpentUsdc, null, null, {
+      this._recordBuy(candidate.side, fillPrice, fillShares, fillSpentUsdc + (Number.isFinite(fillFeeUsdc) && fillFeeUsdc > 0 ? fillFeeUsdc : 0), null, null, {
         intent: 'arb-pair',
         pairCostCap: cfg.BEAT_ARB_PAIR_COST_MAX,
-        pairRequiredEdge: cfg.BEAT_ARB_PAIR_REQUIRED_EDGE,
         executionSource: execution.source ?? null,
         executionFillIndex: index + 1,
         executionFillCount: executionFills.length,
@@ -2641,7 +2702,6 @@ export class BeatTrader {
       spentUsdc: execution.spentUsdc,
       avgPrice: execution.avgFillPrice ?? (execution.spentUsdc / execution.fillShares),
       pairCostCap: cfg.BEAT_ARB_PAIR_COST_MAX,
-      pairRequiredEdge: cfg.BEAT_ARB_PAIR_REQUIRED_EDGE,
       projectedAveragePairCost: candidate.preview.averagePairCost,
       pairEdge: candidate.pairEdge,
     });
