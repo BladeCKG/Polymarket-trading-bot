@@ -908,6 +908,7 @@
       const moveAtBuy = market.moveAtBuyUsd;
       const moveAtBuyPct = market.moveAtBuyPct;
       const buyEvents = Array.isArray(market.buyEvents) ? market.buyEvents : [];
+      const pairEvents = Array.isArray(market.pairEvents) ? market.pairEvents : [];
       const buyRows = buyEvents.length
         ? buyEvents.map((buy, index) => {
             const buyMove = Number(buy?.moveAtBuyUsd ?? null);
@@ -926,6 +927,19 @@
               </div>
             `;
           }).join('')
+        : '';
+      const pairRows = pairEvents.length
+        ? pairEvents.map((pair, index) => `
+            <div class="buy-item">
+              <div class="head">
+                <span>Pair #${index + 1}</span>
+                <span>${Number(pair?.shares ?? 0).toFixed(4)} shares</span>
+              </div>
+              <div class="meta">
+                cost ${price(pair?.averagePairCost)} = Up ${price(pair?.upPrice)} + Down ${price(pair?.downPrice)}
+              </div>
+            </div>
+          `).join('')
         : '';
       return `
         <div class="settlement">
@@ -959,12 +973,34 @@
               <div class="label">Buy Count</div>
               <div class="value">${market.buyCount != null ? Number(market.buyCount) : '-'}</div>
             </div>
+            <div class="summary-box">
+              <div class="label">Paired Shares</div>
+              <div class="value">${Number(market.pairedShares ?? 0).toFixed(4)}</div>
+            </div>
+            <div class="summary-box">
+              <div class="label">Avg Pair Cost</div>
+              <div class="value">${price(market.averagePairedCost)}</div>
+            </div>
+            <div class="summary-box">
+              <div class="label">Unpaired Up</div>
+              <div class="value">${Number(market.unpairedUpShares ?? 0).toFixed(4)}</div>
+            </div>
+            <div class="summary-box">
+              <div class="label">Unpaired Down</div>
+              <div class="value">${Number(market.unpairedDownShares ?? 0).toFixed(4)}</div>
+            </div>
           </div>
         </div>
         ${buyRows ? `
           <div class="buy-history">
             <div class="title">Buy History</div>
             <div class="buy-list">${buyRows}</div>
+          </div>
+        ` : ''}
+        ${pairRows ? `
+          <div class="buy-history">
+            <div class="title">Pair History</div>
+            <div class="buy-list">${pairRows}</div>
           </div>
         ` : ''}
       `;
@@ -1266,10 +1302,11 @@
         : null;
       const buyEvents = Array.isArray(market.buyEvents) ? market.buyEvents : [];
       const totalBuyUsdc = buyEvents.reduce((sum, buy) => sum + Number(buy?.usdc ?? 0), 0);
-      const upShares = buyEvents.reduce((sum, buy) => sum + (buy?.side === 'Up' ? Number(buy?.shares ?? 0) : 0), 0);
-      const downShares = buyEvents.reduce((sum, buy) => sum + (buy?.side === 'Down' ? Number(buy?.shares ?? 0) : 0), 0);
-      const pnlIfUp = traded && !settled ? upShares - totalBuyUsdc : null;
-      const pnlIfDown = traded && !settled ? downShares - totalBuyUsdc : null;
+      const pairedShares = Number(market.pairedShares ?? 0);
+      const unpairedUpShares = Number(market.unpairedUpShares ?? 0);
+      const unpairedDownShares = Number(market.unpairedDownShares ?? 0);
+      const pnlIfUp = traded && !settled ? (pairedShares + unpairedUpShares - totalBuyUsdc) : null;
+      const pnlIfDown = traded && !settled ? (pairedShares + unpairedDownShares - totalBuyUsdc) : null;
       const moveLabel = settled ? null : `${symbol} Move`;
       const moveValueText = settled
         ? null
