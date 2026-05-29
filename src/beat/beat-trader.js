@@ -1164,7 +1164,10 @@ export class BeatTrader {
     const cfg = this.config;
     const remainingBudget = cfg.MAX_SPEND_PER_MARKET - this.totalSpent;
     const reducesImbalance = this._buyReducesImbalance(side);
-    if (remainingBudget < 1 && !reducesImbalance) {
+    const positivePnlOverride = !reducesImbalance && remainingBudget < Number(cfg.BEAT_ORDER_SIZE_USDC ?? 0)
+      ? this._findPositivePnlOverridePlan({ side, book, maxPrice })
+      : null;
+    if (remainingBudget < 1 && !reducesImbalance && !positivePnlOverride) {
       this._recordAudit('decision_skip', {
         reason: 'remaining-budget-too-low',
         side,
@@ -1176,7 +1179,10 @@ export class BeatTrader {
     }
 
     if (cfg.BEAT_ORDER_MODE === 'SHARES') {
-      const requestedShares = reducesImbalance
+      const minSharesRequired = this._minSharesRequired(book, maxPrice);
+      const requestedShares = positivePnlOverride?.mode === 'SHARES'
+        ? Number(positivePnlOverride.requestedShares)
+        : reducesImbalance
         ? cfg.BEAT_ORDER_SIZE_SHARES
         : Math.min(
           cfg.BEAT_ORDER_SIZE_SHARES,
@@ -1193,8 +1199,21 @@ export class BeatTrader {
         });
         return;
       }
+      if (requestedShares + 1e-9 < minSharesRequired) {
+        this._recordAudit('decision_skip', {
+          reason: 'requested-shares-below-minimum',
+          side,
+          requestedShares,
+          minSharesRequired,
+          bestAsk: bestAsk?.price ?? null,
+          maxPrice,
+        });
+        return;
+      }
 
-      const plan = estimateSharesFromBook(book, maxPrice, requestedShares);
+      const plan = positivePnlOverride?.mode === 'SHARES'
+        ? positivePnlOverride.plan
+        : estimateSharesFromBook(book, maxPrice, requestedShares);
       this._recordAudit('order_plan', {
         side,
         orderMode: cfg.BEAT_ORDER_MODE,
@@ -1202,6 +1221,7 @@ export class BeatTrader {
         reducesImbalance,
         requestedShares,
         remainingBudget,
+        positivePnlOverride: positivePnlOverride?.mode === 'SHARES' ? positivePnlOverride : null,
         maxPrice,
         bestBid: bestBid ?? null,
         bestAsk: bestAsk ?? null,
@@ -1216,6 +1236,17 @@ export class BeatTrader {
           side,
           tokenId,
           requestedShares,
+          plan,
+          maxPrice,
+        });
+        return;
+      }
+      if (plan.fillShares + 1e-9 < minSharesRequired) {
+        this._recordAudit('decision_skip', {
+          reason: 'share-plan-below-minimum',
+          side,
+          tokenId,
+          minSharesRequired,
           plan,
           maxPrice,
         });
@@ -1301,7 +1332,10 @@ export class BeatTrader {
       return;
     }
 
-    const amountUsdc = reducesImbalance
+    const minUsdcRequired = this._minUsdcRequired(book);
+    const amountUsdc = positivePnlOverride?.mode === 'USDC'
+      ? Number(positivePnlOverride.requestedUsdc)
+      : reducesImbalance
       ? cfg.BEAT_ORDER_SIZE_USDC
       : Math.min(cfg.BEAT_ORDER_SIZE_USDC, remainingBudget);
     if (amountUsdc <= 0) {
@@ -1314,8 +1348,20 @@ export class BeatTrader {
       });
       return;
     }
+    if (amountUsdc + 1e-9 < minUsdcRequired) {
+      this._recordAudit('decision_skip', {
+        reason: 'amount-usdc-below-minimum',
+        side,
+        amountUsdc,
+        minUsdcRequired,
+        remainingBudget,
+      });
+      return;
+    }
 
-    const plan = ClobClient.estimateMarketBuyFillFromBook(book, maxPrice, amountUsdc, 0);
+    const plan = positivePnlOverride?.mode === 'USDC'
+      ? positivePnlOverride.plan
+      : ClobClient.estimateMarketBuyFillFromBook(book, maxPrice, amountUsdc, 0);
     this._recordAudit('order_plan', {
       side,
       orderMode: cfg.BEAT_ORDER_MODE,
@@ -1323,6 +1369,7 @@ export class BeatTrader {
       reducesImbalance,
       requestedUsdc: amountUsdc,
       remainingBudget,
+      positivePnlOverride: positivePnlOverride?.mode === 'USDC' ? positivePnlOverride : null,
       maxPrice,
       bestBid: bestBid ?? null,
       bestAsk: bestAsk ?? null,
@@ -1336,6 +1383,18 @@ export class BeatTrader {
         reason: 'usdc-plan-not-fillable',
         side,
         tokenId,
+        amountUsdc,
+        plan,
+        maxPrice,
+      });
+      return;
+    }
+    if (plan.spentUsdc + 1e-9 < minUsdcRequired) {
+      this._recordAudit('decision_skip', {
+        reason: 'usdc-plan-below-minimum',
+        side,
+        tokenId,
+        minUsdcRequired,
         amountUsdc,
         plan,
         maxPrice,
@@ -2103,6 +2162,125 @@ export class BeatTrader {
     if (side === 'Up') return imbalance < -1e-9;
     if (side === 'Down') return imbalance > 1e-9;
     return false;
+  }
+
+  _minUsdcRequired(book = null) {
+    const cfgMin = Number(this.config.BEAT_MIN_BUY_USDC);
+    const bookMin = Number(book?.minOrderSize);
+    const values = [cfgMin, bookMin].filter((value) => Number.isFinite(value) && value > 0);
+    return values.length ? Math.max(...values) : 0;
+  }
+
+  _minSharesRequired(book = null, price = null) {
+    const cfgMin = Number(this.config.BEAT_MIN_BUY_SHARES);
+    const minUsdc = this._minUsdcRequired(book);
+    const refPrice = Number(price);
+    const impliedShares = Number.isFinite(refPrice) && refPrice > 0
+      ? minUsdc / refPrice
+      : 0;
+    const values = [cfgMin, impliedShares].filter((value) => Number.isFinite(value) && value > 0);
+    return values.length ? Math.max(...values) : 0;
+  }
+
+  _simulatePnlAfterBuy(side, shares, spentUsdc) {
+    const lotState = this._lotState();
+    const buyShares = Number(shares);
+    const buySpentUsdc = Number(spentUsdc);
+    if (!Number.isFinite(buyShares) || !Number.isFinite(buySpentUsdc) || buyShares <= 0 || buySpentUsdc <= 0) {
+      return null;
+    }
+
+    let pairedShares = Number(lotState.pairedShares ?? 0);
+    let unpairedUpShares = Number(lotState.unpairedUpShares ?? 0);
+    let unpairedDownShares = Number(lotState.unpairedDownShares ?? 0);
+
+    if (side === 'Up') {
+      const pairedNow = Math.min(unpairedDownShares, buyShares);
+      pairedShares += pairedNow;
+      unpairedDownShares -= pairedNow;
+      unpairedUpShares += Math.max(0, buyShares - pairedNow);
+    } else if (side === 'Down') {
+      const pairedNow = Math.min(unpairedUpShares, buyShares);
+      pairedShares += pairedNow;
+      unpairedUpShares -= pairedNow;
+      unpairedDownShares += Math.max(0, buyShares - pairedNow);
+    } else {
+      return null;
+    }
+
+    const totalSpent = this.totalSpent + buySpentUsdc;
+    const pnlIfUp = pairedShares + unpairedUpShares - totalSpent;
+    const pnlIfDown = pairedShares + unpairedDownShares - totalSpent;
+    const positiveBoth = pnlIfUp > 0 && pnlIfDown > 0;
+
+    return {
+      pairedShares,
+      unpairedUpShares,
+      unpairedDownShares,
+      totalSpent,
+      pnlIfUp,
+      pnlIfDown,
+      positiveBoth,
+    };
+  }
+
+  _findPositivePnlOverridePlan({ side, book, maxPrice }) {
+    const cfg = this.config;
+    const fractions = [1, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.25, 0.2, 0.15, 0.1, 0.05];
+
+    if (cfg.BEAT_ORDER_MODE === 'SHARES') {
+      const baseShares = Number(cfg.BEAT_ORDER_SIZE_SHARES);
+      const minSharesRequired = this._minSharesRequired(book, maxPrice);
+      if (!Number.isFinite(baseShares) || baseShares <= 0) {
+        return null;
+      }
+      for (const fraction of fractions) {
+        const requestedShares = Math.max(0, baseShares * fraction);
+        if (requestedShares + 1e-9 < minSharesRequired) {
+          continue;
+        }
+        const plan = estimateSharesFromBook(book, maxPrice, requestedShares);
+        if (!plan?.fullyFilled || plan.fillShares <= 0 || plan.spentUsdc <= 0 || plan.fillShares + 1e-9 < minSharesRequired) {
+          continue;
+        }
+        const simulation = this._simulatePnlAfterBuy(side, plan.fillShares, plan.spentUsdc);
+        if (simulation?.positiveBoth) {
+          return {
+            mode: 'SHARES',
+            requestedShares,
+            plan,
+            simulation,
+          };
+        }
+      }
+      return null;
+    }
+
+    const baseUsdc = Number(cfg.BEAT_ORDER_SIZE_USDC);
+    const minUsdcRequired = this._minUsdcRequired(book);
+    if (!Number.isFinite(baseUsdc) || baseUsdc <= 0) {
+      return null;
+    }
+    for (const fraction of fractions) {
+      const requestedUsdc = Math.max(0.01, Math.round(baseUsdc * fraction * 100) / 100);
+      if (requestedUsdc + 1e-9 < minUsdcRequired) {
+        continue;
+      }
+      const plan = ClobClient.estimateMarketBuyFillFromBook(book, maxPrice, requestedUsdc, 0);
+      if (!plan || plan.fillShares <= 0 || plan.spentUsdc <= 0 || plan.spentUsdc + 1e-9 < minUsdcRequired) {
+        continue;
+      }
+      const simulation = this._simulatePnlAfterBuy(side, plan.fillShares, plan.spentUsdc);
+      if (simulation?.positiveBoth) {
+        return {
+          mode: 'USDC',
+          requestedUsdc,
+          plan,
+          simulation,
+        };
+      }
+    }
+    return null;
   }
 
   async _cancelAllOrders(conditionId) {
