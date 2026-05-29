@@ -94,6 +94,18 @@ function positiveFiniteOrNull(value) {
   return Number.isFinite(num) && num > 0 ? num : null;
 }
 
+function bookAgeMs(book, nowMs = Date.now()) {
+  const sourceTs = Number(book?.sourceTimestampMs);
+  if (Number.isFinite(sourceTs) && sourceTs > 0) {
+    return Math.max(0, nowMs - sourceTs);
+  }
+  const fetchedTs = Number(book?.fetchedAtMs);
+  if (Number.isFinite(fetchedTs) && fetchedTs > 0) {
+    return Math.max(0, nowMs - fetchedTs);
+  }
+  return Infinity;
+}
+
 export class BeatTrader {
   constructor(market, wallet, pnl, { dashboard = null, btcFeed = null, bookFeed = null, config = null, onSettled = null } = {}) {
     this.market = market;
@@ -466,6 +478,7 @@ export class BeatTrader {
   }
 
   async _snapshotMarketState() {
+    const snapshotAtMs = Date.now();
     const [upBook, downBook] = await Promise.all([
       ClobClient.getBook(this.market.upToken.tokenId),
       ClobClient.getBook(this.market.downToken.tokenId),
@@ -500,8 +513,10 @@ export class BeatTrader {
     return {
       upBestBid: upBid?.price ?? null,
       upBestAsk: upAsk?.price ?? null,
+      upBookAgeMs: bookAgeMs(upBook, snapshotAtMs),
       downBestBid: downBid?.price ?? null,
       downBestAsk: downAsk?.price ?? null,
+      downBookAgeMs: bookAgeMs(downBook, snapshotAtMs),
       beatPrice,
       btcPrice,
       chartPoint,
@@ -589,6 +604,7 @@ export class BeatTrader {
         book: this.latestQuotes.up?.book ?? null,
         bid: this.latestQuotes.up?.bid ?? null,
         ask: this.latestQuotes.up?.ask ?? null,
+        bookAgeMs: bookAgeMs(this.latestQuotes.up?.book),
         maxBuyPrice: resolvedBuyMax,
       },
       Down: {
@@ -596,6 +612,7 @@ export class BeatTrader {
         book: this.latestQuotes.down?.book ?? null,
         bid: this.latestQuotes.down?.bid ?? null,
         ask: this.latestQuotes.down?.ask ?? null,
+        bookAgeMs: bookAgeMs(this.latestQuotes.down?.book),
         maxBuyPrice: resolvedBuyMax,
       },
     };
@@ -621,6 +638,9 @@ export class BeatTrader {
         if (!leg.ask) {
           return { side, leg, affordable: false, maxPrice: null, reason: 'missing-best-ask' };
         }
+        if (!Number.isFinite(leg.bookAgeMs) || leg.bookAgeMs > cfg.BEAT_BOOK_MAX_AGE_MS) {
+          return { side, leg, affordable: false, maxPrice: null, reason: 'stale-book' };
+        }
         if (leg.ask.price > leg.maxBuyPrice) {
           return { side, leg, affordable: false, maxPrice: null, reason: 'ask-above-buy-max' };
         }
@@ -644,6 +664,7 @@ export class BeatTrader {
           side: entry.side,
           reason: entry.reason,
           askPrice: entry.leg.ask?.price ?? null,
+          bookAgeMs: entry.leg.bookAgeMs ?? null,
           maxBuyPrice: entry.leg.maxBuyPrice,
           maxPrice: entry.maxPrice,
         })),
@@ -719,6 +740,7 @@ export class BeatTrader {
         affordable: entry.affordable,
         reason: entry.reason,
         askPrice: entry.leg.ask?.price ?? null,
+        bookAgeMs: entry.leg.bookAgeMs ?? null,
         maxBuyPrice: entry.leg.maxBuyPrice,
         maxPrice: entry.maxPrice,
       })),
@@ -726,6 +748,7 @@ export class BeatTrader {
         tokenId: leg.tokenId,
         bestBid: leg.bid,
         bestAsk: leg.ask,
+        bookAgeMs: leg.bookAgeMs ?? null,
         maxBuyPrice: leg.maxBuyPrice,
         maxPrice,
       },

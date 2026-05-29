@@ -77,6 +77,18 @@ function getRoundConfig(tickSize) {
   return ROUNDING_CONFIG[String(tickSize)] ?? ROUNDING_CONFIG['0.01'];
 }
 
+function parseTimestampMs(value) {
+  const num = Number(value);
+  if (Number.isFinite(num) && num > 0) {
+    return num > 1e12 ? num : num * 1000;
+  }
+  if (typeof value === 'string') {
+    const parsed = Date.parse(value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return null;
+}
+
 // ── HMAC auth headers (for all trading endpoints) ────────────────────────────
 function buildHeaders(method, path, body = '') {
   if (!ClobClient._creds) throw new Error('CLOB credentials not initialised — call ClobClient.init() first');
@@ -441,6 +453,7 @@ export class ClobClient {
    * minOrderSize – minimum order size in USDC (typically 5).
    */
   static async getBook(tokenId, { quietNotFound = false } = {}) {
+    const fetchCompletedAtMs = Date.now();
     const raw = await restCall(
       'GET',
       `/book?token_id=${tokenId}`,
@@ -448,11 +461,19 @@ export class ClobClient {
       false,
       quietNotFound ? { quietStatuses: [404] } : {},
     );
+    const sourceTimestampMs =
+      parseTimestampMs(raw?.timestamp)
+      ?? parseTimestampMs(raw?.time)
+      ?? parseTimestampMs(raw?.updated_at)
+      ?? parseTimestampMs(raw?.last_updated_at)
+      ?? parseTimestampMs(raw?.created_at);
     return {
       bids:         (raw.bids ?? []).map(b => ({ price: parseFloat(b.price), size: parseFloat(b.size) })),
       asks:         (raw.asks ?? []).map(a => ({ price: parseFloat(a.price), size: parseFloat(a.size) })),
       tickSize:     parseFloat(raw.tick_size    ?? '0.01'),
       minOrderSize: parseFloat(raw.min_order_size ?? '5'),
+      fetchedAtMs: fetchCompletedAtMs,
+      sourceTimestampMs,
     };
   }
 
