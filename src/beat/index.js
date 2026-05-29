@@ -109,6 +109,7 @@ export async function main() {
     : ['BTC'];
   const priceFeeds = new Map();
   const primaryPriceFeeds = new Map();
+  const primaryPriceHistories = new Map();
   let dashboard = null;
   const beatSessionStats = {
     settledMarkets: 0,
@@ -169,6 +170,15 @@ export async function main() {
       });
       feed.on('tick', (tick) => {
         dashboard?.recordPrice({ ...tick, symbol, source });
+        if (primaryPriceFeeds.get(symbol) === feed && Number.isFinite(Number(tick?.price)) && Number.isFinite(Number(tick?.timeMs))) {
+          const history = primaryPriceHistories.get(symbol) ?? [];
+          history.push({
+            timeMs: Number(tick.timeMs),
+            price: Number(tick.price),
+          });
+          const keepAfterMs = Date.now() - 120_000;
+          primaryPriceHistories.set(symbol, history.filter((entry) => Number(entry?.timeMs ?? 0) >= keepAfterMs));
+        }
       });
       feed.on('error', (err) => {
         logger.warn('Beat main: price feed error', { symbol, source, err: err.message });
@@ -331,6 +341,7 @@ export async function main() {
         btcFeed: symbolFeed,
         config: beatConfig,
         onSettled: recordSettledMarketStats,
+        btcHistoryProvider: () => primaryPriceHistories.get(symbol) ?? [],
       });
       const task = trader.run()
         .then(() => {

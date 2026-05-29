@@ -124,7 +124,12 @@ function bookAgeMs(book, nowMs = Date.now()) {
 }
 
 export class BeatTrader {
-  constructor(market, wallet, pnl, { dashboard = null, btcFeed = null, bookFeed = null, config = null, onSettled = null } = {}) {
+  constructor(
+    market,
+    wallet,
+    pnl,
+    { dashboard = null, btcFeed = null, bookFeed = null, config = null, onSettled = null, btcHistoryProvider = null } = {},
+  ) {
     this.market = market;
     this.wallet = wallet;
     this.pnl = pnl;
@@ -156,6 +161,7 @@ export class BeatTrader {
     this._btcFeed = btcFeed;
     this._ownsBtcFeed = !btcFeed;
     this._btcFeedAttached = false;
+    this._btcHistoryProvider = typeof btcHistoryProvider === 'function' ? btcHistoryProvider : null;
     this._bookFeed = bookFeed;
     this._ownsBookFeed = !bookFeed;
     this._bookFeedAttached = false;
@@ -257,6 +263,7 @@ export class BeatTrader {
       }
 
       await this._primeCurrentBtcTick();
+      this._seedSignalHistoryFromBtcHistory();
 
       // Determine first allowed buy time from the symbol-specific moments.
       const firstAllowedMs = (windowTs + firstStart) * 1000;
@@ -298,7 +305,22 @@ export class BeatTrader {
     }
 
     this.lifecycle = BEAT_LIFECYCLE.RESOLVING;
-    await this._redeemPhase(conditionId, windowClose);
+    const settled = await this._redeemPhase(conditionId, windowClose);
+    if (!settled) {
+      this.log.warn('BeatTrader: resolution still pending, market not marked settled', {
+        beatPrice: this.beatPrice,
+        totalSpent: this.totalSpent.toFixed(4),
+        redeemedUsdc: this.redeemedUsdc.toFixed(4),
+      });
+      this._recordAudit('market_resolution_pending', {
+        beatPrice: this.beatPrice,
+        totalSpent: this.totalSpent,
+        redeemedUsdc: this.redeemedUsdc,
+        tradeSummary: this.tradeSummary,
+        outcome: this.lastOutcome,
+      });
+      return;
+    }
 
     this.lifecycle = BEAT_LIFECYCLE.SETTLED;
     this.log.info('BeatTrader: market complete', {
@@ -577,6 +599,64 @@ export class BeatTrader {
     this.signalHistory = this.signalHistory.filter((entry) => Number(entry?.timestampMs ?? 0) >= keepAfterMs);
   }
 
+  _seedSignalHistoryFromBtcHistory(nowMs = Date.now()) {
+    if (!Number.isFinite(Number(this.beatPrice))) return;
+    const historyWindowMs = Math.max(15_000, Number(this.config.BEAT_PROBABILITY_HISTORY_MS) || 15_000);
+    const rawHistory = Array.isArray(this._btcHistoryProvider?.()) ? this._btcHistoryProvider() : [];
+    if (!rawHistory.length) return;
+
+    const keepAfterMs = nowMs - historyWindowMs;
+    const seeded = rawHistory
+      .map((entry) => ({
+        timestampMs: Number(entry?.timeMs),
+        price: Number(entry?.price),
+      }))
+      .filter((entry) => Number.isFinite(entry.timestampMs) && Number.isFinite(entry.price) && entry.timestampMs >= keepAfterMs && entry.timestampMs <= nowMs)
+      .sort((a, b) => a.timestampMs - b.timestampMs)
+      .map((entry) => ({
+        timestampMs: entry.timestampMs,
+        move: entry.price - Number(this.beatPrice),
+        upAsk: null,
+        downAsk: null,
+      }));
+
+    if (!seeded.length) return;
+
+    const merged = [...this.signalHistory, ...seeded]
+      .sort((a, b) => Number(a?.timestampMs ?? 0) - Number(b?.timestampMs ?? 0));
+    const deduped = [];
+    for (const entry of merged) {
+      const ts = Number(entry?.timestampMs ?? 0);
+      if (!Number.isFinite(ts)) continue;
+      const prev = deduped[deduped.length - 1];
+      if (prev && Math.abs(Number(prev.timestampMs) - ts) <= 1) {
+        deduped[deduped.length - 1] = {
+          timestampMs: ts,
+          move: Number.isFinite(Number(entry.move)) ? Number(entry.move) : prev.move,
+          upAsk: entry.upAsk ?? prev.upAsk ?? null,
+          downAsk: entry.downAsk ?? prev.downAsk ?? null,
+        };
+        continue;
+      }
+      deduped.push({
+        timestampMs: ts,
+        move: Number.isFinite(Number(entry.move)) ? Number(entry.move) : null,
+        upAsk: entry.upAsk ?? null,
+        downAsk: entry.downAsk ?? null,
+      });
+    }
+    this.signalHistory = deduped.filter((entry) => Number(entry?.timestampMs ?? 0) >= keepAfterMs);
+  }
+
+  _hasGuaranteedProbabilityHistory(nowMs = Date.now()) {
+    const historyWindowMs = Math.max(15_000, Number(this.config.BEAT_PROBABILITY_HISTORY_MS) || 15_000);
+    if (!this.signalHistory.length) return false;
+    const earliestTs = Number(this.signalHistory[0]?.timestampMs ?? 0);
+    const latestTs = Number(this.signalHistory[this.signalHistory.length - 1]?.timestampMs ?? 0);
+    if (!Number.isFinite(earliestTs) || !Number.isFinite(latestTs)) return false;
+    return earliestTs <= (nowMs - historyWindowMs) && latestTs <= nowMs;
+  }
+
   _sampleAgo(msAgo, nowMs = Date.now()) {
     const cutoffMs = nowMs - msAgo;
     for (let i = this.signalHistory.length - 1; i >= 0; i -= 1) {
@@ -591,6 +671,9 @@ export class BeatTrader {
   _probabilityModel(snapshot = {}) {
     const nowMs = Number(snapshot.snapshotAtMs ?? Date.now());
     const historyWindowMs = Math.max(15_000, Number(this.config.BEAT_PROBABILITY_HISTORY_MS) || 15_000);
+    if (!this._hasGuaranteedProbabilityHistory(nowMs)) {
+      return null;
+    }
     const checkpointsMs = [
       3_000,
       6_000,
@@ -629,6 +712,7 @@ export class BeatTrader {
       (0.3 * accelerationMid) +
       (0.2 * accelerationSlow)
     );
+    const momentumComposite = velocityComposite + (0.5 * accelerationComposite);
 
     const upOfi = this.ofi.snapshotFor(this.market.upToken.tokenId, nowMs);
     const downOfi = this.ofi.snapshotFor(this.market.downToken.tokenId, nowMs);
@@ -641,6 +725,7 @@ export class BeatTrader {
     const velocity10To15Feature = clamp(velocity10To15 / 2, -1, 1);
     const velocityCompositeFeature = clamp(velocityComposite / 2, -1, 1);
     const accelerationFeature = clamp(accelerationComposite / 2, -1, 1);
+    const momentumFeature = clamp(momentumComposite / 2, -1, 1);
     const ofiFeature = clamp(ofiDiff / 200, -1, 1);
     const upCheapness = Number.isFinite(upAsk) ? clamp((0.5 - upAsk) / 0.25, -1, 1) : -1;
     const downCheapness = Number.isFinite(downAsk) ? clamp((0.5 - downAsk) / 0.25, -1, 1) : -1;
@@ -655,6 +740,7 @@ export class BeatTrader {
       (0.08 * velocity10To15Feature) +
       (0.18 * velocityCompositeFeature) +
       (0.25 * accelerationFeature) +
+      (0.12 * momentumFeature) +
       (0.45 * ofiFeature) +
       (0.55 * upCheapness) +
       (0.45 * pairFeature) +
@@ -667,6 +753,7 @@ export class BeatTrader {
       (-0.08 * velocity10To15Feature) +
       (-0.18 * velocityCompositeFeature) +
       (-0.25 * accelerationFeature) +
+      (-0.12 * momentumFeature) +
       (-0.45 * ofiFeature) +
       (0.55 * downCheapness) +
       (0.45 * pairFeature) +
@@ -692,6 +779,7 @@ export class BeatTrader {
         accelerationMid,
         accelerationSlow,
         accelerationComposite,
+        momentumComposite,
         ofiDiff,
         upCheapness,
         downCheapness,
@@ -765,6 +853,15 @@ export class BeatTrader {
 
     const delta = tick.price - this.beatPrice;
     const probabilityModel = cfg.BEAT_PROBABILITY_ENABLED ? this._probabilityModel(snapshot) : null;
+    if (cfg.BEAT_PROBABILITY_ENABLED && !probabilityModel) {
+      this._recordAudit('decision_skip', {
+        reason: 'insufficient-btc-history',
+        requiredHistoryMs: cfg.BEAT_PROBABILITY_HISTORY_MS,
+        availableFromMs: Number(this.signalHistory[0]?.timestampMs ?? null),
+        snapshotAtMs: Number(snapshot?.snapshotAtMs ?? Date.now()),
+      });
+      return;
+    }
     // Determine per-moment thresholds (seconds after market open)
     const secondsAfterOpen = Math.floor(Date.now() / 1000) - this.market.windowTs;
     const trendMoments = trendMomentsForConfig(this.market, cfg);
@@ -1324,14 +1421,18 @@ export class BeatTrader {
     const accelerationDirectional = probabilityModel
       ? directionSign * Number(probabilityModel.features?.accelerationComposite ?? 0)
       : null;
+    const momentumDirectional = probabilityModel
+      ? directionSign * Number(probabilityModel.features?.momentumComposite ?? 0)
+      : null;
     const ofiDirectional = probabilityModel
       ? directionSign * Number(probabilityModel.features?.ofiDiff ?? 0)
       : null;
     const trendSignalScore = probabilityModel
       ? (
           (0.45 * clamp(((chosenProbability ?? 0) - 0.5) / 0.25, -1, 1)) +
-          (0.25 * clamp((velocityDirectional ?? 0) / 2, -1, 1)) +
-          (0.15 * clamp((accelerationDirectional ?? 0) / 2, -1, 1)) +
+          (0.30 * clamp((momentumDirectional ?? 0) / 2, -1, 1)) +
+          (0.15 * clamp((velocityDirectional ?? 0) / 2, -1, 1)) +
+          (0.10 * clamp((accelerationDirectional ?? 0) / 2, -1, 1)) +
           (0.15 * clamp((ofiDirectional ?? 0) / 200, -1, 1))
         )
       : null;
@@ -1356,6 +1457,7 @@ export class BeatTrader {
           trendMoment,
           chosenProbability,
           probabilityEdge,
+          momentumDirectional,
           velocityDirectional,
           accelerationDirectional,
           ofiDirectional,
@@ -1448,6 +1550,7 @@ export class BeatTrader {
         ofiDecision,
         chosenProbability,
         probabilityEdge,
+        momentumDirectional,
         velocityDirectional,
         accelerationDirectional,
         ofiDirectional,
@@ -1468,6 +1571,7 @@ export class BeatTrader {
       maxPrice,
       chosenProbability,
       probabilityEdge,
+      momentumDirectional,
       velocityDirectional,
       accelerationDirectional,
       ofiDirectional,
@@ -2038,17 +2142,66 @@ export class BeatTrader {
     }
 
     let resolvedMarket = null;
-    try {
-      resolvedMarket = await waitForResolution(this.market, 400_000, 10_000);
-    } catch (err) {
-      this.log.warn('BeatTrader: resolution poll timed out, redeeming anyway', { err: err.message });
-      this._recordAudit('resolution_timeout', { err: err.message });
+    let resolutionAttempt = 0;
+    while (!resolvedMarket) {
+      resolutionAttempt += 1;
+      try {
+        resolvedMarket = await waitForResolution(this.market, 400_000, 10_000);
+      } catch (err) {
+        this.log.warn('BeatTrader: resolution poll timed out, retrying', {
+          attempt: resolutionAttempt,
+          err: err.message,
+        });
+        this._recordAudit('resolution_timeout', {
+          attempt: resolutionAttempt,
+          err: err.message,
+        });
+        this._publishMarket({
+          lifecycle: BEAT_LIFECYCLE.RESOLVING,
+          settled: false,
+          outcome: null,
+          pnl: null,
+          tradeStatus: `resolution pending (retry ${resolutionAttempt})`,
+          chosenSide: this.tradeSummary?.chosenSide ?? null,
+          buyShares: this.tradeSummary?.buyShares ?? 0,
+          buyUsdc: this.tradeSummary?.buyUsdc ?? 0,
+          buyPrice: this.tradeSummary?.buyPrice ?? null,
+          tradeOccurred: Boolean(this.tradeSummary?.buyShares > 0),
+        });
+      }
     }
 
     const outcome = this._resolveOutcome(resolvedMarket);
     this.lastOutcome = outcome;
-    this.lastSettledAt = Date.now();
     const estimatedPayout = this._estimateRedeemPayout(resolvedMarket);
+    if (!outcome || !Number.isFinite(estimatedPayout)) {
+      this._recordAudit('settlement_pending', {
+        reason: !outcome ? 'unknown-outcome' : 'unknown-payout',
+        resolvedPayouts: resolvedMarket?.resolvedPayouts ?? null,
+        outcome,
+        estimatedPayout,
+        balances: {
+          up: this.balanceUp,
+          down: this.balanceDown,
+        },
+        tradeSummary: this.tradeSummary,
+      });
+      this._publishMarket({
+        lifecycle: BEAT_LIFECYCLE.RESOLVING,
+        settled: false,
+        outcome: null,
+        pnl: null,
+        tradeStatus: 'resolution pending',
+        chosenSide: this.tradeSummary?.chosenSide ?? null,
+        buyShares: this.tradeSummary?.buyShares ?? 0,
+        buyUsdc: this.tradeSummary?.buyUsdc ?? 0,
+        buyPrice: this.tradeSummary?.buyPrice ?? null,
+        tradeOccurred: Boolean(this.tradeSummary?.buyShares > 0),
+      });
+      return false;
+    }
+
+    this.lastSettledAt = Date.now();
     const marketPnl = estimatedPayout - this.totalSpent;
     this.redeemedUsdc += estimatedPayout;
 
@@ -2086,7 +2239,7 @@ export class BeatTrader {
     });
 
     if (cfg.BEAT_DRY_RUN) {
-      this.pnl.recordRedeem(this.market.slug, marketPnl, 'dry-run');
+      this.pnl.recordRedeem(this.market.slug, estimatedPayout, 'dry-run');
       this.log.info('BeatTrader: dry-run settlement simulated', {
         outcome,
         estimatedPayout,
@@ -2100,26 +2253,26 @@ export class BeatTrader {
         estimatedPayout,
         marketPnl,
       });
-      return;
+      return true;
     }
 
     const totalHeld = this.balanceUp + this.balanceDown;
     if (totalHeld < 0.001) {
       this.log.info('BeatTrader: no tokens to redeem');
-      this.pnl.recordRedeem(this.market.slug, marketPnl, 'none');
+      this.pnl.recordRedeem(this.market.slug, estimatedPayout, 'none');
       this._recordAudit('redeem_skipped', {
         reason: 'no-tokens-held',
         totalHeld,
         outcome,
         estimatedPayout,
       });
-      return;
+      return true;
     }
 
     try {
       this._recordAudit('redeem_submit', { conditionId, totalHeld, outcome });
       const txHash = await redeemPositions(conditionId);
-      this.pnl.recordRedeem(this.market.slug, marketPnl, txHash);
+      this.pnl.recordRedeem(this.market.slug, estimatedPayout, txHash);
       this.log.info('BeatTrader: redeemed winning position', {
         txHash,
         estimatedPayout,
@@ -2137,6 +2290,7 @@ export class BeatTrader {
         upHeld: this.balanceUp,
         downHeld: this.balanceDown,
       });
+      return true;
     } catch (err) {
       this.log.error('BeatTrader: redeem failed', { err: err.message });
       this._recordAudit('redeem_error', {
@@ -2144,6 +2298,7 @@ export class BeatTrader {
         err: err.message,
         stack: err.stack ?? null,
       });
+      return false;
     }
   }
 
@@ -2198,7 +2353,7 @@ export class BeatTrader {
       }
       return (this.balanceUp * Number(payouts[0] ?? 0)) + (this.balanceDown * Number(payouts[1] ?? 0));
     }
-    return Math.max(this.balanceUp, this.balanceDown);
+    return null;
   }
 
   _publishTrade(patch = {}) {
