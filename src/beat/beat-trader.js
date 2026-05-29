@@ -111,6 +111,60 @@ function roundShareAmount(value, precision = 1e-9) {
   return Math.abs(num) <= precision ? 0 : num;
 }
 
+function reconstructActualFillsFromEstimate(estimatedPlan, actualShares, actualSpentUsdc) {
+  const fills = Array.isArray(estimatedPlan?.fills) ? estimatedPlan.fills : [];
+  let remainingShares = Number(actualShares);
+  let remainingSpentUsdc = Number(actualSpentUsdc);
+  if (!Number.isFinite(remainingShares) || !Number.isFinite(remainingSpentUsdc) || remainingShares <= 1e-9 || remainingSpentUsdc <= 1e-9) {
+    return [];
+  }
+
+  const reconstructed = [];
+  for (const fill of fills) {
+    if (remainingShares <= 1e-9 || remainingSpentUsdc <= 1e-9) break;
+    const price = Number(fill?.price);
+    const fillShares = Number(fill?.shares);
+    if (!Number.isFinite(price) || price <= 0 || !Number.isFinite(fillShares) || fillShares <= 1e-9) continue;
+
+    const sharesAtRemainingSpent = remainingSpentUsdc / price;
+    const takeShares = Math.min(fillShares, remainingShares, sharesAtRemainingSpent);
+    if (!Number.isFinite(takeShares) || takeShares <= 1e-9) continue;
+
+    let takeSpentUsdc = takeShares * price;
+    if (takeSpentUsdc > remainingSpentUsdc) {
+      takeSpentUsdc = remainingSpentUsdc;
+    }
+    reconstructed.push({
+      price,
+      shares: takeShares,
+      spentUsdc: takeSpentUsdc,
+      feeUsdc: 0,
+    });
+    remainingShares -= takeShares;
+    remainingSpentUsdc -= takeSpentUsdc;
+  }
+
+  if (remainingShares > 1e-9 && Number.isFinite(estimatedPlan?.avgFillPrice) && Number(estimatedPlan.avgFillPrice) > 0) {
+    const fallbackPrice = Number(estimatedPlan.avgFillPrice);
+    reconstructed.push({
+      price: fallbackPrice,
+      shares: remainingShares,
+      spentUsdc: Math.max(0, remainingSpentUsdc),
+      feeUsdc: 0,
+    });
+  } else if (reconstructed.length && Math.abs(remainingSpentUsdc) > 1e-9) {
+    reconstructed[reconstructed.length - 1].spentUsdc += remainingSpentUsdc;
+  }
+
+  return reconstructed.filter((fill) =>
+    Number.isFinite(fill.price) &&
+    Number.isFinite(fill.shares) &&
+    Number.isFinite(fill.spentUsdc) &&
+    fill.price > 0 &&
+    fill.shares > 1e-9 &&
+    fill.spentUsdc > 1e-9);
+}
+
 function bookAgeMs(book, nowMs = Date.now()) {
   const sourceTs = Number(book?.sourceTimestampMs);
   if (Number.isFinite(sourceTs) && sourceTs > 0) {
@@ -1254,6 +1308,17 @@ export class BeatTrader {
         });
         return;
       }
+      const imbalanceProjection = this._wouldTradeIncreaseImbalancePastCap(side, plan.fillShares);
+      if (imbalanceProjection?.exceedsCap && imbalanceProjection?.increasesImbalance) {
+        this._recordAudit('decision_skip', {
+          reason: 'inventory-imbalance-would-be-exceeded',
+          side,
+          tokenId,
+          plan,
+          ...imbalanceProjection,
+        });
+        return;
+      }
 
       if (!cfg.BEAT_DRY_RUN) {
         try {
@@ -1414,6 +1479,18 @@ export class BeatTrader {
         amountUsdc,
         plan,
         maxPrice,
+      });
+      return;
+    }
+    const imbalanceProjection = this._wouldTradeIncreaseImbalancePastCap(side, plan.fillShares);
+    if (imbalanceProjection?.exceedsCap && imbalanceProjection?.increasesImbalance) {
+      this._recordAudit('decision_skip', {
+        reason: 'inventory-imbalance-would-be-exceeded',
+        side,
+        tokenId,
+        amountUsdc,
+        plan,
+        ...imbalanceProjection,
       });
       return;
     }
@@ -1789,21 +1866,132 @@ export class BeatTrader {
 
   _eligiblePairLots(targetSide, buyPriceCap) {
     const oppositeSide = this._oppositeSide(targetSide);
-    if (!oppositeSide || !Number.isFinite(Number(buyPriceCap))) return [];
-    const pairCostCap = Number(this.config.BEAT_ARB_PAIR_COST_MAX);
+    if (!oppositeSide) return [];
+    const normalizedBuyPriceCap = Number(buyPriceCap);
+    const pairCostCap = this._pairCostThreshold();
     return this.openLots[oppositeSide]
       .filter((lot) => {
         const remainingShares = Number(lot?.remainingShares ?? 0);
         const lotPrice = Number(lot?.avgPrice ?? 0);
-        return remainingShares > 0 && Number.isFinite(lotPrice) && (lotPrice + buyPriceCap) <= pairCostCap;
+        return remainingShares > 0 &&
+          Number.isFinite(lotPrice) &&
+          (!Number.isFinite(normalizedBuyPriceCap) || (lotPrice + normalizedBuyPriceCap) <= pairCostCap);
       })
-      .map((lot) => ({ ...lot }));
+      .map((lot) => ({ ...lot }))
+      .sort((a, b) => {
+        const priceDiff = Number(b?.avgPrice ?? 0) - Number(a?.avgPrice ?? 0);
+        if (Math.abs(priceDiff) > 1e-9) return priceDiff;
+        return Number(a?.recordedAt ?? 0) - Number(b?.recordedAt ?? 0);
+      });
+  }
+
+  _pairCostThreshold() {
+    const pairCostCap = Number(this.config.BEAT_ARB_PAIR_COST_MAX);
+    const requiredEdge = Number(this.config.BEAT_ARB_PAIR_REQUIRED_EDGE);
+    const edgeCostCap = Number.isFinite(requiredEdge) ? (1 - requiredEdge) : Infinity;
+    if (Number.isFinite(pairCostCap) && Number.isFinite(edgeCostCap)) {
+      return Math.min(pairCostCap, edgeCostCap);
+    }
+    if (Number.isFinite(pairCostCap)) return pairCostCap;
+    if (Number.isFinite(edgeCostCap)) return edgeCostCap;
+    return Infinity;
+  }
+
+  _buildPerTradePairPlan(side, book) {
+    const asks = Array.isArray(book?.asks)
+      ? [...book.asks]
+        .filter((row) =>
+          Number.isFinite(Number(row?.price)) &&
+          Number.isFinite(Number(row?.size)) &&
+          Number(row.price) > 0 &&
+          Number(row.size) > 0)
+        .sort((a, b) => Number(a.price) - Number(b.price))
+      : [];
+    if (!asks.length) return null;
+
+    const pairCostCap = this._pairCostThreshold();
+    const eligibleLots = this._eligiblePairLots(side, Infinity)
+      .map((lot) => ({
+        ...lot,
+        remainingShares: Number(lot?.remainingShares ?? 0),
+        avgPrice: Number(lot?.avgPrice ?? 0),
+      }))
+      .filter((lot) => lot.remainingShares > 1e-9 && Number.isFinite(lot.avgPrice));
+    if (!eligibleLots.length) return null;
+
+    let fillShares = 0;
+    let spentUsdc = 0;
+    let totalPairCostUsdc = 0;
+    let maxPrice = 0;
+    const fills = [];
+    const matches = [];
+
+    for (const ask of asks) {
+      let remainingAskShares = Number(ask.size);
+      if (!Number.isFinite(remainingAskShares) || remainingAskShares <= 1e-9) continue;
+
+      for (const lot of eligibleLots) {
+        if (remainingAskShares <= 1e-9) break;
+        if (lot.remainingShares <= 1e-9) continue;
+
+        const pairCost = lot.avgPrice + Number(ask.price);
+        if (!Number.isFinite(pairCost) || pairCost > pairCostCap) continue;
+
+        const matchedShares = Math.min(lot.remainingShares, remainingAskShares);
+        if (matchedShares <= 1e-9) continue;
+
+        const spentAtAsk = matchedShares * Number(ask.price);
+        const pairCostUsdc = matchedShares * pairCost;
+
+        fillShares += matchedShares;
+        spentUsdc += spentAtAsk;
+        totalPairCostUsdc += pairCostUsdc;
+        maxPrice = Math.max(maxPrice, Number(ask.price));
+        remainingAskShares -= matchedShares;
+        lot.remainingShares = roundShareAmount(lot.remainingShares - matchedShares);
+
+        fills.push({
+          price: Number(ask.price),
+          shares: matchedShares,
+          spentUsdc: spentAtAsk,
+          feeUsdc: 0,
+        });
+        matches.push({
+          oppositeLotId: lot.id,
+          oppositeSide: this._oppositeSide(side),
+          oppositePrice: lot.avgPrice,
+          shares: matchedShares,
+          pairCost,
+          pairEdge: 1 - pairCost,
+        });
+      }
+    }
+
+    if (fillShares <= 1e-9 || spentUsdc <= 0 || maxPrice <= 0) return null;
+
+    const averagePairCost = totalPairCostUsdc / fillShares;
+    return {
+      fillShares,
+      spentUsdc,
+      avgFillPrice: spentUsdc / fillShares,
+      fullyFilled: true,
+      fills,
+      maxPrice,
+      preview: {
+        pairedShares: fillShares,
+        totalCost: totalPairCostUsdc,
+        averagePairCost,
+        pairEdge: 1 - averagePairCost,
+        expectedProfitUsdc: fillShares - totalPairCostUsdc,
+        matches,
+      },
+    };
   }
 
   _pairingPreview(side, pairBuyPrice, targetShares = Infinity) {
     const remainingTarget = { value: Number.isFinite(Number(targetShares)) ? Math.max(0, Number(targetShares)) : Infinity };
     const oppositeSide = this._oppositeSide(side);
-    const pairCostCap = Number(this.config.BEAT_ARB_PAIR_COST_MAX);
+    const pairCostCap = this._pairCostThreshold();
     const matches = [];
     let pairedShares = 0;
     let totalCost = 0;
@@ -1844,27 +2032,11 @@ export class BeatTrader {
     if (!leg?.ask || !Number.isFinite(Number(leg.ask.price))) return null;
     if (!Number.isFinite(leg.bookAgeMs) || leg.bookAgeMs > cfg.BEAT_BOOK_MAX_AGE_MS) return null;
 
-    const eligibleLots = this._eligiblePairLots(side, Number(leg.ask.price));
-    if (!eligibleLots.length) return null;
-
-    const maxPrice = eligibleLots.reduce((minCap, lot) => {
-      const allowedPrice = Number(cfg.BEAT_ARB_PAIR_COST_MAX) - Number(lot.avgPrice ?? 0);
-      return Math.min(minCap, allowedPrice);
-    }, Infinity);
-    if (!Number.isFinite(maxPrice) || maxPrice <= 0) return null;
-
-    const targetShares = eligibleLots.reduce((sum, lot) => sum + Number(lot.remainingShares ?? 0), 0);
-    if (targetShares <= 1e-9) return null;
-
-    const plan = estimateSharesFromBook(leg.book, maxPrice, targetShares);
+    const plan = this._buildPerTradePairPlan(side, leg.book);
     if (!plan || plan.fillShares <= 1e-9 || plan.spentUsdc <= 0) return null;
 
-    const projectedAvgPrice = plan.spentUsdc / plan.fillShares;
-    const preview = this._pairingPreview(side, projectedAvgPrice, plan.fillShares);
+    const preview = plan.preview;
     if (preview.pairedShares <= 1e-9) return null;
-    if (!Number.isFinite(preview.pairEdge) || preview.pairEdge < Number(cfg.BEAT_ARB_PAIR_REQUIRED_EDGE)) {
-      return null;
-    }
 
     return {
       intent: 'arb-pair',
@@ -1874,8 +2046,8 @@ export class BeatTrader {
       bestBid: leg.bid,
       bestAsk: leg.ask,
       bookAgeMs: leg.bookAgeMs,
-      maxPrice,
-      targetShares,
+      maxPrice: plan.maxPrice,
+      targetShares: plan.fillShares,
       plan,
       preview,
       pairEdge: preview.pairEdge,
@@ -1907,6 +2079,8 @@ export class BeatTrader {
     if (!candidates.length) return false;
 
     const selected = candidates.sort((a, b) => {
+      const profitDiff = Number(b.preview.expectedProfitUsdc ?? -Infinity) - Number(a.preview.expectedProfitUsdc ?? -Infinity);
+      if (profitDiff !== 0) return profitDiff;
       const edgeDiff = Number(b.pairEdge ?? -Infinity) - Number(a.pairEdge ?? -Infinity);
       if (edgeDiff !== 0) return edgeDiff;
       const pairCostDiff = Number(a.preview.averagePairCost ?? Infinity) - Number(b.preview.averagePairCost ?? Infinity);
@@ -1934,19 +2108,17 @@ export class BeatTrader {
 
   async _executePairBuy(candidate) {
     const cfg = this.config;
-    const remainingBudget = cfg.MAX_SPEND_PER_MARKET - this.totalSpent;
-    const targetShares = Number(candidate?.targetShares ?? 0);
-    if (targetShares <= 1e-9) {
+    const plan = candidate?.plan;
+    if (!plan || Number(plan.fillShares ?? 0) <= 1e-9) {
       return false;
     }
 
-    const plan = estimateSharesFromBook(candidate.book, candidate.maxPrice, targetShares);
     this._recordAudit('order_plan', {
       side: candidate.side,
-      orderMode: 'ARB_PAIR_SHARES',
+      orderMode: 'ARB_PAIR_USDC',
       tokenId: candidate.tokenId,
-      requestedShares: targetShares,
-      remainingBudget,
+      requestedShares: plan.fillShares,
+      requestedUsdc: plan.spentUsdc,
       maxPrice: candidate.maxPrice,
       bestBid: candidate.bestBid ?? null,
       bestAsk: candidate.bestAsk ?? null,
@@ -1956,43 +2128,35 @@ export class BeatTrader {
       lotState: this._lotState(),
       book: summarizeBook(candidate.book),
     });
-    if (!plan || !plan.fullyFilled || plan.fillShares <= 1e-9 || plan.spentUsdc <= 0) {
+    if (!plan || plan.fillShares <= 1e-9 || plan.spentUsdc <= 0) {
       this._recordAudit('decision_skip', {
         reason: 'arb-pair-plan-not-fillable',
         side: candidate.side,
         tokenId: candidate.tokenId,
-        targetShares,
+        targetShares: candidate.targetShares,
         maxPrice: candidate.maxPrice,
         plan,
       });
       return false;
     }
-    if (plan.spentUsdc - remainingBudget > 1e-9) {
-      this._recordAudit('decision_skip', {
-        reason: 'arb-pair-max-spend-cap-would-be-exceeded',
-        side: candidate.side,
-        tokenId: candidate.tokenId,
-        remainingBudget,
-        totalSpent: this.totalSpent,
-        maxSpendPerMarket: cfg.MAX_SPEND_PER_MARKET,
-        plan,
-      });
-      return false;
-    }
 
+    let actualExecution = null;
     if (!cfg.BEAT_DRY_RUN) {
+      const preTokenBalance = candidate.side === 'Up' ? this.walletBalanceUp : this.walletBalanceDown;
+      let preUsdcBalance = null;
       try {
+        preUsdcBalance = await getUsdcBalance();
         this._recordAudit('order_submit', {
           side: candidate.side,
-          orderMode: 'ARB_PAIR_SHARES',
+          orderMode: 'ARB_PAIR_USDC',
           tokenId: candidate.tokenId,
           maxPrice: candidate.maxPrice,
-          shares: plan.fillShares,
+          requestedUsdc: plan.spentUsdc,
         });
-        const response = await ClobClient.postFOKLimitBuy(this.wallet, candidate.tokenId, candidate.maxPrice, plan.fillShares);
+        const response = await ClobClient.postIOCBuy(this.wallet, candidate.tokenId, candidate.maxPrice, plan.spentUsdc);
         this._recordAudit('order_result', {
           side: candidate.side,
-          orderMode: 'ARB_PAIR_SHARES',
+          orderMode: 'ARB_PAIR_USDC',
           tokenId: candidate.tokenId,
           response,
         });
@@ -2006,15 +2170,24 @@ export class BeatTrader {
           this._publishOrderIssue({
             side: candidate.side,
             tradeStatus: 'arb pair rejected',
-            extra: { tokenId: candidate.tokenId, orderMode: 'ARB_PAIR_SHARES', response },
+            extra: { tokenId: candidate.tokenId, orderMode: 'ARB_PAIR_USDC', response },
           });
           return false;
         }
+        actualExecution = await this._resolveActualUsdcBuyExecution({
+          side: candidate.side,
+          tokenId: candidate.tokenId,
+          requestedUsdc: plan.spentUsdc,
+          estimatedPlan: plan,
+          preTokenBalance,
+          preUsdcBalance,
+          response,
+        });
       } catch (err) {
         this.log.warn('BeatTrader: arb pair buy failed', { side: candidate.side, err: err.message });
         this._recordAudit('order_error', {
           side: candidate.side,
-          orderMode: 'ARB_PAIR_SHARES',
+          orderMode: 'ARB_PAIR_USDC',
           tokenId: candidate.tokenId,
           err: err.message,
           stack: err.stack ?? null,
@@ -2022,31 +2195,72 @@ export class BeatTrader {
         this._publishOrderIssue({
           side: candidate.side,
           tradeStatus: 'arb pair error',
-          extra: { tokenId: candidate.tokenId, orderMode: 'ARB_PAIR_SHARES', err: err.message },
+          extra: { tokenId: candidate.tokenId, orderMode: 'ARB_PAIR_USDC', err: err.message },
         });
         return false;
       }
     }
 
-    const avgPrice = plan.spentUsdc / plan.fillShares;
-    this._recordBuy(candidate.side, avgPrice, plan.fillShares, plan.spentUsdc, null, null, {
-      intent: 'arb-pair',
-      pairCostCap: cfg.BEAT_ARB_PAIR_COST_MAX,
+    const execution = actualExecution ?? {
+      fillShares: plan.fillShares,
+      spentUsdc: plan.spentUsdc,
+      avgFillPrice: plan.avgFillPrice,
+      fills: plan.fills,
+      source: cfg.BEAT_DRY_RUN ? 'dry-run-estimate' : 'estimated-plan',
+    };
+    if (!Number.isFinite(execution.fillShares) || execution.fillShares <= 0 || !Number.isFinite(execution.spentUsdc) || execution.spentUsdc <= 0) {
+      this._recordAudit('decision_skip', {
+        reason: 'arb-pair-empty-after-submit',
+        side: candidate.side,
+        tokenId: candidate.tokenId,
+        execution,
+        estimatedPlan: plan,
+      });
+      this._publishOrderIssue({
+        side: candidate.side,
+        tradeStatus: 'arb pair empty fill',
+        extra: { tokenId: candidate.tokenId, orderMode: 'ARB_PAIR_USDC', execution, estimatedPlan: plan },
+      });
+      return false;
+    }
+
+    const executionFills = Array.isArray(execution.fills) && execution.fills.length
+      ? execution.fills
+      : [{
+        price: execution.avgFillPrice ?? (execution.spentUsdc / execution.fillShares),
+        shares: execution.fillShares,
+        spentUsdc: execution.spentUsdc,
+      }];
+    executionFills.forEach((fill, index) => {
+      const fillPrice = Number(fill?.price);
+      const fillShares = Number(fill?.shares);
+      const fillSpentUsdc = Number(fill?.spentUsdc);
+      if (!Number.isFinite(fillPrice) || !Number.isFinite(fillShares) || !Number.isFinite(fillSpentUsdc) || fillPrice <= 0 || fillShares <= 0 || fillSpentUsdc <= 0) {
+        return;
+      }
+      this._recordBuy(candidate.side, fillPrice, fillShares, fillSpentUsdc, null, null, {
+        intent: 'arb-pair',
+        pairCostCap: cfg.BEAT_ARB_PAIR_COST_MAX,
+        pairRequiredEdge: cfg.BEAT_ARB_PAIR_REQUIRED_EDGE,
+        executionSource: execution.source ?? null,
+        executionFillIndex: index + 1,
+        executionFillCount: executionFills.length,
+      });
     });
     this.lastBuyAt = Date.now();
     this._publishTrade({
       lifecycle: BEAT_LIFECYCLE.MONITORING,
       tradeStatus: cfg.BEAT_DRY_RUN ? 'dry-run buy placed' : 'buy placed',
       chosenSide: this.tradeSummary?.chosenSide ?? candidate.side,
-      buyShares: this.tradeSummary?.buyShares ?? plan.fillShares,
-      buyUsdc: this.tradeSummary?.buyUsdc ?? plan.spentUsdc,
-      buyPrice: this.tradeSummary?.buyPrice ?? avgPrice,
+      buyShares: this.tradeSummary?.buyShares ?? execution.fillShares,
+      buyUsdc: this.tradeSummary?.buyUsdc ?? execution.spentUsdc,
+      buyPrice: this.tradeSummary?.buyPrice ?? (execution.avgFillPrice ?? (execution.spentUsdc / execution.fillShares)),
     });
     this.log.info(`BeatTrader: ${cfg.BEAT_DRY_RUN ? 'dry-run arb pair buy' : 'arb pair buy executed'}`, {
       side: candidate.side,
-      shares: plan.fillShares,
-      spentUsdc: plan.spentUsdc,
-      avgPrice,
+      shares: execution.fillShares,
+      spentUsdc: execution.spentUsdc,
+      avgPrice: execution.avgFillPrice ?? (execution.spentUsdc / execution.fillShares),
       pairCostCap: cfg.BEAT_ARB_PAIR_COST_MAX,
       pairRequiredEdge: cfg.BEAT_ARB_PAIR_REQUIRED_EDGE,
       projectedAveragePairCost: candidate.preview.averagePairCost,
@@ -2054,11 +2268,12 @@ export class BeatTrader {
     });
     this._recordAudit('order_filled', {
       side: candidate.side,
-      orderMode: 'ARB_PAIR_SHARES',
+      orderMode: 'ARB_PAIR_USDC',
       tokenId: candidate.tokenId,
       dryRun: cfg.BEAT_DRY_RUN,
       maxPrice: candidate.maxPrice,
       plan,
+      execution,
       pairPreview: candidate.preview,
       pairEdge: candidate.pairEdge,
       lotState: this._lotState(),
@@ -2069,7 +2284,7 @@ export class BeatTrader {
 
   _pairNewLot(newLot) {
     const oppositeSide = this._oppositeSide(newLot.side);
-    const pairCostCap = Number(this.config.BEAT_ARB_PAIR_COST_MAX);
+    const pairCostCap = this._pairCostThreshold();
     if (!oppositeSide || !Number.isFinite(pairCostCap)) {
       this.openLots[newLot.side].push(newLot);
       return [];
@@ -2205,31 +2420,6 @@ export class BeatTrader {
     const cfg = this.config;
     if (this.halted) return true;
 
-    const lotState = this._lotState();
-    const imbalanceShares = Math.abs(lotState.unpairedUpShares - lotState.unpairedDownShares);
-    if (imbalanceShares > cfg.BEAT_MAX_INVENTORY_IMBALANCE_SHARES) {
-      this.log.warn('BeatTrader: inventory imbalance limit reached', {
-        imbalanceShares,
-        balanceUp: this.balanceUp,
-        balanceDown: this.balanceDown,
-        unpairedUpShares: lotState.unpairedUpShares,
-        unpairedDownShares: lotState.unpairedDownShares,
-        maxInventoryImbalanceShares: cfg.BEAT_MAX_INVENTORY_IMBALANCE_SHARES,
-      });
-      this._recordAudit('circuit_breaker', {
-        reason: 'inventory-imbalance',
-        imbalanceShares,
-        balanceUp: this.balanceUp,
-        balanceDown: this.balanceDown,
-        unpairedUpShares: lotState.unpairedUpShares,
-        unpairedDownShares: lotState.unpairedDownShares,
-        maxInventoryImbalanceShares: cfg.BEAT_MAX_INVENTORY_IMBALANCE_SHARES,
-      });
-      this.halted = true;
-      this.lifecycle = BEAT_LIFECYCLE.HALTED;
-      return true;
-    }
-
     if (this.totalSpent >= cfg.MAX_SPEND_PER_MARKET) {
       if (!this.stopBuying) {
         this.log.info('BeatTrader: spend cap reached', { totalSpent: this.totalSpent.toFixed(2) });
@@ -2252,6 +2442,61 @@ export class BeatTrader {
     if (side === 'Up') return imbalance < -1e-9;
     if (side === 'Down') return imbalance > 1e-9;
     return false;
+  }
+
+  _projectedLotStateAfterBuy(side, shares) {
+    const lotState = this._lotState();
+    const buyShares = Number(shares);
+    if (!Number.isFinite(buyShares) || buyShares <= 0) {
+      return null;
+    }
+
+    let pairedShares = Number(lotState.pairedShares ?? 0);
+    let unpairedUpShares = Number(lotState.unpairedUpShares ?? 0);
+    let unpairedDownShares = Number(lotState.unpairedDownShares ?? 0);
+
+    if (side === 'Up') {
+      const pairedNow = Math.min(unpairedDownShares, buyShares);
+      pairedShares += pairedNow;
+      unpairedDownShares -= pairedNow;
+      unpairedUpShares += Math.max(0, buyShares - pairedNow);
+    } else if (side === 'Down') {
+      const pairedNow = Math.min(unpairedUpShares, buyShares);
+      pairedShares += pairedNow;
+      unpairedUpShares -= pairedNow;
+      unpairedDownShares += Math.max(0, buyShares - pairedNow);
+    } else {
+      return null;
+    }
+
+    const imbalanceShares = Math.abs(unpairedUpShares - unpairedDownShares);
+    return {
+      pairedShares,
+      unpairedUpShares,
+      unpairedDownShares,
+      imbalanceShares,
+    };
+  }
+
+  _wouldTradeIncreaseImbalancePastCap(side, shares) {
+    const cap = Number(this.config.BEAT_MAX_INVENTORY_IMBALANCE_SHARES);
+    if (!Number.isFinite(cap) || cap <= 0) return null;
+
+    const currentLotState = this._lotState();
+    const currentImbalanceShares = Math.abs(
+      Number(currentLotState.unpairedUpShares ?? 0) - Number(currentLotState.unpairedDownShares ?? 0),
+    );
+    const projectedLotState = this._projectedLotStateAfterBuy(side, shares);
+    if (!projectedLotState) return null;
+
+    return {
+      currentImbalanceShares,
+      projectedImbalanceShares: projectedLotState.imbalanceShares,
+      exceedsCap: projectedLotState.imbalanceShares - cap > 1e-9,
+      increasesImbalance: projectedLotState.imbalanceShares - currentImbalanceShares > 1e-9,
+      projectedLotState,
+      maxInventoryImbalanceShares: cap,
+    };
   }
 
   _minUsdcRequired(book = null) {
@@ -2423,6 +2668,7 @@ export class BeatTrader {
                   : Number(estimatedPlan?.spentUsdc ?? 0),
               );
           const avgFillPrice = spentUsdc > 1e-9 ? (spentUsdc / actualShares) : null;
+          const fills = reconstructActualFillsFromEstimate(estimatedPlan, actualShares, spentUsdc);
           if (side === 'Up') {
             this.walletBalanceUp = tokenBalanceAfter;
             if (!this.config.BEAT_DRY_RUN) this.balanceUp = tokenBalanceAfter;
@@ -2443,12 +2689,14 @@ export class BeatTrader {
             actualSpentUsdc,
             spentUsdc,
             avgFillPrice,
+            fills,
             response,
           });
           return {
             fillShares: actualShares,
             spentUsdc,
             avgFillPrice,
+            fills,
             source: 'wallet-balance-delta',
             response,
           };
