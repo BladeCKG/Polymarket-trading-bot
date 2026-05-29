@@ -76,6 +76,13 @@ function momentsForConfig(market, config) {
   return Array.isArray(moments) ? moments : [];
 }
 
+function trendMomentsForConfig(market, config) {
+  const symbol = traderSymbol(market, config);
+  const key = `BEAT_TREND_MOMENTS_${symbol}`;
+  const moments = config?.[key];
+  return Array.isArray(moments) ? moments : [];
+}
+
 function summarizeBook(book) {
   const bids = Array.isArray(book?.bids) ? book.bids : [];
   const asks = Array.isArray(book?.asks) ? book.asks : [];
@@ -210,6 +217,9 @@ export class BeatTrader {
         arbPairEnabled: cfg.BEAT_ARB_PAIR_ENABLED,
         arbPairCostMax: cfg.BEAT_ARB_PAIR_COST_MAX,
         arbPairRequiredEdge: cfg.BEAT_ARB_PAIR_REQUIRED_EDGE,
+        trendMinProbability: cfg.BEAT_TREND_MIN_PROBABILITY,
+        trendMinSignalScore: cfg.BEAT_TREND_MIN_SIGNAL_SCORE,
+        trendMoments: trendMomentsForConfig(this.market, cfg),
         moments: momentsForLog,
       },
       auditLogPath: getMarketLogFilePath(this.market.slug),
@@ -754,8 +764,26 @@ export class BeatTrader {
     }
 
     const delta = tick.price - this.beatPrice;
+    const probabilityModel = cfg.BEAT_PROBABILITY_ENABLED ? this._probabilityModel(snapshot) : null;
     // Determine per-moment thresholds (seconds after market open)
     const secondsAfterOpen = Math.floor(Date.now() / 1000) - this.market.windowTs;
+    const trendMoments = trendMomentsForConfig(this.market, cfg);
+    const trendMoment = trendMoments.find((m) => secondsAfterOpen >= Number(m.start ?? 0) && secondsAfterOpen < Number(m.end ?? cfg.MARKET_WINDOW_SECONDS)) || null;
+
+    if (trendMoment) {
+      const trendBuyExecuted = await this._maybeTrendBuy({
+        snapshot,
+        tick,
+        delta,
+        secondsAfterOpen,
+        trendMoment,
+        probabilityModel,
+      });
+      if (trendBuyExecuted) {
+        return;
+      }
+    }
+
     const moments = momentsForConfig(this.market, cfg);
     const moment = moments.find((m) => secondsAfterOpen >= Number(m.start ?? 0) && secondsAfterOpen < Number(m.end ?? cfg.MARKET_WINDOW_SECONDS)) || null;
     // Require an explicit moment with thresholds to allow buys. If no moment or missing values, do not buy.
@@ -773,8 +801,6 @@ export class BeatTrader {
 
     const thresholds = { upMax: Number(moment.btcmoveMax), downMax: Number(moment.btcmoveMax) };
     const resolvedBuyMax = Number(moment.buyMax);
-    const probabilityModel = cfg.BEAT_PROBABILITY_ENABLED ? this._probabilityModel(snapshot) : null;
-
     const bookState = {
       Up: {
         tokenId: this.market.upToken.tokenId,
@@ -1256,6 +1282,212 @@ export class BeatTrader {
       },
       tradeSummary: this.tradeSummary,
     });
+  }
+
+  async _maybeTrendBuy({ snapshot = {}, tick, delta, secondsAfterOpen, trendMoment, probabilityModel = null }) {
+    const cfg = this.config;
+    const absoluteMove = Math.abs(delta);
+    const chosenSide = delta > 0 ? 'Up' : (delta < 0 ? 'Down' : null);
+    if (!chosenSide) {
+      this._recordAudit('trend_moment_skip', {
+        reason: 'zero-delta',
+        secondsAfterOpen,
+        trendMoment,
+        delta,
+      });
+      return false;
+    }
+    if (absoluteMove < Number(trendMoment.btcmoveMin ?? Infinity)) {
+      this._recordAudit('trend_moment_skip', {
+        reason: 'move-below-min',
+        secondsAfterOpen,
+        trendMoment,
+        delta,
+        absoluteMove,
+      });
+      return false;
+    }
+
+    const directionSign = chosenSide === 'Up' ? 1 : -1;
+    const chosenProbability = probabilityModel
+      ? Number(chosenSide === 'Up' ? probabilityModel.pUp : probabilityModel.pDown)
+      : null;
+    const oppositeProbability = probabilityModel
+      ? Number(chosenSide === 'Up' ? probabilityModel.pDown : probabilityModel.pUp)
+      : null;
+    const probabilityEdge = Number.isFinite(chosenProbability) && Number.isFinite(oppositeProbability)
+      ? chosenProbability - oppositeProbability
+      : null;
+    const velocityDirectional = probabilityModel
+      ? directionSign * Number(probabilityModel.features?.velocityComposite ?? 0)
+      : null;
+    const accelerationDirectional = probabilityModel
+      ? directionSign * Number(probabilityModel.features?.accelerationComposite ?? 0)
+      : null;
+    const ofiDirectional = probabilityModel
+      ? directionSign * Number(probabilityModel.features?.ofiDiff ?? 0)
+      : null;
+    const trendSignalScore = probabilityModel
+      ? (
+          (0.45 * clamp(((chosenProbability ?? 0) - 0.5) / 0.25, -1, 1)) +
+          (0.25 * clamp((velocityDirectional ?? 0) / 2, -1, 1)) +
+          (0.15 * clamp((accelerationDirectional ?? 0) / 2, -1, 1)) +
+          (0.15 * clamp((ofiDirectional ?? 0) / 200, -1, 1))
+        )
+      : null;
+    if (probabilityModel) {
+      if (!Number.isFinite(chosenProbability) || chosenProbability < Number(cfg.BEAT_TREND_MIN_PROBABILITY)) {
+        this._recordAudit('trend_moment_skip', {
+          reason: 'probability-below-min',
+          chosenSide,
+          secondsAfterOpen,
+          trendMoment,
+          chosenProbability,
+          minProbability: cfg.BEAT_TREND_MIN_PROBABILITY,
+          probabilityModel,
+        });
+        return false;
+      }
+      if (!Number.isFinite(trendSignalScore) || trendSignalScore < Number(cfg.BEAT_TREND_MIN_SIGNAL_SCORE)) {
+        this._recordAudit('trend_moment_skip', {
+          reason: 'trend-signal-too-weak',
+          chosenSide,
+          secondsAfterOpen,
+          trendMoment,
+          chosenProbability,
+          probabilityEdge,
+          velocityDirectional,
+          accelerationDirectional,
+          ofiDirectional,
+          trendSignalScore,
+          minTrendSignalScore: cfg.BEAT_TREND_MIN_SIGNAL_SCORE,
+          probabilityModel,
+        });
+        return false;
+      }
+    }
+
+    const leg = chosenSide === 'Up'
+      ? {
+          tokenId: this.market.upToken.tokenId,
+          book: this.latestQuotes.up?.book ?? null,
+          bid: this.latestQuotes.up?.bid ?? null,
+          ask: this.latestQuotes.up?.ask ?? null,
+          bookAgeMs: bookAgeMs(this.latestQuotes.up?.book),
+        }
+      : {
+          tokenId: this.market.downToken.tokenId,
+          book: this.latestQuotes.down?.book ?? null,
+          bid: this.latestQuotes.down?.bid ?? null,
+          ask: this.latestQuotes.down?.ask ?? null,
+          bookAgeMs: bookAgeMs(this.latestQuotes.down?.book),
+        };
+
+    if (!leg.ask) {
+      this._recordAudit('trend_moment_skip', {
+        reason: 'missing-best-ask',
+        chosenSide,
+        secondsAfterOpen,
+        trendMoment,
+      });
+      return false;
+    }
+    if (!Number.isFinite(leg.bookAgeMs) || leg.bookAgeMs > cfg.BEAT_BOOK_MAX_AGE_MS) {
+      this._recordAudit('trend_moment_skip', {
+        reason: 'stale-book',
+        chosenSide,
+        secondsAfterOpen,
+        trendMoment,
+        bookAgeMs: leg.bookAgeMs,
+      });
+      return false;
+    }
+
+    const askPrice = Number(leg.ask.price);
+    const askMin = Number(trendMoment.askMin);
+    const askMax = Number(trendMoment.askMax);
+    if (!Number.isFinite(askPrice) || askPrice < askMin || askPrice > askMax) {
+      this._recordAudit('trend_moment_skip', {
+        reason: 'ask-outside-range',
+        chosenSide,
+        secondsAfterOpen,
+        trendMoment,
+        askPrice,
+      });
+      return false;
+    }
+
+    const ofiDecision = this.ofi.decisionFor(
+      leg.tokenId,
+      Number(leg.book?.tickSize ?? 0.01),
+      Date.now(),
+    );
+    if (ofiDecision.suppress) {
+      this._recordAudit('trend_moment_skip', {
+        reason: 'ofi-suppressed',
+        chosenSide,
+        secondsAfterOpen,
+        trendMoment,
+        askPrice,
+        ofiDecision,
+      });
+      return false;
+    }
+
+    const unclampedMaxPrice = clampMaxPrice(askPrice, askMax, cfg.BEAT_MAX_SLIPPAGE);
+    const maxPrice = Math.max(0, unclampedMaxPrice - ofiDecision.adjustPrice);
+    if (maxPrice + 1e-9 < askPrice) {
+      this._recordAudit('trend_moment_skip', {
+        reason: 'ofi-softened-price-below-ask',
+        chosenSide,
+        secondsAfterOpen,
+        trendMoment,
+        askPrice,
+        unclampedMaxPrice,
+        maxPrice,
+        ofiDecision,
+        chosenProbability,
+        probabilityEdge,
+        velocityDirectional,
+        accelerationDirectional,
+        ofiDirectional,
+        trendSignalScore,
+      });
+      return false;
+    }
+
+    this._recordAudit('trend_moment_buy_signal', {
+      chosenSide,
+      secondsAfterOpen,
+      trendMoment,
+      delta,
+      absoluteMove,
+      beatPrice: this.beatPrice,
+      btcPrice: tick.price,
+      askPrice,
+      maxPrice,
+      chosenProbability,
+      probabilityEdge,
+      velocityDirectional,
+      accelerationDirectional,
+      ofiDirectional,
+      trendSignalScore,
+      snapshot,
+      ofiDecision,
+      probabilityModel,
+    });
+
+    await this._executeBuy({
+      side: chosenSide,
+      tokenId: leg.tokenId,
+      book: leg.book,
+      bestBid: leg.bid,
+      bestAsk: leg.ask,
+      maxPrice,
+      delta,
+      btcPrice: tick.price,
+    });
+    return true;
   }
 
   _oppositeSide(side) {
