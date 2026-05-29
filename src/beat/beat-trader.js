@@ -3,7 +3,7 @@ import { BeatOfiTracker } from './ofi.js';
 import { BEAT_LIFECYCLE } from './lifecycle.js';
 import { createBeatRuntimeConfig } from './runtime-config.js';
 import { BookFeed, ClobClient } from '../clob.js';
-import { getTokenBalances, redeemPositions, sleep } from '../onchain.js';
+import { getTokenBalances, getUsdcBalance, redeemPositions, sleep } from '../onchain.js';
 import { msUntil, waitForResolution } from '../market.js';
 import { getMarketLogFilePath, marketFileLogger, marketLogger } from '../logger.js';
 
@@ -1402,8 +1402,12 @@ export class BeatTrader {
       return;
     }
 
+    let actualExecution = null;
     if (!cfg.BEAT_DRY_RUN) {
+      const preTokenBalance = side === 'Up' ? this.walletBalanceUp : this.walletBalanceDown;
+      let preUsdcBalance = null;
       try {
+        preUsdcBalance = await getUsdcBalance();
         this._recordAudit('order_submit', {
           side,
           orderMode: cfg.BEAT_ORDER_MODE,
@@ -1427,6 +1431,15 @@ export class BeatTrader {
           });
           return;
         }
+        actualExecution = await this._resolveActualUsdcBuyExecution({
+          side,
+          tokenId,
+          requestedUsdc: amountUsdc,
+          estimatedPlan: plan,
+          preTokenBalance,
+          preUsdcBalance,
+          response,
+        });
       } catch (err) {
         this.log.warn('BeatTrader: directional USDC buy failed', { side, err: err.message });
         this._recordAudit('order_error', {
@@ -1440,22 +1453,45 @@ export class BeatTrader {
       }
     }
 
-    this._recordBuy(side, plan.avgFillPrice ?? bestAsk.price, plan.fillShares, plan.spentUsdc, delta, btcPrice);
+    const execution = actualExecution ?? {
+      fillShares: plan.fillShares,
+      spentUsdc: plan.spentUsdc,
+      avgFillPrice: plan.avgFillPrice ?? bestAsk.price,
+      source: cfg.BEAT_DRY_RUN ? 'dry-run-estimate' : 'estimated-plan',
+    };
+    if (!Number.isFinite(execution.fillShares) || execution.fillShares <= 0 || !Number.isFinite(execution.spentUsdc) || execution.spentUsdc <= 0) {
+      this._recordAudit('decision_skip', {
+        reason: 'execution-empty-after-submit',
+        side,
+        tokenId,
+        execution,
+        estimatedPlan: plan,
+      });
+      return;
+    }
+
+    this._recordBuy(side, execution.avgFillPrice ?? bestAsk.price, execution.fillShares, execution.spentUsdc, delta, btcPrice, {
+      executionSource: execution.source ?? null,
+      estimatedPlan: plan,
+    });
     this.lastBuyAt = Date.now();
     this._publishTrade({
       lifecycle: BEAT_LIFECYCLE.MONITORING,
       tradeStatus: cfg.BEAT_DRY_RUN ? 'dry-run buy placed' : 'buy placed',
       chosenSide: this.tradeSummary?.chosenSide ?? side,
-      buyShares: this.tradeSummary?.buyShares ?? plan.fillShares,
-      buyUsdc: this.tradeSummary?.buyUsdc ?? plan.spentUsdc,
-      buyPrice: this.tradeSummary?.buyPrice ?? (plan.avgFillPrice ?? bestAsk.price),
+      buyShares: this.tradeSummary?.buyShares ?? execution.fillShares,
+      buyUsdc: this.tradeSummary?.buyUsdc ?? execution.spentUsdc,
+      buyPrice: this.tradeSummary?.buyPrice ?? (execution.avgFillPrice ?? bestAsk.price),
     });
     this.log.info(`BeatTrader: ${cfg.BEAT_DRY_RUN ? 'dry-run buy' : 'bought'} directional USDC`, {
       side,
       requestedUsdc: amountUsdc,
       estimatedFillShares: plan.fillShares,
       estimatedSpentUsdc: plan.spentUsdc,
-      avgPrice: plan.avgFillPrice,
+      actualFillShares: execution.fillShares,
+      actualSpentUsdc: execution.spentUsdc,
+      avgPrice: execution.avgFillPrice ?? plan.avgFillPrice,
+      executionSource: execution.source ?? null,
       bestBid: bestBid?.price ?? null,
       bestAsk: bestAsk.price,
       maxPrice,
@@ -1469,6 +1505,7 @@ export class BeatTrader {
       tokenId,
       dryRun: cfg.BEAT_DRY_RUN,
       plan,
+      execution,
       maxPrice,
       delta,
       btcPrice,
@@ -2275,6 +2312,104 @@ export class BeatTrader {
       }
     }
     return null;
+  }
+
+  async _resolveActualUsdcBuyExecution({
+    side,
+    tokenId,
+    requestedUsdc,
+    estimatedPlan,
+    preTokenBalance,
+    preUsdcBalance,
+    response = null,
+  }) {
+    const fallback = {
+      fillShares: Number(estimatedPlan?.fillShares ?? 0),
+      spentUsdc: Number(estimatedPlan?.spentUsdc ?? 0),
+      avgFillPrice: Number(estimatedPlan?.avgFillPrice ?? 0) || null,
+      source: 'estimated-plan',
+      response,
+    };
+
+    const attempts = [0, 150, 350, 700];
+    for (const delayMs of attempts) {
+      if (delayMs > 0) {
+        await sleep(delayMs);
+      }
+      try {
+        const [balances, usdcBalanceAfter] = await Promise.all([
+          getTokenBalances([tokenId]),
+          getUsdcBalance(),
+        ]);
+        const tokenBalanceAfter = Number(balances?.[tokenId]);
+        const actualShares = Number.isFinite(tokenBalanceAfter)
+          ? Math.max(0, tokenBalanceAfter - Number(preTokenBalance ?? 0))
+          : 0;
+        const actualSpentUsdc = Number.isFinite(usdcBalanceAfter)
+          ? Math.max(0, Number(preUsdcBalance ?? 0) - usdcBalanceAfter)
+          : 0;
+        if (actualShares > 1e-9) {
+          const spentUsdc = actualSpentUsdc > 1e-9
+            ? actualSpentUsdc
+            : Math.min(
+                Number(requestedUsdc ?? 0),
+                Number(estimatedPlan?.avgFillPrice ?? 0) > 0
+                  ? actualShares * Number(estimatedPlan.avgFillPrice)
+                  : Number(estimatedPlan?.spentUsdc ?? 0),
+              );
+          const avgFillPrice = spentUsdc > 1e-9 ? (spentUsdc / actualShares) : null;
+          if (side === 'Up') {
+            this.walletBalanceUp = tokenBalanceAfter;
+            if (!this.config.BEAT_DRY_RUN) this.balanceUp = tokenBalanceAfter;
+          } else if (side === 'Down') {
+            this.walletBalanceDown = tokenBalanceAfter;
+            if (!this.config.BEAT_DRY_RUN) this.balanceDown = tokenBalanceAfter;
+          }
+          this._recordAudit('live_fill_reconciled', {
+            side,
+            tokenId,
+            delayMs,
+            requestedUsdc,
+            preTokenBalance,
+            tokenBalanceAfter,
+            preUsdcBalance,
+            usdcBalanceAfter,
+            actualShares,
+            actualSpentUsdc,
+            spentUsdc,
+            avgFillPrice,
+            response,
+          });
+          return {
+            fillShares: actualShares,
+            spentUsdc,
+            avgFillPrice,
+            source: 'wallet-balance-delta',
+            response,
+          };
+        }
+      } catch (err) {
+        this._recordAudit('live_fill_reconcile_error', {
+          side,
+          tokenId,
+          requestedUsdc,
+          delayMs,
+          err: err.message,
+          response,
+        });
+      }
+    }
+
+    this._recordAudit('live_fill_reconciled_fallback', {
+      side,
+      tokenId,
+      requestedUsdc,
+      preTokenBalance,
+      preUsdcBalance,
+      estimatedPlan,
+      response,
+    });
+    return fallback;
   }
 
   async _cancelAllOrders(conditionId) {
