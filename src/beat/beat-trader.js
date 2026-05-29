@@ -132,6 +132,54 @@ function logReturn(currentPrice, priorPrice) {
   return Math.log(current / prior);
 }
 
+function lowerLogBarrierHitProbability({
+  currentValue,
+  targetValue,
+  secondsLeft,
+  driftPerSecond,
+  sigmaPerSqrtSecond,
+}) {
+  const current = Number(currentValue);
+  const target = Number(targetValue);
+  const horizon = Number(secondsLeft);
+  const mu = Number(driftPerSecond);
+  const sigma = Number(sigmaPerSqrtSecond);
+  if (!Number.isFinite(current) || !Number.isFinite(target) || current <= 0 || target <= 0) {
+    return null;
+  }
+  if (!Number.isFinite(horizon) || horizon <= 0) {
+    return current <= target ? 1 : 0;
+  }
+  if (current <= target) {
+    return 1;
+  }
+
+  const barrierDistance = Math.log(current / target);
+  if (!Number.isFinite(barrierDistance) || barrierDistance <= 0) {
+    return 1;
+  }
+
+  if (!Number.isFinite(sigma) || sigma <= 1e-12) {
+    if (!Number.isFinite(mu) || mu >= 0) {
+      return 0;
+    }
+    const hitTimeSeconds = barrierDistance / Math.abs(mu);
+    return hitTimeSeconds <= horizon ? 1 : 0;
+  }
+
+  const sigmaSqrtT = sigma * Math.sqrt(horizon);
+  if (!Number.isFinite(sigmaSqrtT) || sigmaSqrtT <= 1e-12) {
+    return 0;
+  }
+
+  const reflectedDrift = -mu;
+  const term1 = (reflectedDrift * horizon) - barrierDistance;
+  const term2 = (-reflectedDrift * horizon) - barrierDistance;
+  const exponent = clamp((2 * reflectedDrift * barrierDistance) / (sigma * sigma), -60, 60);
+  const probability = normalCDF(term1 / sigmaSqrtT) + (Math.exp(exponent) * normalCDF(term2 / sigmaSqrtT));
+  return clamp(probability, 0, 1);
+}
+
 function roundShareAmount(value, precision = 1e-9) {
   const num = Number(value);
   if (!Number.isFinite(num)) return 0;
@@ -790,6 +838,30 @@ export class BeatTrader {
     return history[0] ?? null;
   }
 
+  _seriesSampleAgo(series = [], msAgo, nowMs = Date.now()) {
+    const cutoffMs = nowMs - msAgo;
+    for (let i = series.length - 1; i >= 0; i -= 1) {
+      const sample = series[i];
+      if (Number(sample?.timestampMs ?? 0) <= cutoffMs) {
+        return sample;
+      }
+    }
+    return series[0] ?? null;
+  }
+
+  _askHistorySeries(side, nowMs = Date.now(), history = null) {
+    const sourceHistory = Array.isArray(history) ? history : this._effectiveSignalHistory(nowMs);
+    const askKey = side === 'Up' ? 'upAsk' : (side === 'Down' ? 'downAsk' : null);
+    if (!askKey) return [];
+    return sourceHistory
+      .map((entry) => ({
+        timestampMs: Number(entry?.timestampMs),
+        value: positiveFiniteOrNull(entry?.[askKey]),
+      }))
+      .filter((entry) => Number.isFinite(entry.timestampMs) && Number.isFinite(entry.value) && entry.value > 0)
+      .sort((a, b) => a.timestampMs - b.timestampMs);
+  }
+
   _ewmaSigmaPerSqrtSecond(history = []) {
     const lambda = clamp(Number(this.config.BEAT_PROBABILITY_VOL_LAMBDA) || 0.97, 0.5, 0.9999);
     let variance = null;
@@ -812,6 +884,138 @@ export class BeatTrader {
         : ((lambda * variance) + ((1 - lambda) * perSecondVariance));
     }
     return variance != null && variance > 0 ? Math.sqrt(variance) : null;
+  }
+
+  _ewmaSigmaPerSqrtSecondForSeries(series = [], lambda = null) {
+    const normalizedLambda = clamp(
+      Number.isFinite(Number(lambda))
+        ? Number(lambda)
+        : (Number(this.config.BEAT_PROBABILITY_VOL_LAMBDA) || 0.97),
+      0.5,
+      0.9999,
+    );
+    let variance = null;
+    for (let i = 1; i < series.length; i += 1) {
+      const prev = series[i - 1];
+      const next = series[i];
+      const prevValue = Number(prev?.value);
+      const nextValue = Number(next?.value);
+      const prevTs = Number(prev?.timestampMs);
+      const nextTs = Number(next?.timestampMs);
+      if (!Number.isFinite(prevValue) || !Number.isFinite(nextValue) || prevValue <= 0 || nextValue <= 0) continue;
+      if (!Number.isFinite(prevTs) || !Number.isFinite(nextTs) || nextTs <= prevTs) continue;
+      const dtSeconds = (nextTs - prevTs) / 1000;
+      if (!Number.isFinite(dtSeconds) || dtSeconds <= 0) continue;
+      const r = logReturn(nextValue, prevValue);
+      if (!Number.isFinite(r)) continue;
+      const perSecondVariance = (r * r) / dtSeconds;
+      variance = variance == null
+        ? perSecondVariance
+        : ((normalizedLambda * variance) + ((1 - normalizedLambda) * perSecondVariance));
+    }
+    return variance != null && variance > 0 ? Math.sqrt(variance) : null;
+  }
+
+  _pairCompletionModel({ buySide, buyPrice, snapshot = {}, history = null } = {}) {
+    const cfg = this.config;
+    if (!cfg.BEAT_PAIR_COMPLETION_ENABLED) {
+      return null;
+    }
+
+    const normalizedBuyPrice = Number(buyPrice);
+    const oppositeSide = this._oppositeSide(buySide);
+    if (!oppositeSide || !Number.isFinite(normalizedBuyPrice) || normalizedBuyPrice <= 0) {
+      return null;
+    }
+
+    const nowMs = Number(snapshot.snapshotAtMs ?? Date.now());
+    const effectiveHistory = Array.isArray(history) ? history : this._effectiveSignalHistory(nowMs);
+    const currentOppositeAsk = positiveFiniteOrNull(
+      oppositeSide === 'Up' ? snapshot.upBestAsk : snapshot.downBestAsk,
+    );
+    const pairCostThreshold = this._pairCostThreshold();
+    const targetOppositeAsk = Number.isFinite(pairCostThreshold)
+      ? pairCostThreshold - normalizedBuyPrice
+      : null;
+    const secondsLeft = Math.max(1, ((this.market.windowTs + this.config.MARKET_WINDOW_SECONDS) * 1000 - nowMs) / 1000);
+    if (!Number.isFinite(currentOppositeAsk) || !Number.isFinite(targetOppositeAsk) || targetOppositeAsk <= 0) {
+      return {
+        oppositeSide,
+        currentOppositeAsk,
+        targetOppositeAsk,
+        secondsLeft,
+        completionProbability: 0,
+        reason: 'missing-opposite-ask-or-target',
+      };
+    }
+    if (currentOppositeAsk <= targetOppositeAsk) {
+      return {
+        oppositeSide,
+        currentOppositeAsk,
+        targetOppositeAsk,
+        secondsLeft,
+        completionProbability: 1,
+        reason: 'already-pairable',
+      };
+    }
+
+    const askSeries = this._askHistorySeries(oppositeSide, nowMs, effectiveHistory);
+    if (askSeries.length < 2) {
+      return {
+        oppositeSide,
+        currentOppositeAsk,
+        targetOppositeAsk,
+        secondsLeft,
+        completionProbability: 0,
+        reason: 'insufficient-ask-history',
+      };
+    }
+
+    const checkpointsMs = [1_000, 3_000, 10_000, 30_000];
+    const perSecondMomentum = Object.fromEntries(checkpointsMs.map((ms) => {
+      const sample = this._seriesSampleAgo(askSeries, ms, nowMs);
+      const priorValue = Number(sample?.value);
+      const value = logReturn(currentOppositeAsk, priorValue);
+      return [ms, Number.isFinite(value) ? value / (ms / 1000) : 0];
+    }));
+
+    const askMomentum1 = perSecondMomentum[1_000];
+    const askMomentum3 = perSecondMomentum[3_000];
+    const askMomentum10 = perSecondMomentum[10_000];
+    const askMomentum30 = perSecondMomentum[30_000];
+    const askDriftRaw = (
+      (0.45 * askMomentum1) +
+      (0.30 * askMomentum3) +
+      (0.20 * askMomentum10) +
+      (0.05 * askMomentum30)
+    );
+    const askDrift = clamp(Number(cfg.BEAT_PAIR_COMPLETION_DRIFT_SHRINK) || 0.25, 0, 1) * askDriftRaw;
+    const askSigmaPerSqrtSecond = this._ewmaSigmaPerSqrtSecondForSeries(askSeries);
+    const barrierLogDistance = Math.log(currentOppositeAsk / targetOppositeAsk);
+    const completionProbability = lowerLogBarrierHitProbability({
+      currentValue: currentOppositeAsk,
+      targetValue: targetOppositeAsk,
+      secondsLeft,
+      driftPerSecond: askDrift,
+      sigmaPerSqrtSecond: askSigmaPerSqrtSecond,
+    });
+
+    return {
+      oppositeSide,
+      currentOppositeAsk,
+      targetOppositeAsk,
+      secondsLeft,
+      barrierLogDistance: Number.isFinite(barrierLogDistance) ? barrierLogDistance : null,
+      sigmaPerSqrtSecond: askSigmaPerSqrtSecond,
+      driftPerSecond: askDrift,
+      driftRawPerSecond: askDriftRaw,
+      momentum1s: askMomentum1,
+      momentum3s: askMomentum3,
+      momentum10s: askMomentum10,
+      momentum30s: askMomentum30,
+      completionProbability: Number.isFinite(completionProbability) ? completionProbability : 0,
+      reason: 'modeled',
+    };
   }
 
   _probabilityModel(snapshot = {}) {
@@ -1086,6 +1290,7 @@ export class BeatTrader {
     };
 
     const absoluteMove = Math.abs(delta);
+    const effectiveHistory = probabilityModel ? this._effectiveSignalHistory(Number(snapshot?.snapshotAtMs ?? Date.now())) : null;
     if (!probabilityModel && absoluteMove > Math.max(thresholds.upMax, thresholds.downMax)) {
       this._recordAudit('decision_skip', {
         reason: 'delta-outside-thresholds',
@@ -1109,14 +1314,26 @@ export class BeatTrader {
         const modelEdge = Number.isFinite(sideProbability) && Number.isFinite(leg.ask?.price)
           ? sideProbability - leg.ask.price
           : null;
+        const pairCompletionModel = probabilityModel
+          ? this._pairCompletionModel({
+            buySide: side,
+            buyPrice: leg.ask?.price,
+            snapshot,
+            history: effectiveHistory,
+          })
+          : null;
+        const pairCompletionProbability = Number(pairCompletionModel?.completionProbability);
+        const effectiveModelEdge = Number.isFinite(modelEdge) && Number.isFinite(pairCompletionProbability)
+          ? modelEdge * pairCompletionProbability
+          : modelEdge;
         const dynamicBuyMax = probabilityModel && Number.isFinite(sideProbability)
           ? Math.min(
             leg.maxBuyPrice,
             Math.max(0, sideProbability - Number(cfg.BEAT_PROBABILITY_REQUIRED_EDGE)),
           )
           : leg.maxBuyPrice;
-        const edgeFactor = Number.isFinite(modelEdge)
-          ? clamp(modelEdge / Math.max(0.0001, Number(cfg.BEAT_PROBABILITY_REQUIRED_EDGE)), 0, 1)
+        const edgeFactor = Number.isFinite(effectiveModelEdge)
+          ? clamp(effectiveModelEdge / Math.max(0.0001, Number(cfg.BEAT_PROBABILITY_REQUIRED_EDGE)), 0, 1)
           : 0;
         const baseMoveMax = side === 'Up' ? thresholds.upMax : thresholds.downMax;
         const dynamicMoveMax = probabilityModel
@@ -1127,30 +1344,33 @@ export class BeatTrader {
           : baseMoveMax;
 
         if (!leg.ask) {
-          return { side, leg, affordable: false, maxPrice: null, reason: 'missing-best-ask', sideProbability, modelEdge, dynamicBuyMax, dynamicMoveMax };
+          return { side, leg, affordable: false, maxPrice: null, reason: 'missing-best-ask', sideProbability, modelEdge, effectiveModelEdge, pairCompletionModel, dynamicBuyMax, dynamicMoveMax };
         }
         if (!Number.isFinite(leg.bookAgeMs) || leg.bookAgeMs > cfg.BEAT_BOOK_MAX_AGE_MS) {
-          return { side, leg, affordable: false, maxPrice: null, reason: 'stale-book', sideProbability, modelEdge, dynamicBuyMax, dynamicMoveMax };
+          return { side, leg, affordable: false, maxPrice: null, reason: 'stale-book', sideProbability, modelEdge, effectiveModelEdge, pairCompletionModel, dynamicBuyMax, dynamicMoveMax };
         }
         if (probabilityModel) {
           if (!Number.isFinite(probabilityModel.pairCost) || probabilityModel.pairCost > Number(cfg.BEAT_PROBABILITY_PAIR_COST_MAX)) {
-            return { side, leg, affordable: false, maxPrice: null, reason: 'pair-cost-too-high', sideProbability, modelEdge, dynamicBuyMax, dynamicMoveMax };
+            return { side, leg, affordable: false, maxPrice: null, reason: 'pair-cost-too-high', sideProbability, modelEdge, effectiveModelEdge, pairCompletionModel, dynamicBuyMax, dynamicMoveMax };
           }
-          if (!Number.isFinite(modelEdge) || modelEdge < Number(cfg.BEAT_PROBABILITY_REQUIRED_EDGE)) {
-            return { side, leg, affordable: false, maxPrice: null, reason: 'probability-edge-too-small', sideProbability, modelEdge, dynamicBuyMax, dynamicMoveMax };
+          if (!Number.isFinite(pairCompletionProbability) || pairCompletionProbability < Number(cfg.BEAT_PAIR_COMPLETION_MIN_PROBABILITY)) {
+            return { side, leg, affordable: false, maxPrice: null, reason: 'pair-completion-probability-too-small', sideProbability, modelEdge, effectiveModelEdge, pairCompletionModel, dynamicBuyMax, dynamicMoveMax };
+          }
+          if (!Number.isFinite(effectiveModelEdge) || effectiveModelEdge < Number(cfg.BEAT_PROBABILITY_REQUIRED_EDGE)) {
+            return { side, leg, affordable: false, maxPrice: null, reason: 'probability-edge-too-small', sideProbability, modelEdge, effectiveModelEdge, pairCompletionModel, dynamicBuyMax, dynamicMoveMax };
           }
           if (absoluteMove > dynamicMoveMax) {
-            return { side, leg, affordable: false, maxPrice: null, reason: 'move-above-dynamic-cap', sideProbability, modelEdge, dynamicBuyMax, dynamicMoveMax };
+            return { side, leg, affordable: false, maxPrice: null, reason: 'move-above-dynamic-cap', sideProbability, modelEdge, effectiveModelEdge, pairCompletionModel, dynamicBuyMax, dynamicMoveMax };
           }
         }
         if (leg.ask.price > dynamicBuyMax) {
-          return { side, leg, affordable: false, maxPrice: null, reason: 'ask-above-buy-max', sideProbability, modelEdge, dynamicBuyMax, dynamicMoveMax };
+          return { side, leg, affordable: false, maxPrice: null, reason: 'ask-above-buy-max', sideProbability, modelEdge, effectiveModelEdge, pairCompletionModel, dynamicBuyMax, dynamicMoveMax };
         }
         const maxPrice = clampMaxPrice(leg.ask.price, dynamicBuyMax, cfg.BEAT_MAX_SLIPPAGE);
         if (maxPrice + 1e-9 < leg.ask.price) {
-          return { side, leg, affordable: false, maxPrice, reason: 'clamped-price-below-ask', sideProbability, modelEdge, dynamicBuyMax, dynamicMoveMax };
+          return { side, leg, affordable: false, maxPrice, reason: 'clamped-price-below-ask', sideProbability, modelEdge, effectiveModelEdge, pairCompletionModel, dynamicBuyMax, dynamicMoveMax };
         }
-        return { side, leg, affordable: true, maxPrice, reason: null, sideProbability, modelEdge, dynamicBuyMax, dynamicMoveMax };
+        return { side, leg, affordable: true, maxPrice, reason: null, sideProbability, modelEdge, effectiveModelEdge, pairCompletionModel, dynamicBuyMax, dynamicMoveMax };
       });
 
     const affordableLegs = candidateLegs.filter((entry) => entry.affordable);
@@ -1172,6 +1392,8 @@ export class BeatTrader {
           maxPrice: entry.maxPrice,
           sideProbability: entry.sideProbability ?? null,
           modelEdge: entry.modelEdge ?? null,
+          effectiveModelEdge: entry.effectiveModelEdge ?? null,
+          pairCompletionModel: entry.pairCompletionModel ?? null,
         })),
         probabilityModel,
       });
@@ -1180,8 +1402,8 @@ export class BeatTrader {
 
     const selected = affordableLegs
       .sort((a, b) => {
-        const aEdge = Number.isFinite(a.modelEdge) ? -a.modelEdge : Infinity;
-        const bEdge = Number.isFinite(b.modelEdge) ? -b.modelEdge : Infinity;
+        const aEdge = Number.isFinite(a.effectiveModelEdge) ? -a.effectiveModelEdge : Infinity;
+        const bEdge = Number.isFinite(b.effectiveModelEdge) ? -b.effectiveModelEdge : Infinity;
         if (aEdge !== bEdge) return aEdge - bEdge;
         const aPreferred = a.side === preferredSide ? 0 : 1;
         const bPreferred = b.side === preferredSide ? 0 : 1;
@@ -1257,6 +1479,8 @@ export class BeatTrader {
         maxPrice: entry.maxPrice,
         sideProbability: entry.sideProbability ?? null,
         modelEdge: entry.modelEdge ?? null,
+        effectiveModelEdge: entry.effectiveModelEdge ?? null,
+        pairCompletionModel: entry.pairCompletionModel ?? null,
       })),
       selectedLeg: {
         tokenId: leg.tokenId,
@@ -1268,6 +1492,8 @@ export class BeatTrader {
         maxPrice,
         sideProbability: selected.sideProbability ?? null,
         modelEdge: selected.modelEdge ?? null,
+        effectiveModelEdge: selected.effectiveModelEdge ?? null,
+        pairCompletionModel: selected.pairCompletionModel ?? null,
       },
       ofiDecision,
       probabilityModel,
@@ -1834,6 +2060,46 @@ export class BeatTrader {
       return false;
     }
 
+    const pairCompletionModel = probabilityModel
+      ? this._pairCompletionModel({
+        buySide: chosenSide,
+        buyPrice: askPrice,
+        snapshot,
+      })
+      : null;
+    const pairCompletionProbability = Number(pairCompletionModel?.completionProbability);
+    const pairAdjustedEdge = Number.isFinite(chosenProbability) && Number.isFinite(askPrice) && Number.isFinite(pairCompletionProbability)
+      ? ((chosenProbability - askPrice) * pairCompletionProbability)
+      : null;
+    if (probabilityModel) {
+      if (!Number.isFinite(pairCompletionProbability) || pairCompletionProbability < Number(cfg.BEAT_PAIR_COMPLETION_MIN_PROBABILITY)) {
+        this._recordAudit('trend_moment_skip', {
+          reason: 'pair-completion-probability-too-small',
+          chosenSide,
+          secondsAfterOpen,
+          trendMoment,
+          askPrice,
+          chosenProbability,
+          pairAdjustedEdge,
+          pairCompletionModel,
+        });
+        return false;
+      }
+      if (!Number.isFinite(pairAdjustedEdge) || pairAdjustedEdge < Number(cfg.BEAT_PROBABILITY_REQUIRED_EDGE)) {
+        this._recordAudit('trend_moment_skip', {
+          reason: 'pair-adjusted-edge-too-small',
+          chosenSide,
+          secondsAfterOpen,
+          trendMoment,
+          askPrice,
+          chosenProbability,
+          pairAdjustedEdge,
+          pairCompletionModel,
+        });
+        return false;
+      }
+    }
+
     const ofiDecision = this.ofi.decisionFor(
       leg.tokenId,
       Number(leg.book?.tickSize ?? 0.01),
@@ -1865,6 +2131,8 @@ export class BeatTrader {
         ofiDecision,
         chosenProbability,
         probabilityEdge,
+        pairAdjustedEdge,
+        pairCompletionModel,
         momentumDirectional,
         velocityDirectional,
         accelerationDirectional,
@@ -1886,6 +2154,8 @@ export class BeatTrader {
       maxPrice,
       chosenProbability,
       probabilityEdge,
+      pairAdjustedEdge,
+      pairCompletionModel,
       momentumDirectional,
       velocityDirectional,
       accelerationDirectional,
