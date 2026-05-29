@@ -14,7 +14,7 @@ import { BtcPriceFeed } from './btc-price-feed.js';
 import { BEAT_LIFECYCLE } from './lifecycle.js';
 import { applyBeatRuntimeConfigPatch, createBeatRuntimeConfig } from './runtime-config.js';
 
-const PRICE_FEED_SOURCE_ORDER = ['rtds', 'binance', 'coinbase', 'okx', 'hyperliquid'];
+const PRICE_FEED_SOURCE_ORDER = ['binance', 'okx', 'coinbase', 'rtds', 'hyperliquid'];
 
 function feedConfigsFor(symbol) {
   const normalized = String(symbol ?? 'BTC').trim().toUpperCase();
@@ -335,7 +335,7 @@ export async function main() {
 
       if (stopping) return;
 
-      const symbolFeed = primaryPriceFeeds.get(symbol) ?? priceFeeds.get(`${symbol}-rtds`) ?? priceFeeds.get(`${symbol}-binance`);
+        const symbolFeed = primaryPriceFeeds.get(symbol) ?? priceFeeds.get(`${symbol}-binance`) ?? priceFeeds.get(`${symbol}-rtds`);
       const trader = new BeatTrader(market, wallet, pnl, {
         dashboard,
         btcFeed: symbolFeed,

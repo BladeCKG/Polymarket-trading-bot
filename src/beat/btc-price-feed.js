@@ -79,6 +79,15 @@ export class BtcPriceFeed extends EventEmitter {
     this._pingTimer = null;
   }
 
+  _logContext(extra = {}) {
+    return {
+      source: this.source,
+      productId: this.productId,
+      url: this.url,
+      ...extra,
+    };
+  }
+
   _detectSource(url) {
     if (/polymarket|ws-live-data/i.test(url)) return 'rtds';
     if (/binance/i.test(url)) return 'binance';
@@ -391,9 +400,10 @@ export class BtcPriceFeed extends EventEmitter {
       this._subscribe();
       this._startPing();
       logger.debug('BtcPriceFeed: connected', {
-        url: this.url,
-        topic: this.topic,
-        filters: this.productId,
+        ...this._logContext({
+          topic: this.topic,
+          filters: this.productId,
+        }),
       });
     });
 
@@ -409,12 +419,12 @@ export class BtcPriceFeed extends EventEmitter {
         const msg = JSON.parse(text);
         this._handleMessage(msg);
       } catch (err) {
-        logger.warn('BtcPriceFeed: parse error', { err: err.message });
+        logger.warn('BtcPriceFeed: parse error', this._logContext({ err: err.message }));
       }
     });
 
     this._ws.on('error', (err) => {
-      logger.warn('BtcPriceFeed: websocket error', { err: err.message });
+      logger.warn('BtcPriceFeed: websocket error', this._logContext({ err: err.message }));
       this.emit('error', err);
     });
 
@@ -431,7 +441,7 @@ export class BtcPriceFeed extends EventEmitter {
       if (this._closed) return;
       const delayMs = this._reconnectDelayMs;
       this._reconnectDelayMs = Math.min(this._reconnectDelayMs * 2, 30_000);
-      logger.warn('BtcPriceFeed: websocket closed, reconnecting', { delayMs });
+      logger.warn('BtcPriceFeed: websocket closed, reconnecting', this._logContext({ delayMs }));
       setTimeout(() => this._connect(), delayMs);
     });
   }
@@ -654,18 +664,16 @@ export class BtcPriceFeed extends EventEmitter {
       if (this._ws.readyState !== WebSocket.OPEN) return;
       const idleMs = Date.now() - this._lastTickAtMs;
       if (idleMs <= this.stallReconnectMs) return;
-      logger.warn('BtcPriceFeed: tick stream stalled, forcing reconnect', {
-        productId: this.productId,
+      logger.warn('BtcPriceFeed: tick stream stalled, forcing reconnect', this._logContext({
         idleMs,
         stallReconnectMs: this.stallReconnectMs,
-      });
+      }));
       try {
         this._ws.terminate();
       } catch (err) {
-        logger.warn('BtcPriceFeed: terminate failed after stall', {
-          productId: this.productId,
+        logger.warn('BtcPriceFeed: terminate failed after stall', this._logContext({
           err: err.message,
-        });
+        }));
       }
     }, 1_000);
     this._stallCheckTimer.unref?.();
@@ -685,7 +693,7 @@ export class BtcPriceFeed extends EventEmitter {
           this._ws.send('PING');
         }
       } catch (err) {
-        logger.warn('BtcPriceFeed: failed to send ping', { err: err.message });
+        logger.warn('BtcPriceFeed: failed to send ping', this._logContext({ err: err.message }));
       }
     }, PING_INTERVAL_MS);
     this._pingTimer.unref?.();
