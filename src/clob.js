@@ -17,6 +17,12 @@ import axios from 'axios';
 import WebSocket from 'ws';
 import { ethers } from 'ethers';
 import {
+  ClobClient as PolymarketSdkClobClient,
+  Side as PolymarketSide,
+  OrderType as PolymarketOrderType,
+  Chain as PolymarketChain,
+} from '@polymarket/clob-client';
+import {
   CLOB_API_URL,
   CLOB_WS_URL,
   GAMMA_API_URL,
@@ -299,9 +305,67 @@ async function buildMarketSellOrder(wallet, tokenId, minPrice, shares, expiry = 
 // ── Public API ────────────────────────────────────────────────────────────────
 export class ClobClient {
   static _creds = null;
+  static _sdkCreds = null;
+  static _sdkClient = null;
   static _signerAddress = null;
   static _wallet = null;
   static _takerFeeCache = new Map();
+  static _heartbeatId = null;
+
+  static _createSdkSigner(wallet) {
+    if (!wallet) throw new Error('CLOB wallet not initialised');
+    return {
+      _signTypedData: (domain, types, value) => wallet.signTypedData(domain, types, value),
+      getAddress: async () => wallet.address,
+    };
+  }
+
+  static _normalizeCreds(creds = null) {
+    if (!creds) return null;
+    const key = creds.key ?? creds.apiKey ?? '';
+    return {
+      key,
+      apiKey: key,
+      secret: creds.secret,
+      passphrase: creds.passphrase,
+    };
+  }
+
+  static _buildSdkClient(wallet, creds = null) {
+    return new PolymarketSdkClobClient(
+      CLOB_API_URL,
+      PolymarketChain.POLYGON,
+      ClobClient._createSdkSigner(wallet),
+      creds,
+      Number(SIGNATURE_TYPE),
+      PROXY_WALLET,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      true,
+    );
+  }
+
+  static async _deriveOrCreateSdkCreds(client) {
+    try {
+      return await client.deriveApiKey();
+    } catch (deriveErr) {
+      logger.warn('CLOB: deriveApiKey failed, trying createApiKey', {
+        err: deriveErr.message,
+      });
+      return client.createApiKey();
+    }
+  }
+
+  static _requireSdkClient() {
+    if (!ClobClient._sdkClient) {
+      throw new Error('CLOB SDK client not initialised');
+    }
+    return ClobClient._sdkClient;
+  }
 
   /**
    * Initialise the client.
@@ -312,14 +376,19 @@ export class ClobClient {
   static async init(wallet, { apiKey, secret, passphrase } = {}) {
     ClobClient._wallet = wallet;
     ClobClient._signerAddress = wallet.address;
+    ClobClient._sdkClient = ClobClient._buildSdkClient(wallet);
     try {
       logger.info('CLOB: deriving API credentials via L1 auth…');
-      ClobClient._creds = await ClobClient._deriveCredentials(wallet);
+      ClobClient._sdkCreds = await ClobClient._deriveOrCreateSdkCreds(ClobClient._sdkClient);
+      ClobClient._creds = ClobClient._normalizeCreds(ClobClient._sdkCreds);
+      ClobClient._sdkClient = ClobClient._buildSdkClient(wallet, ClobClient._sdkCreds);
       logger.info('CLOB: credentials derived', { apiKey: ClobClient._creds.apiKey });
       return;
     } catch (err) {
       if (apiKey && secret && passphrase) {
-        ClobClient._creds = { apiKey, secret, passphrase };
+        ClobClient._sdkCreds = { key: apiKey, secret, passphrase };
+        ClobClient._creds = ClobClient._normalizeCreds(ClobClient._sdkCreds);
+        ClobClient._sdkClient = ClobClient._buildSdkClient(wallet, ClobClient._sdkCreds);
         logger.warn('CLOB: credential derivation failed, falling back to provided credentials', {
           err: err.message,
         });
@@ -333,7 +402,10 @@ export class ClobClient {
     if (!ClobClient._wallet) {
       throw new Error('CLOB wallet not initialised — cannot refresh API credentials');
     }
-    ClobClient._creds = await ClobClient._deriveCredentials(ClobClient._wallet);
+    const bootstrapClient = ClobClient._buildSdkClient(ClobClient._wallet);
+    ClobClient._sdkCreds = await ClobClient._deriveOrCreateSdkCreds(bootstrapClient);
+    ClobClient._creds = ClobClient._normalizeCreds(ClobClient._sdkCreds);
+    ClobClient._sdkClient = ClobClient._buildSdkClient(ClobClient._wallet, ClobClient._sdkCreds);
     logger.info('CLOB: refreshed API credentials', { apiKey: ClobClient._creds.apiKey });
     return ClobClient._creds;
   }
@@ -438,7 +510,13 @@ export class ClobClient {
    * @see https://docs.polymarket.com/api-reference/trade/send-heartbeat
    */
   static async sendHeartbeat() {
-    await restCall('POST', '/heartbeats', {});
+    const client = ClobClient._requireSdkClient();
+    const response = await client.postHeartbeat(ClobClient._heartbeatId);
+    const nextHeartbeatId = response?.heartbeat_id ?? response?.heartbeatId ?? null;
+    if (nextHeartbeatId) {
+      ClobClient._heartbeatId = nextHeartbeatId;
+    }
+    return response;
   }
 
   // ── Order book ──────────────────────────────────────────────────────────────
@@ -586,36 +664,27 @@ export class ClobClient {
    * Returns the orderId string, or throws on rejection.
    */
   static async postLimitBuy(wallet, tokenId, price, shares, negRisk = true) {
-    const feeRateBps = await ClobClient.getTakerFeeBps(tokenId);
     const { tickSize } = await ClobClient.getBook(tokenId);
-    const { orderData, signature } = await buildLimitBuyOrder(
-      wallet, tokenId, price, shares, 0, negRisk, feeRateBps, tickSize,
+    const client = ClobClient._requireSdkClient();
+    const res = await client.createAndPostOrder(
+      { tokenID: tokenId, price, size: shares, side: PolymarketSide.BUY },
+      { tickSize: String(tickSize), negRisk },
+      PolymarketOrderType.GTC,
     );
-    const body = {
-      order: { ...orderData, signature },
-      owner:     ClobClient._creds.apiKey,  // API key UUID, not proxy wallet
-      orderType: 'GTC',
-    };
-    const path = '/order';
-    const res  = await restCall('POST', path, body);
-    if (!res.success) throw new Error(`Order rejected: ${res.errorMsg ?? JSON.stringify(res)}`);
-    logger.debug('CLOB: limit buy posted', { tokenId, price, shares, orderId: res.orderId });
-    return res.orderId;
+    const orderId = res?.orderID ?? res?.orderId ?? null;
+    if (!res?.success) throw new Error(`Order rejected: ${res?.errorMsg ?? JSON.stringify(res)}`);
+    logger.debug('CLOB: limit buy posted', { tokenId, price, shares, orderId });
+    return orderId;
   }
 
   static async postFOKLimitBuy(wallet, tokenId, price, shares, negRisk = true) {
-    const feeRateBps = await ClobClient.getTakerFeeBps(tokenId);
     const { tickSize } = await ClobClient.getBook(tokenId);
-    const { orderData, signature } = await buildLimitBuyOrder(
-      wallet, tokenId, price, shares, 0, negRisk, feeRateBps, tickSize,
+    const client = ClobClient._requireSdkClient();
+    const order = await client.createOrder(
+      { tokenID: tokenId, price, size: shares, side: PolymarketSide.BUY },
+      { tickSize: String(tickSize), negRisk },
     );
-    const body = {
-      order: { ...orderData, signature },
-      owner: ClobClient._creds.apiKey,
-      orderType: 'FOK',
-    };
-    const path = '/order';
-    const res = await restCall('POST', path, body);
+    const res = await client.postOrder(order, PolymarketOrderType.FOK);
     if (res.success === false) {
       logger.warn('CLOB: FOK limit buy rejected', { tokenId, price, shares, errorMsg: res.errorMsg, status: res.status });
     } else {
@@ -625,21 +694,17 @@ export class ClobClient {
   }
 
   static async postLimitSell(wallet, tokenId, price, shares, negRisk = true) {
-    const feeRateBps = await ClobClient.getTakerFeeBps(tokenId);
     const { tickSize } = await ClobClient.getBook(tokenId);
-    const { orderData, signature } = await buildMarketSellOrder(
-      wallet, tokenId, price, shares, 0, negRisk, feeRateBps, tickSize,
+    const client = ClobClient._requireSdkClient();
+    const res = await client.createAndPostOrder(
+      { tokenID: tokenId, price, size: shares, side: PolymarketSide.SELL },
+      { tickSize: String(tickSize), negRisk },
+      PolymarketOrderType.GTC,
     );
-    const body = {
-      order: { ...orderData, signature },
-      owner: ClobClient._creds.apiKey,
-      orderType: 'GTC',
-    };
-    const path = '/order';
-    const res = await restCall('POST', path, body);
-    if (!res.success) throw new Error(`Order rejected: ${res.errorMsg ?? JSON.stringify(res)}`);
-    logger.debug('CLOB: limit sell posted', { tokenId, price, shares, orderId: res.orderId });
-    return res.orderId;
+    const orderId = res?.orderID ?? res?.orderId ?? null;
+    if (!res?.success) throw new Error(`Order rejected: ${res?.errorMsg ?? JSON.stringify(res)}`);
+    logger.debug('CLOB: limit sell posted', { tokenId, price, shares, orderId });
+    return orderId;
   }
 
   /**
@@ -655,18 +720,19 @@ export class ClobClient {
    * @param {boolean} negRisk - true for Neg Risk markets, false for standard binary markets
    */
   static async postIOCBuy(wallet, tokenId, maxPrice, amountUsdc, negRisk = true) {
-    const feeRateBps = await ClobClient.getTakerFeeBps(tokenId);
     const { tickSize } = await ClobClient.getBook(tokenId);
-    const { orderData, signature } = await buildMarketBuyOrder(
-      wallet, tokenId, maxPrice, amountUsdc, 0, negRisk, feeRateBps, tickSize,
+    const client = ClobClient._requireSdkClient();
+    const res = await client.createAndPostMarketOrder(
+      {
+        tokenID: tokenId,
+        price: maxPrice,
+        amount: amountUsdc,
+        side: PolymarketSide.BUY,
+        orderType: PolymarketOrderType.FAK,
+      },
+      { tickSize: String(tickSize), negRisk },
+      PolymarketOrderType.FAK,
     );
-    const body = {
-      order: { ...orderData, signature },
-      owner:     ClobClient._creds.apiKey,  // API key UUID, not proxy wallet
-      orderType: 'FAK',
-    };
-    const path = '/order';
-    const res  = await restCall('POST', path, body);
     if (res.success === false) {
       logger.warn('CLOB: FAK buy rejected', { tokenId, errorMsg: res.errorMsg, status: res.status });
     } else {
@@ -685,18 +751,19 @@ export class ClobClient {
    * @param {boolean} negRisk - true for Neg Risk markets, false for standard binary markets
    */
   static async postFOKBuy(wallet, tokenId, maxPrice, amountUsdc, negRisk = true) {
-    const feeRateBps = await ClobClient.getTakerFeeBps(tokenId);
     const { tickSize } = await ClobClient.getBook(tokenId);
-    const { orderData, signature } = await buildMarketBuyOrder(
-      wallet, tokenId, maxPrice, amountUsdc, 0, negRisk, feeRateBps, tickSize,
+    const client = ClobClient._requireSdkClient();
+    const res = await client.createAndPostMarketOrder(
+      {
+        tokenID: tokenId,
+        price: maxPrice,
+        amount: amountUsdc,
+        side: PolymarketSide.BUY,
+        orderType: PolymarketOrderType.FOK,
+      },
+      { tickSize: String(tickSize), negRisk },
+      PolymarketOrderType.FOK,
     );
-    const body = {
-      order: { ...orderData, signature },
-      owner:     ClobClient._creds.apiKey,  // API key UUID, not proxy wallet
-      orderType: 'FOK',
-    };
-    const path = '/order';
-    const res  = await restCall('POST', path, body);
     if (res.success === false) {
       logger.warn('CLOB: FOK buy rejected', { tokenId, errorMsg: res.errorMsg, status: res.status });
     } else {
@@ -706,18 +773,19 @@ export class ClobClient {
   }
 
   static async postFOKSell(wallet, tokenId, minPrice, shares, negRisk = true) {
-    const feeRateBps = await ClobClient.getTakerFeeBps(tokenId);
     const { tickSize } = await ClobClient.getBook(tokenId);
-    const { orderData, signature } = await buildMarketSellOrder(
-      wallet, tokenId, minPrice, shares, 0, negRisk, feeRateBps, tickSize,
+    const client = ClobClient._requireSdkClient();
+    const res = await client.createAndPostMarketOrder(
+      {
+        tokenID: tokenId,
+        price: minPrice,
+        amount: shares,
+        side: PolymarketSide.SELL,
+        orderType: PolymarketOrderType.FOK,
+      },
+      { tickSize: String(tickSize), negRisk },
+      PolymarketOrderType.FOK,
     );
-    const body = {
-      order: { ...orderData, signature },
-      owner:     ClobClient._creds.apiKey,
-      orderType: 'FOK',
-    };
-    const path = '/order';
-    const res  = await restCall('POST', path, body);
     if (res.success === false) {
       logger.warn('CLOB: FOK sell rejected', { tokenId, errorMsg: res.errorMsg, status: res.status });
     } else {
@@ -730,8 +798,8 @@ export class ClobClient {
    * Cancel a single order by orderId.
    */
   static async cancelOrder(orderId) {
-    const path = `/order/${orderId}`;
-    const res  = await restCall('DELETE', path);
+    const client = ClobClient._requireSdkClient();
+    const res = await client.cancelOrder({ orderID: orderId });
     logger.debug('CLOB: order cancelled', { orderId });
     return res;
   }
@@ -740,8 +808,8 @@ export class ClobClient {
    * Cancel all open orders for this wallet.
    */
   static async cancelAll() {
-    const path = '/orders';
-    const res  = await restCall('DELETE', path);
+    const client = ClobClient._requireSdkClient();
+    const res = await client.cancelAll();
     logger.info('CLOB: all orders cancelled');
     return res;
   }
@@ -750,8 +818,8 @@ export class ClobClient {
    * Cancel all open orders for a specific market (conditionId).
    */
   static async cancelMarket(conditionId) {
-    const path = `/orders/cancel/market`;
-    const res  = await restCall('DELETE', path, { market: conditionId });
+    const client = ClobClient._requireSdkClient();
+    const res = await client.cancelMarketOrders({ market: conditionId });
     logger.debug('CLOB: market orders cancelled', { conditionId });
     return res;
   }
@@ -761,8 +829,8 @@ export class ClobClient {
    * Returns array of order objects with { id, tokenId, price, size, side }.
    */
   static async getOpenOrders(conditionId) {
-    const path = `/orders?market=${conditionId}&maker_address=${PROXY_WALLET}`;
-    const res  = await restCall('GET', path);
+    const client = ClobClient._requireSdkClient();
+    const res = await client.getOpenOrders({ market: conditionId });
     return res ?? [];
   }
 }
