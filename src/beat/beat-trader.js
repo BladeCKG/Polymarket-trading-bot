@@ -2868,21 +2868,7 @@ export class BeatTrader {
   }
 
   _checkCircuitBreakers() {
-    const cfg = this.config;
     if (this.halted) return true;
-
-    if (this.totalSpent >= cfg.MAX_SPEND_PER_MARKET) {
-      if (!this.stopBuying) {
-        this.log.info('BeatTrader: spend cap reached', { totalSpent: this.totalSpent.toFixed(2) });
-        this._recordAudit('circuit_breaker', {
-          reason: 'spend-cap',
-          totalSpent: this.totalSpent,
-          maxSpendPerMarket: cfg.MAX_SPEND_PER_MARKET,
-        });
-      }
-      this.stopBuying = true;
-      return false;
-    }
 
     return false;
   }
