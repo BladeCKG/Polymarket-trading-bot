@@ -1143,6 +1143,8 @@ export class BeatTrader {
     const upOfi = this.ofi.snapshotFor(this.market.upToken.tokenId, nowMs);
     const downOfi = this.ofi.snapshotFor(this.market.downToken.tokenId, nowMs);
     const ofiDiff = Number(upOfi?.ofiScore ?? 0) - Number(downOfi?.ofiScore ?? 0);
+    const ofiThreshold = Math.max(1, Number(this.config.BEAT_OFI_TOXICITY_THRESHOLD) || 200);
+    const ofiMomentumFactor = clamp(ofiDiff / ofiThreshold, -1, 1);
 
     const sigmaPerSqrtSecond = this._ewmaSigmaPerSqrtSecond(history);
     const secondsLeft = Math.max(1, ((this.market.windowTs + this.config.MARKET_WINDOW_SECONDS) * 1000 - nowMs) / 1000);
@@ -1153,9 +1155,21 @@ export class BeatTrader {
       (0.15 * momentum0To30)
     );
     const muMicro = microMomentum;
+    const momentumScale = Math.max(
+      Math.abs(muRaw),
+      Math.abs(muMicro),
+      Math.abs(momentumComposite),
+      Number.isFinite(sigmaPerSqrtSecond) && sigmaPerSqrtSecond > 0
+        ? (sigmaPerSqrtSecond / Math.sqrt(secondsLeft))
+        : 0,
+      1e-6,
+    );
+    const ofiWeight = Math.max(0, Number(this.config.BEAT_PROBABILITY_OFI_WEIGHT) || 0.20);
+    const ofiMomentumAdjustment = ofiWeight * ofiMomentumFactor * momentumScale;
     const muBlended = (
       (0.75 * muRaw) +
-      (0.25 * muMicro)
+      (0.25 * muMicro) +
+      ofiMomentumAdjustment
     );
     const driftShrink = clamp(Number(this.config.BEAT_PROBABILITY_DRIFT_SHRINK) || 0.35, 0, 1);
     const mu = driftShrink * muBlended;
@@ -1191,6 +1205,8 @@ export class BeatTrader {
         driftPerSecond: mu,
         driftRawPerSecond: muRaw,
         microDriftPerSecond: muMicro,
+        ofiMomentumFactor,
+        ofiMomentumAdjustment,
         momentum0To0_5,
         momentum0To1,
         momentum0To2,

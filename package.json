@@ -28,28 +28,28 @@
   "scripts": {
     "install-shell-hooks": "node scripts/install-shell-hooks-runner.mjs",
     "ensure-deps": "node scripts/ensure-deps.mjs",
-    "start":    "node scripts/ensure-deps.mjs && node src/index.js",
-    "dev":      "node scripts/ensure-deps.mjs && node --watch src/index.js",
-    "arb":      "node scripts/ensure-deps.mjs && cross-env TRADING_MODE=arb  node src/index.js",
-    "copy":     "node scripts/ensure-deps.mjs && cross-env TRADING_MODE=copy node src/index.js",
-    "beat":     "node scripts/ensure-deps.mjs && cross-env TRADING_MODE=beat node src/index.js",
-    "value":    "node scripts/ensure-deps.mjs && cross-env TRADING_MODE=value node src/index.js",
-    "arb:dev":  "node scripts/ensure-deps.mjs && cross-env TRADING_MODE=arb  node --watch src/index.js",
+    "start": "node scripts/ensure-deps.mjs && node src/index.js",
+    "dev": "node scripts/ensure-deps.mjs && node --watch src/index.js",
+    "arb": "node scripts/ensure-deps.mjs && cross-env TRADING_MODE=arb  node src/index.js",
+    "copy": "node scripts/ensure-deps.mjs && cross-env TRADING_MODE=copy node src/index.js",
+    "beat": "node scripts/ensure-deps.mjs && cross-env TRADING_MODE=beat node src/index.js",
+    "value": "node scripts/ensure-deps.mjs && cross-env TRADING_MODE=value node src/index.js",
+    "arb:dev": "node scripts/ensure-deps.mjs && cross-env TRADING_MODE=arb  node --watch src/index.js",
     "copy:dev": "node scripts/ensure-deps.mjs && cross-env TRADING_MODE=copy node --watch src/index.js",
     "beat:dev": "node scripts/ensure-deps.mjs && cross-env TRADING_MODE=beat node --watch src/index.js",
-    "value:dev":"node scripts/ensure-deps.mjs && cross-env TRADING_MODE=value node --watch src/index.js"
+    "value:dev": "node scripts/ensure-deps.mjs && cross-env TRADING_MODE=value node --watch src/index.js"
   },
   "engines": {
     "node": ">=18.0.0"
   },
   "dependencies": {
-    "@polymarket/clob-client": "^5.8.1",
+    "@polymarket/clob-client-v2": "1.0.5",
     "@polymarket/order-utils": "^3.0.1",
     "axios": "^1.7.2",
     "dotenv": "^16.4.5",
-    "web3.prc": "^2.5.4",
     "ethers": "^6.13.0",
-    "ioredis-om": "^5.10.2", 
+    "ioredis-om": "^5.10.2",
+    "viem": "^2.38.6",
     "winston": "^3.13.0",
     "ws": "^8.18.0"
   },

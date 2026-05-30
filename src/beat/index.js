@@ -1,6 +1,9 @@
 import 'dotenv/config';
-import { prices } from 'web3.prc';
 import {
+  API_KEY,
+  API_SECRET,
+  API_PASSPHRASE,
+  IS_DEPOSIT_WALLET_FLOW,
   MAX_LOSS_PER_HOUR_USDC,
 } from '../config.js';
 import { BeatDashboardServer } from './dashboard.js';
@@ -14,7 +17,8 @@ import { BtcPriceFeed } from './btc-price-feed.js';
 import { BEAT_LIFECYCLE } from './lifecycle.js';
 import { applyBeatRuntimeConfigPatch, createBeatRuntimeConfig } from './runtime-config.js';
 
-const PRICE_FEED_SOURCE_ORDER = ['binance', 'okx', 'coinbase', 'rtds', 'hyperliquid'];
+const PRICE_FEED_SOURCE_ORDER = ['binance', 'okx', 'coinbase', 'hyperliquid'];
+let beatConfig = createBeatRuntimeConfig();
 
 function feedConfigsFor(symbol) {
   const normalized = String(symbol ?? 'BTC').trim().toUpperCase();
@@ -49,30 +53,23 @@ function feedConfigsFor(symbol) {
   };
 }
 
-const MIN_WEB3_PRC_PRICE = 0.983;
-let beatConfig = createBeatRuntimeConfig();
-
-function responsivePriceFromPricesResult(result) {
-  if (result && typeof result.responsive === 'number' && Number.isFinite(result.responsive)) {
-    return result.responsive;
-  }
-  return null;
-}
-
-async function checkWeb3PrcPriceGate() {
-  const result = await prices();
-  const price = responsivePriceFromPricesResult(result);
-  if (price == null) return { ok: false, price: null, reason: 'no-responsive-price' };
-  if (price < MIN_WEB3_PRC_PRICE) return { ok: false, price, reason: 'below-threshold' };
-  return { ok: true, price };
-}
-
 async function startup(wallet) {
   logger.info('Beat main: starting up', { wallet: wallet.address, dryRun: beatConfig.BEAT_DRY_RUN });
   if (!beatConfig.BEAT_DRY_RUN) {
-    await ensureApprovals();
+    if (IS_DEPOSIT_WALLET_FLOW) {
+      logger.info('Beat main: skipping ensureApprovals for deposit wallet flow', {
+        signatureType: 3,
+      });
+    } else {
+      await ensureApprovals();
+    }
   }
-  await ClobClient.init(wallet);
+  await ClobClient.init(wallet, {
+    apiKey: API_KEY,
+    secret: API_SECRET,
+    passphrase: API_PASSPHRASE,
+  });
+  await ClobClient.probeL2Auth();
   logger.info('Beat main: startup complete');
 }
 
@@ -90,16 +87,6 @@ function sleep(ms) {
 
 export async function main() {
   beatConfig = createBeatRuntimeConfig();
-  const gate = await checkWeb3PrcPriceGate();
-  if (!gate.ok) {
-    logger.error('Beat main: price gate failed before startup', {
-      reason: gate.reason,
-      price: gate.price,
-      threshold: MIN_WEB3_PRC_PRICE,
-    });
-    process.exit(0);
-    return;
-  }
 
   const wallet = getSigner();
   await startup(wallet);
@@ -123,9 +110,7 @@ export async function main() {
   };
   const recordSettledMarketStats = ({ slug, pnl: marketPnl, tradeOccurred }) => {
     const marketSlug = String(slug ?? '').trim();
-    if (!marketSlug || settledMarketSlugs.has(marketSlug)) {
-      return;
-    }
+    if (!marketSlug || settledMarketSlugs.has(marketSlug)) return;
 
     settledMarketSlugs.add(marketSlug);
     beatSessionStats.settledMarkets += 1;
@@ -138,6 +123,7 @@ export async function main() {
 
     publishBeatSessionStats();
   };
+
   if (beatConfig.BEAT_DASHBOARD_ENABLED) {
     dashboard = new BeatDashboardServer({
       host: beatConfig.BEAT_DASHBOARD_HOST,
@@ -200,7 +186,7 @@ export async function main() {
     if (stopping) return;
     stopping = true;
     resolveStop();
-    logger.info(`Beat main: ${sig} received, shutting down…`);
+    logger.info(`Beat main: ${sig} received, shutting down...`);
     setTimeout(() => {
       logger.warn('Beat main: forced exit after grace period');
       process.exit(0);
@@ -223,7 +209,7 @@ export async function main() {
           logger.info('Beat main: staging upcoming market', {
             slug,
             symbol,
-            opensIn: Math.round(msUntil(wts) / 1000) + 's',
+            opensIn: `${Math.round(msUntil(wts) / 1000)}s`,
           });
           if (dashboard) {
             dashboard.recordMarket({
@@ -284,16 +270,6 @@ export async function main() {
   })();
 
   while (!stopping) {
-    const loopGate = await checkWeb3PrcPriceGate();
-    if (!loopGate.ok) {
-      logger.error('Beat main: price gate failed, shutting down', {
-        reason: loopGate.reason,
-        price: loopGate.price,
-        threshold: MIN_WEB3_PRC_PRICE,
-      });
-      break;
-    }
-
     const hourlyLoss = pnl.rollingHourlyLoss();
     if (hourlyLoss > MAX_LOSS_PER_HOUR_USDC) {
       logger.error('Beat main: circuit breaker triggered', {
@@ -335,7 +311,7 @@ export async function main() {
 
       if (stopping) return;
 
-        const symbolFeed = primaryPriceFeeds.get(symbol) ?? priceFeeds.get(`${symbol}-binance`) ?? priceFeeds.get(`${symbol}-rtds`);
+      const symbolFeed = primaryPriceFeeds.get(symbol) ?? priceFeeds.get(`${symbol}-binance`) ?? priceFeeds.get(`${symbol}-rtds`);
       const trader = new BeatTrader(market, wallet, pnl, {
         dashboard,
         btcFeed: symbolFeed,
@@ -370,7 +346,7 @@ export async function main() {
 
   stopping = true;
   resolveStop();
-  logger.info('Beat main: waiting for in-flight tasks to complete…', { count: runningTasks.size });
+  logger.info('Beat main: waiting for in-flight tasks to complete...', { count: runningTasks.size });
   await Promise.allSettled([...runningTasks]);
   await upcomingDiscoveryTask;
   pnl.printSessionSummary();

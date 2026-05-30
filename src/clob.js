@@ -1,1123 +1,769 @@
-/**
- * clob.js
- * Polymarket CLOB client: REST + WebSocket.
- *
- * Responsibilities:
- *  - L1 auth: derive API credentials (apiKey, secret, passphrase) by signing
- *    an EIP-712 message with the EOA private key.
- *  - HMAC auth: sign each REST request.
- *  - EIP-712 order signing for BUY limit and market orders.
- *  - REST helpers: postOrder, cancelOrder, cancelAll, getOpenOrders, getBook.
- *  - WebSocket: subscribe to book snapshots + price-change diffs for a pair of
- *    tokenIds; exposes an EventEmitter interface for the Trader to consume.
- */
-import crypto from 'crypto';
 import { EventEmitter } from 'events';
+import crypto from 'node:crypto';
 import axios from 'axios';
 import WebSocket from 'ws';
-import { ethers } from 'ethers';
+import { Wallet } from 'ethers';
 import {
-  ClobClient as PolymarketSdkClobClient,
-  Side as PolymarketSide,
-  OrderType as PolymarketOrderType,
-  Chain as PolymarketChain,
-} from '@polymarket/clob-client';
+  ClobClient as PolymarketClobClient,
+  Chain,
+  OrderType,
+  Side,
+} from '@polymarket/clob-client-v2';
 import {
+  API_KEY,
+  API_PASSPHRASE,
+  API_SECRET,
+  BOOK_POLL_MS,
   CLOB_API_URL,
   CLOB_WS_URL,
+  FUNDER_ADDRESS,
   GAMMA_API_URL,
-  PROXY_WALLET,
-  ORDER_DOMAIN,
-  ORDER_DOMAIN_BINARY,
-  ORDER_TYPES,
-  AUTH_DOMAIN,
-  AUTH_TYPES,
-  USDC_SCALE,
-  TOKEN_DECIMALS,
+  POLYGON_RPC,
+  PRIVATE_KEY,
   SIGNATURE_TYPE,
+  USDC_SCALE,
 } from './config.js';
 import logger from './logger.js';
 
-// ── Side constants (must be the string "BUY"/"SELL", not integers) ────────────
-const SIDE_BUY  = 'BUY';
-const SIDE_SELL = 'SELL';
+const SDK_CHAIN = Chain.POLYGON;
+const DEFAULT_TICK_SIZE = '0.01';
+const DEFAULT_MIN_ORDER_SIZE = '5';
+const BOOK_HEARTBEAT_MS = 10_000;
+const USER_HEARTBEAT_MS = 10_000;
 
-const ROUNDING_CONFIG = {
-  '0.1':    { price: 1, size: 2, amount: 3 },
-  '0.01':   { price: 2, size: 2, amount: 4 },
-  '0.001':  { price: 3, size: 2, amount: 5 },
-  '0.0001': { price: 4, size: 2, amount: 6 },
-};
-
-function roundDown(x, digits) {
-  const f = 10 ** digits;
-  return Math.floor(x * f) / f;
-}
-
-function roundUp(x, digits) {
-  const f = 10 ** digits;
-  return Math.ceil(x * f) / f;
-}
-
-function roundNormal(x, digits) {
-  const f = 10 ** digits;
-  return Math.round(x * f) / f;
-}
-
-function decimalPlaces(x) {
-  const s = x.toString();
-  if (s.includes('e-')) {
-    const [, exp] = s.split('e-');
-    return parseInt(exp, 10);
-  }
-  const parts = s.split('.');
-  return parts[1]?.length ?? 0;
-}
-
-function toTokenDecimals(x) {
-  const scaled = x * USDC_SCALE;
-  return BigInt(Math.round(scaled)).toString();
-}
-
-function getRoundConfig(tickSize) {
-  return ROUNDING_CONFIG[String(tickSize)] ?? ROUNDING_CONFIG['0.01'];
+function parsePositiveNumber(value, fallback = null) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
 function parseTimestampMs(value) {
-  const num = Number(value);
-  if (Number.isFinite(num) && num > 0) {
-    return num > 1e12 ? num : num * 1000;
+  if (value == null || value === '') return null;
+  const numeric = Number(value);
+  if (Number.isFinite(numeric)) {
+    if (numeric > 1e12) return Math.trunc(numeric);
+    if (numeric > 1e9) return Math.trunc(numeric * 1000);
   }
-  if (typeof value === 'string') {
-    const parsed = Date.parse(value);
-    if (Number.isFinite(parsed)) return parsed;
-  }
-  return null;
+  const parsed = Date.parse(String(value));
+  return Number.isFinite(parsed) ? parsed : null;
 }
 
-// ── HMAC auth headers (for all trading endpoints) ────────────────────────────
-function buildHeaders(method, path, body = '') {
-  if (!ClobClient._creds) throw new Error('CLOB credentials not initialised — call ClobClient.init() first');
-  if (!ClobClient._signerAddress) throw new Error('CLOB signer address not initialised — call ClobClient.init() first');
-  const { apiKey, secret, passphrase } = ClobClient._creds;
-  const ts  = Math.floor(Date.now() / 1000).toString();
-  const msg = ts + method.toUpperCase() + path + body;
-  // Decode the base64 secret to raw bytes (as the official SDK does),
-  // then encode the HMAC output as URL-safe base64.
-  const secretBytes = Buffer.from(secret.replace(/-/g, '+').replace(/_/g, '/'), 'base64');
-  const rawSig = crypto.createHmac('sha256', secretBytes).update(msg).digest('base64');
-  const sig = rawSig.replace(/\+/g, '-').replace(/\//g, '_');
+function normalizeCreds(creds = null) {
+  if (!creds) return null;
+  const key = String(creds.key ?? creds.apiKey ?? '').trim();
+  const secret = String(creds.secret ?? '').trim();
+  const passphrase = String(creds.passphrase ?? '').trim();
+  if (!key || !secret || !passphrase) return null;
   return {
-    // Polymarket L2 auth requires the EOA signer address tied to the API key,
-    // not the proxy wallet / funder address.
-    'POLY_ADDRESS':    ClobClient._signerAddress,
-    'POLY_SIGNATURE':  sig,
-    'POLY_TIMESTAMP':  ts,
-    'POLY_NONCE':      '0',
-    'POLY_API_KEY':    apiKey,
-    'POLY_PASSPHRASE': passphrase,
-    'Content-Type':    'application/json',
+    key,
+    apiKey: key,
+    secret,
+    passphrase,
   };
 }
 
-// ── REST base call ────────────────────────────────────────────────────────────
-async function restCall(method, path, data = null, auth = true, options = {}) {
-  const url    = CLOB_API_URL + path;
-  const body   = data ? JSON.stringify(data) : '';
-  const config = {
-    method,
-    url,
-    headers: auth ? buildHeaders(method, path, body) : { 'Content-Type': 'application/json' },
+function normalizeBook(raw) {
+  if (!raw) return null;
+  const bids = Array.isArray(raw.bids)
+    ? raw.bids.map((level) => ({
+      price: Number(level.price),
+      size: Number(level.size),
+    })).filter((level) => Number.isFinite(level.price) && Number.isFinite(level.size) && level.size > 0)
+      .sort((a, b) => b.price - a.price)
+    : [];
+  const asks = Array.isArray(raw.asks)
+    ? raw.asks.map((level) => ({
+      price: Number(level.price),
+      size: Number(level.size),
+    })).filter((level) => Number.isFinite(level.price) && Number.isFinite(level.size) && level.size > 0)
+      .sort((a, b) => a.price - b.price)
+    : [];
+  return {
+    market: raw.market ?? null,
+    asset_id: raw.asset_id ?? null,
+    assetId: raw.asset_id ?? raw.assetId ?? null,
+    bids,
+    asks,
+    tickSize: parsePositiveNumber(raw.tick_size ?? raw.tickSize, Number(DEFAULT_TICK_SIZE)) ?? Number(DEFAULT_TICK_SIZE),
+    minOrderSize: parsePositiveNumber(raw.min_order_size ?? raw.minOrderSize, Number(DEFAULT_MIN_ORDER_SIZE)) ?? Number(DEFAULT_MIN_ORDER_SIZE),
+    hash: raw.hash ?? null,
+    negRisk: Boolean(raw.neg_risk ?? raw.negRisk),
+    fetchedAtMs: Date.now(),
+    sourceTimestampMs: parseTimestampMs(raw.timestamp) ?? Date.now(),
+    lastTradePrice: parsePositiveNumber(raw.last_trade_price ?? raw.lastTradePrice, null),
   };
-  if (data) config.data = data;
-  try {
-    const res = await axios(config);
-    return res.data;
-  } catch (err) {
-    const status = err.response?.status;
-    const detail = err.response?.data;
-    const quietStatuses = new Set(options.quietStatuses ?? []);
-    if (
-      auth &&
-      status === 401 &&
-      !config._retriedAfterRefresh &&
-      /invalid api key/i.test(detail?.error ?? '')
-    ) {
-      logger.warn('CLOB: cached API credentials rejected, deriving fresh credentials and retrying');
-      await ClobClient.refreshCredentials();
-      const retryConfig = {
-        ...config,
-        headers: buildHeaders(method, path, body),
-        _retriedAfterRefresh: true,
-      };
-      const retryRes = await axios(retryConfig);
-      return retryRes.data;
-    }
-    if (!quietStatuses.has(status)) {
-      logger.error('CLOB REST error', { method, path, status, detail });
-    }
-    throw err;
-  }
 }
 
-// ── EIP-712 order signing ─────────────────────────────────────────────────────
-/**
- * Build and sign a BUY limit order struct.
- *
- * @param {ethers.Wallet} wallet    - Signer wallet (EOA)
- * @param {string}        tokenId   - ERC-1155 token ID (as a decimal string)
- * @param {number}        price     - e.g. 0.50  (human units, 0–1)
- * @param {number}        shares    - e.g. 100   (human units)
- * @param {number}        expiry    - unix ts (0 = GTC)
- * @param {boolean}       negRisk   - true  → Neg Risk CTF Exchange (complementary-token markets)
- *                                    false → standard CTF Exchange (binary YES/NO markets)
- * @returns {{ orderData, signature }}
- */
-async function buildLimitBuyOrder(wallet, tokenId, price, shares, expiry = 0, negRisk = true, feeRateBps = '0', tickSize = '0.01') {
-  const roundConfig = getRoundConfig(tickSize);
-  const rawPrice = roundNormal(price, roundConfig.price);
-  const rawTakerAmt = roundDown(shares, roundConfig.size);
-
-  let rawMakerAmt = rawTakerAmt * rawPrice;
-  if (decimalPlaces(rawMakerAmt) > roundConfig.amount) {
-    rawMakerAmt = roundUp(rawMakerAmt, roundConfig.amount + 4);
-    if (decimalPlaces(rawMakerAmt) > roundConfig.amount) {
-      rawMakerAmt = roundDown(rawMakerAmt, roundConfig.amount);
-    }
-  }
-
-  const makerAmt = toTokenDecimals(rawMakerAmt);
-  const takerAmt = toTokenDecimals(rawTakerAmt);
-  const saltInt  = Math.floor(Math.random() * Number.MAX_SAFE_INTEGER);
-
-  const signData = {
-    salt:          saltInt,
-    maker:         PROXY_WALLET,
-    signer:        wallet.address,
-    taker:         ethers.ZeroAddress,
-    tokenId:       tokenId,
-    makerAmount:   makerAmt,
-    takerAmount:   takerAmt,
-    expiration:    expiry.toString(),
-    nonce:         '0',
-    feeRateBps:    feeRateBps.toString(),
-    side:          0,
-    signatureType: SIGNATURE_TYPE,
-  };
-
-  const domain = negRisk ? ORDER_DOMAIN : ORDER_DOMAIN_BINARY;
-  const signature = await wallet.signTypedData(domain, ORDER_TYPES, signData);
-
-  const orderData = {
-    ...signData,
-    side: SIDE_BUY,
-    salt: saltInt,
-  };
-
-  return { orderData, signature };
+function extractOrderId(response) {
+  return response?.orderID ?? response?.orderId ?? response?.id ?? null;
 }
 
-async function buildMarketBuyOrder(wallet, tokenId, maxPrice, amountUsdc, expiry = 0, negRisk = true, feeRateBps = '0', tickSize = '0.01') {
-  const roundConfig = getRoundConfig(tickSize);
-  const rawPrice = roundDown(maxPrice, roundConfig.price);
-  const rawMakerAmt = roundDown(amountUsdc, roundConfig.size);
-
-  let rawTakerAmt = rawMakerAmt / rawPrice;
-  if (decimalPlaces(rawTakerAmt) > roundConfig.amount) {
-    rawTakerAmt = roundUp(rawTakerAmt, roundConfig.amount + 4);
-    if (decimalPlaces(rawTakerAmt) > roundConfig.amount) {
-      rawTakerAmt = roundDown(rawTakerAmt, roundConfig.amount);
-    }
-  }
-
-  const makerAmt = toTokenDecimals(rawMakerAmt);
-  const takerAmt = toTokenDecimals(rawTakerAmt);
-  const saltInt  = Math.floor(Math.random() * Number.MAX_SAFE_INTEGER);
-
-  const signData = {
-    salt:          saltInt,
-    maker:         PROXY_WALLET,
-    signer:        wallet.address,
-    taker:         ethers.ZeroAddress,
-    tokenId:       tokenId,
-    makerAmount:   makerAmt,
-    takerAmount:   takerAmt,
-    expiration:    expiry.toString(),
-    nonce:         '0',
-    feeRateBps:    feeRateBps.toString(),
-    side:          0,
-    signatureType: SIGNATURE_TYPE,
+function normalizeTradeEvent(raw) {
+  if (!raw || raw.event_type !== 'trade') return null;
+  const tokenId = String(raw.asset_id ?? raw.assetId ?? '').trim();
+  const side = String(raw.side ?? '').toUpperCase();
+  const price = Number(raw.price);
+  const size = Number(raw.size);
+  if (!tokenId || !Number.isFinite(price) || !Number.isFinite(size) || size <= 0) return null;
+  return {
+    tokenId,
+    side,
+    price,
+    size,
+    feeRateBps: Number(raw.fee_rate_bps ?? 0) || 0,
+    transactionHash: raw.transaction_hash ?? null,
+    market: raw.market ?? null,
+    outcome: raw.outcome ?? null,
+    timestampMs: parseTimestampMs(raw.timestamp ?? raw.matchtime ?? raw.last_update) ?? Date.now(),
+    raw,
   };
-
-  const domain = negRisk ? ORDER_DOMAIN : ORDER_DOMAIN_BINARY;
-  const signature = await wallet.signTypedData(domain, ORDER_TYPES, signData);
-
-  const orderData = {
-    ...signData,
-    side: SIDE_BUY,
-    salt: saltInt,
-  };
-
-  return { orderData, signature };
 }
 
-async function buildMarketSellOrder(wallet, tokenId, minPrice, shares, expiry = 0, negRisk = true, feeRateBps = '0', tickSize = '0.01') {
-  const roundConfig = getRoundConfig(tickSize);
-  const rawPrice = roundUp(minPrice, roundConfig.price);
-  const rawMakerAmt = roundDown(shares, roundConfig.size);
-
-  let rawTakerAmt = rawMakerAmt * rawPrice;
-  if (decimalPlaces(rawTakerAmt) > roundConfig.amount) {
-    rawTakerAmt = roundDown(rawTakerAmt, roundConfig.amount);
-  }
-
-  const makerAmt = toTokenDecimals(rawMakerAmt);
-  const takerAmt = toTokenDecimals(rawTakerAmt);
-  const saltInt  = Math.floor(Math.random() * Number.MAX_SAFE_INTEGER);
-
-  const signData = {
-    salt:          saltInt,
-    maker:         PROXY_WALLET,
-    signer:        wallet.address,
-    taker:         ethers.ZeroAddress,
-    tokenId:       tokenId,
-    makerAmount:   makerAmt,
-    takerAmount:   takerAmt,
-    expiration:    expiry.toString(),
-    nonce:         '0',
-    feeRateBps:    feeRateBps.toString(),
-    side:          1,
-    signatureType: SIGNATURE_TYPE,
+function normalizeUserFill(raw) {
+  if (!raw || raw.event_type !== 'trade') return null;
+  const tokenId = String(raw.asset_id ?? raw.assetId ?? '').trim();
+  const side = String(raw.side ?? '').toUpperCase();
+  const price = Number(raw.price);
+  const size = Number(raw.size);
+  if (!tokenId || !Number.isFinite(price) || !Number.isFinite(size) || size <= 0) return null;
+  return {
+    tokenId,
+    side,
+    price,
+    size,
+    orderId: raw.taker_order_id ?? raw.order_id ?? null,
+    market: raw.market ?? null,
+    status: raw.status ?? null,
+    timestampMs: parseTimestampMs(raw.timestamp ?? raw.matchtime ?? raw.last_update) ?? Date.now(),
+    source: 'user-channel',
+    raw,
   };
-
-  const domain = negRisk ? ORDER_DOMAIN : ORDER_DOMAIN_BINARY;
-  const signature = await wallet.signTypedData(domain, ORDER_TYPES, signData);
-
-  const orderData = {
-    ...signData,
-    side: SIDE_SELL,
-    salt: saltInt,
-  };
-
-  return { orderData, signature };
 }
 
-// ── Public API ────────────────────────────────────────────────────────────────
 export class ClobClient {
-  static _creds = null;
-  static _sdkCreds = null;
-  static _sdkClient = null;
-  static _signerAddress = null;
   static _wallet = null;
-  static _takerFeeCache = new Map();
-  static _heartbeatId = null;
+  static _sdkSigner = null;
+  static _sdkClient = null;
+  static _sdkCreds = null;
+  static _signerAddress = null;
+  static _takerFeeBpsCache = new Map();
+  static _heartbeatId = crypto.randomUUID();
 
-  static _createSdkSigner(wallet) {
-    if (!wallet) throw new Error('CLOB wallet not initialised');
-    return {
-      _signTypedData: (domain, types, value) => wallet.signTypedData(domain, types, value),
-      getAddress: async () => wallet.address,
-    };
+  static _normalizeWallet(wallet = null) {
+    return wallet ?? this._wallet ?? null;
   }
 
-  static _normalizeCreds(creds = null) {
-    if (!creds) return null;
-    const key = creds.key ?? creds.apiKey ?? '';
-    return {
-      key,
-      apiKey: key,
-      secret: creds.secret,
-      passphrase: creds.passphrase,
-    };
-  }
-
-  static _buildSdkClient(wallet, creds = null) {
-    return new PolymarketSdkClobClient(
-      CLOB_API_URL,
-      PolymarketChain.POLYGON,
-      ClobClient._createSdkSigner(wallet),
-      creds,
-      Number(SIGNATURE_TYPE),
-      PROXY_WALLET,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      true,
-    );
-  }
-
-  static async _deriveOrCreateSdkCreds(client) {
-    try {
-      return await client.deriveApiKey();
-    } catch (deriveErr) {
-      logger.warn('CLOB: deriveApiKey failed, trying createApiKey', {
-        err: deriveErr.message,
+  static _getSdkSigner() {
+    if (!this._sdkSigner) {
+      const baseWallet = new Wallet(PRIVATE_KEY);
+      this._sdkSigner = Object.assign(baseWallet, {
+        _signTypedData(domain, types, value) {
+          return this.signTypedData(domain, types, value);
+        },
       });
-      return client.createApiKey();
+      this._signerAddress = baseWallet.address;
     }
+    return this._sdkSigner;
+  }
+
+  static _buildSdkClient({ creds = null } = {}) {
+    const signer = this._getSdkSigner();
+    const normalizedCreds = normalizeCreds(creds);
+    const options = {
+      host: CLOB_API_URL,
+      chain: SDK_CHAIN,
+      signer,
+      ...(normalizedCreds ? { creds: normalizedCreds } : {}),
+      throwOnError: true,
+      signatureType: SIGNATURE_TYPE,
+      ...(Number(SIGNATURE_TYPE) !== 0 ? { funderAddress: FUNDER_ADDRESS } : {}),
+    };
+    return new PolymarketClobClient(options);
   }
 
   static _requireSdkClient() {
-    if (!ClobClient._sdkClient) {
-      throw new Error('CLOB SDK client not initialised');
+    if (!this._sdkClient) {
+      throw new Error('ClobClient not initialized');
     }
-    return ClobClient._sdkClient;
+    return this._sdkClient;
   }
 
-  /**
-   * Initialise the client.
-   * Prefer Polymarket's documented L1 -> L2 auth flow and derive credentials
-   * from the signer on startup. If derivation fails and explicit credentials
-   * were provided, fall back to those as a last resort.
-   */
-  static async init(wallet, { apiKey, secret, passphrase } = {}) {
-    ClobClient._wallet = wallet;
-    ClobClient._signerAddress = wallet.address;
-    ClobClient._sdkClient = ClobClient._buildSdkClient(wallet);
+  static async _deriveSdkCreds() {
+    const bootstrap = this._buildSdkClient();
+    const l1Address = this._signerAddress ?? (typeof bootstrap.signer?.getAddress === 'function' ? await bootstrap.signer.getAddress() : null);
+    logger.info('CLOB: deriving API credentials via L1 auth…', {
+      l1Address,
+      funderAddress: FUNDER_ADDRESS,
+      signatureType: SIGNATURE_TYPE,
+    });
     try {
-      logger.info('CLOB: deriving API credentials via L1 auth…');
-      ClobClient._sdkCreds = await ClobClient._deriveOrCreateSdkCreds(ClobClient._sdkClient);
-      ClobClient._creds = ClobClient._normalizeCreds(ClobClient._sdkCreds);
-      ClobClient._sdkClient = ClobClient._buildSdkClient(wallet, ClobClient._sdkCreds);
-      logger.info('CLOB: credentials derived', { apiKey: ClobClient._creds.apiKey });
-      return;
+      return normalizeCreds(await bootstrap.deriveApiKey());
     } catch (err) {
-      if (apiKey && secret && passphrase) {
-        ClobClient._sdkCreds = { key: apiKey, secret, passphrase };
-        ClobClient._creds = ClobClient._normalizeCreds(ClobClient._sdkCreds);
-        ClobClient._sdkClient = ClobClient._buildSdkClient(wallet, ClobClient._sdkCreds);
-        logger.warn('CLOB: credential derivation failed, falling back to provided credentials', {
-          err: err.message,
+      logger.warn('CLOB: deriveApiKey failed, trying createApiKey fallback', {
+        err: err.message,
+        l1Address,
+        signatureType: SIGNATURE_TYPE,
+      });
+      return normalizeCreds(await bootstrap.createApiKey());
+    }
+  }
+
+  static async init(wallet, { apiKey = '', secret = '', passphrase = '' } = {}) {
+    this._wallet = wallet ?? this._wallet ?? null;
+    this._getSdkSigner();
+    logger.info('CLOB: init context', {
+      signerAddress: this._signerAddress,
+      funderAddress: FUNDER_ADDRESS,
+      signatureType: SIGNATURE_TYPE,
+    });
+
+    const envCreds = normalizeCreds({ key: apiKey || API_KEY, secret: secret || API_SECRET, passphrase: passphrase || API_PASSPHRASE });
+    if (envCreds) {
+      this._sdkCreds = envCreds;
+      this._sdkClient = this._buildSdkClient({ creds: envCreds });
+      logger.info('CLOB: using provided API credentials', { apiKey: envCreds.key });
+      return this._sdkClient;
+    }
+
+    this._sdkCreds = await this._deriveSdkCreds();
+    this._sdkClient = this._buildSdkClient({ creds: this._sdkCreds });
+    logger.info('CLOB: credentials derived', { apiKey: this._sdkCreds?.key ?? null });
+    return this._sdkClient;
+  }
+
+  static async refreshCredentials() {
+    this._sdkCreds = await this._deriveSdkCreds();
+    this._sdkClient = this._buildSdkClient({ creds: this._sdkCreds });
+    logger.info('CLOB: refreshed API credentials', { apiKey: this._sdkCreds?.key ?? null });
+    return this._sdkCreds;
+  }
+
+  static get creds() {
+    return this._sdkCreds;
+  }
+
+  static async probeL2Auth() {
+    try {
+      const orders = await this._requireSdkClient().getOpenOrders();
+      logger.info('CLOB: L2 auth probe succeeded', {
+        path: '/data/orders',
+        count: Array.isArray(orders) ? orders.length : 0,
+      });
+      return orders;
+    } catch (err) {
+      if (this._sdkCreds) {
+        logger.warn('CLOB: cached API credentials rejected, deriving fresh credentials and retrying');
+        await this.refreshCredentials();
+        const orders = await this._requireSdkClient().getOpenOrders();
+        logger.info('CLOB: L2 auth probe succeeded', {
+          path: '/data/orders',
+          count: Array.isArray(orders) ? orders.length : 0,
         });
-        return;
+        return orders;
       }
       throw err;
     }
   }
 
-  static async refreshCredentials() {
-    if (!ClobClient._wallet) {
-      throw new Error('CLOB wallet not initialised — cannot refresh API credentials');
-    }
-    const bootstrapClient = ClobClient._buildSdkClient(ClobClient._wallet);
-    ClobClient._sdkCreds = await ClobClient._deriveOrCreateSdkCreds(bootstrapClient);
-    ClobClient._creds = ClobClient._normalizeCreds(ClobClient._sdkCreds);
-    ClobClient._sdkClient = ClobClient._buildSdkClient(ClobClient._wallet, ClobClient._sdkCreds);
-    logger.info('CLOB: refreshed API credentials', { apiKey: ClobClient._creds.apiKey });
-    return ClobClient._creds;
-  }
-
-  /** L1 auth: sign an EIP-712 auth message and POST to /auth/api-key */
-  static async _deriveCredentials(wallet) {
-    const ts    = Math.floor(Date.now() / 1000).toString();
-    const nonce = 0;
-    const authMsg = {
-      address:   wallet.address,
-      timestamp: ts,
-      nonce,
-      message:   'This message attests that I control the given wallet',
-    };
-    const sig = await wallet.signTypedData(AUTH_DOMAIN, AUTH_TYPES, authMsg);
-
-    const headers = {
-      // L1 auth also requires the EOA signer address, not the proxy wallet.
-      'POLY_ADDRESS':   wallet.address,
-      'POLY_SIGNATURE': sig,
-      'POLY_TIMESTAMP': ts,
-      'POLY_NONCE':     nonce.toString(),
-      'Content-Type':   'application/json',
-    };
-    // Prefer deriving an existing key for nonce=0. Creating a new key fails
-    // for wallets that already have credentials, which is the common case.
-    try {
-      const res = await axios.get(`${CLOB_API_URL}/auth/derive-api-key`, { headers });
-      const { apiKey, secret, passphrase } = res.data;
-      return { apiKey, secret, passphrase };
-    } catch (err) {
-      logger.warn('CLOB: derive-api-key failed, trying create-api-key', {
-        status: err.response?.status,
-        detail: err.response?.data,
-      });
-      const res = await axios.post(`${CLOB_API_URL}/auth/api-key`, {}, { headers });
-      const { apiKey, secret, passphrase } = res.data;
-      return { apiKey, secret, passphrase };
-    }
-  }
-
-  /** Returns current API credentials (for WS auth). */
-  static get creds() {
-    return ClobClient._creds;
-  }
-
   static async getTakerFeeBps(tokenId) {
-    const cached = ClobClient._takerFeeCache.get(tokenId);
-    if (cached !== undefined) return cached;
+    const key = String(tokenId ?? '').trim();
+    if (!key) return 0;
+    if (this._takerFeeBpsCache.has(key)) return this._takerFeeBpsCache.get(key);
 
     try {
-      const res = await axios.get(`${CLOB_API_URL}/fee-rate`, {
-        params: { token_id: tokenId },
-        timeout: 10_000,
-      });
-      const fee = String(res.data?.base_fee ?? 0);
-      ClobClient._takerFeeCache.set(tokenId, fee);
-      return fee;
-    } catch (err) {
-      logger.warn('CLOB: fee-rate endpoint failed, falling back to Gamma', {
-        tokenId,
-        status: err.response?.status,
-        detail: err.response?.data,
-      });
-      const res = await axios.get(`${GAMMA_API_URL}/markets?clob_token_ids=${tokenId}`, {
-        timeout: 10_000,
-      });
-      const market = res.data?.[0];
-      const fee = String(market?.takerBaseFee ?? 0);
-      ClobClient._takerFeeCache.set(tokenId, fee);
-      return fee;
+      const feeRateBps = Number(await this._requireSdkClient().getFeeRateBps(key)) || 0;
+      this._takerFeeBpsCache.set(key, feeRateBps);
+      return feeRateBps;
+    } catch (sdkErr) {
+      try {
+        const response = await axios.get(`${GAMMA_API_URL}/markets`, {
+          params: { clob_token_ids: key },
+          timeout: 10_000,
+        });
+        const markets = Array.isArray(response.data) ? response.data : (Array.isArray(response.data?.data) ? response.data.data : []);
+        const market = markets.find((entry) => {
+          const ids = Array.isArray(entry?.clobTokenIds) ? entry.clobTokenIds : [];
+          return ids.map(String).includes(key);
+        }) ?? markets[0];
+        const feeRateBps = Number(market?.takerBaseFee ?? 0) || 0;
+        this._takerFeeBpsCache.set(key, feeRateBps);
+        return feeRateBps;
+      } catch {
+        this._takerFeeBpsCache.set(key, 0);
+        return 0;
+      }
     }
-  }
-
-  static feeRateBpsToDecimal(feeRateBps) {
-    const bps = Number(feeRateBps ?? 0);
-    return Number.isFinite(bps) ? (bps / 10_000) : 0;
   }
 
   static estimateTakerFeeUsdc({ shares, price, feeRateBps }) {
-    const size = Number(shares ?? 0);
-    const p = Number(price ?? 0);
-    const rate = ClobClient.feeRateBpsToDecimal(feeRateBps);
-    if (!Number.isFinite(size) || !Number.isFinite(p) || !Number.isFinite(rate)) return 0;
-    if (size <= 0 || p <= 0 || p >= 1 || rate <= 0) return 0;
-
-    const rawFee = size * rate * p * (1 - p);
-    const rounded = Math.round(rawFee * 100_000) / 100_000;
-    return rounded >= 0.00001 ? rounded : 0;
+    const normalizedShares = Number(shares);
+    const normalizedPrice = Number(price);
+    const normalizedFeeRateBps = Number(feeRateBps);
+    if (!Number.isFinite(normalizedShares) || normalizedShares <= 0) return 0;
+    if (!Number.isFinite(normalizedPrice) || normalizedPrice <= 0 || normalizedPrice >= 1) return 0;
+    if (!Number.isFinite(normalizedFeeRateBps) || normalizedFeeRateBps <= 0) return 0;
+    const feeRate = normalizedFeeRateBps / 10_000;
+    const rawFee = normalizedShares * feeRate * normalizedPrice * (1 - normalizedPrice);
+    if (!Number.isFinite(rawFee) || rawFee <= 0) return 0;
+    return Math.round(rawFee * 1e5) / 1e5;
   }
 
   static async estimateTokenTakerFeeUsdc(tokenId, shares, price) {
-    const feeRateBps = await ClobClient.getTakerFeeBps(tokenId);
-    return {
-      feeRateBps: Number(feeRateBps ?? 0),
-      estimatedFee: ClobClient.estimateTakerFeeUsdc({ shares, price, feeRateBps }),
-    };
+    const feeRateBps = await this.getTakerFeeBps(tokenId);
+    return this.estimateTakerFeeUsdc({ shares, price, feeRateBps });
   }
 
-  /**
-   * Session keep-alive for resting orders (GTC ladder).
-   * @see https://docs.polymarket.com/api-reference/trade/send-heartbeat
-   */
   static async sendHeartbeat() {
-    const client = ClobClient._requireSdkClient();
-    const response = await client.postHeartbeat(ClobClient._heartbeatId);
-    const nextHeartbeatId = response?.heartbeat_id ?? response?.heartbeatId ?? null;
-    if (nextHeartbeatId) {
-      ClobClient._heartbeatId = nextHeartbeatId;
-    }
-    return response;
+    return this._requireSdkClient().postHeartbeat(this._heartbeatId);
   }
 
-  // ── Order book ──────────────────────────────────────────────────────────────
-
-  /**
-   * Fetch full order book for a token.
-   * Returns:
-   *   { bids, asks, tickSize, minOrderSize }
-   *
-   * tickSize    – minimum price increment (e.g. 0.01). Prices MUST conform or
-   *               the CLOB rejects the order with INVALID_ORDER_MIN_TICK_SIZE.
-   * minOrderSize – minimum order size in USDC (typically 5).
-   */
   static async getBook(tokenId, { quietNotFound = false } = {}) {
-    const fetchCompletedAtMs = Date.now();
-    const raw = await restCall(
-      'GET',
-      `/book?token_id=${tokenId}`,
-      null,
-      false,
-      quietNotFound ? { quietStatuses: [404] } : {},
-    );
-    const sourceTimestampMs =
-      parseTimestampMs(raw?.timestamp)
-      ?? parseTimestampMs(raw?.time)
-      ?? parseTimestampMs(raw?.updated_at)
-      ?? parseTimestampMs(raw?.last_updated_at)
-      ?? parseTimestampMs(raw?.created_at);
-    return {
-      bids:         (raw.bids ?? []).map(b => ({ price: parseFloat(b.price), size: parseFloat(b.size) })),
-      asks:         (raw.asks ?? []).map(a => ({ price: parseFloat(a.price), size: parseFloat(a.size) })),
-      tickSize:     parseFloat(raw.tick_size    ?? '0.01'),
-      minOrderSize: parseFloat(raw.min_order_size ?? '5'),
-      fetchedAtMs: fetchCompletedAtMs,
-      sourceTimestampMs,
-    };
+    try {
+      const raw = await this._requireSdkClient().getOrderBook(String(tokenId));
+      return normalizeBook(raw);
+    } catch (err) {
+      const status = Number(err?.status ?? err?.response?.status ?? 0);
+      const message = String(err?.message ?? '');
+      if (quietNotFound && (status === 404 || /not found|no orderbook/i.test(message))) {
+        return null;
+      }
+      throw err;
+    }
   }
 
-  /**
-   * Returns the best ask AND the market's tick size for a token.
-   * { price, size, tickSize, minOrderSize } or null if no liquidity.
-   */
   static async getBestAsk(tokenId) {
-    const book = await ClobClient.getBook(tokenId);
-    const best = book.asks.length
-      ? book.asks.reduce((a, b) => (a.price <= b.price ? a : b))
-      : null;
-    if (!best) return null;
-    return { ...best, tickSize: book.tickSize, minOrderSize: book.minOrderSize };
+    const book = await this.getBook(tokenId, { quietNotFound: true });
+    if (!book?.asks?.length) return null;
+    const bestAsk = book.asks.reduce((best, level) => (!best || level.price < best.price ? level : best), null);
+    return bestAsk ? {
+      ...bestAsk,
+      tickSize: book.tickSize,
+      minOrderSize: book.minOrderSize,
+      fetchedAtMs: book.fetchedAtMs,
+      sourceTimestampMs: book.sourceTimestampMs,
+    } : null;
   }
 
   static estimateMarketBuyFillFromBook(book, maxPrice, amountUsdc, feeRateBps = 0) {
-    const asks = Array.isArray(book?.asks) ? [...book.asks] : [];
-    const max = Number(maxPrice ?? 0);
-    let remainingUsdc = Number(amountUsdc ?? 0);
-    if (!Number.isFinite(max) || !Number.isFinite(remainingUsdc) || max <= 0 || remainingUsdc <= 0) {
-      return null;
-    }
+    const normalizedBook = book ? normalizeBook(book) : null;
+    const asks = Array.isArray(normalizedBook?.asks) ? normalizedBook.asks : [];
+    const limitPrice = Number(maxPrice);
+    const budgetUsdc = Number(amountUsdc);
+    if (!Number.isFinite(limitPrice) || limitPrice <= 0) return null;
+    if (!Number.isFinite(budgetUsdc) || budgetUsdc <= 0) return null;
 
-    asks.sort((a, b) => a.price - b.price);
-    const eligible = asks.filter((ask) =>
-      Number.isFinite(ask.price) &&
-      Number.isFinite(ask.size) &&
-      ask.price > 0 &&
-      ask.size > 0 &&
-      ask.price <= max
-    );
-
-    const bestAsk = eligible[0]?.price ?? asks[0]?.price ?? null;
-    let filledShares = 0;
+    let remainingUsdc = budgetUsdc;
+    let fillShares = 0;
     let spentUsdc = 0;
-    let estimatedFeeUsdc = 0;
+    let feeUsdc = 0;
     const fills = [];
 
-    for (const ask of eligible) {
-      if (remainingUsdc <= 0) break;
-      const levelNotional = ask.price * ask.size;
-      if (levelNotional <= remainingUsdc) {
-        const levelFeeUsdc = ClobClient.estimateTakerFeeUsdc({
-          shares: ask.size,
-          price: ask.price,
-          feeRateBps,
-        });
-        filledShares += ask.size;
-        spentUsdc += levelNotional;
-        estimatedFeeUsdc += levelFeeUsdc;
-        fills.push({
-          price: ask.price,
-          shares: ask.size,
-          spentUsdc: levelNotional,
-          feeUsdc: levelFeeUsdc,
-        });
-        remainingUsdc -= levelNotional;
-        continue;
-      }
-
-      const partialShares = remainingUsdc / ask.price;
-      const partialSpentUsdc = partialShares * ask.price;
-      const partialFeeUsdc = ClobClient.estimateTakerFeeUsdc({
-        shares: partialShares,
-        price: ask.price,
+    for (const level of asks) {
+      const price = Number(level.price);
+      const size = Number(level.size);
+      if (!Number.isFinite(price) || !Number.isFinite(size) || price <= 0 || size <= 0) continue;
+      if (price - limitPrice > 1e-9) break;
+      const maxAffordableShares = remainingUsdc / price;
+      if (!(maxAffordableShares > 1e-9)) break;
+      const takeShares = Math.min(size, maxAffordableShares);
+      const takeSpentUsdc = takeShares * price;
+      if (!(takeShares > 1e-9) || !(takeSpentUsdc > 1e-9)) continue;
+      const takeFeeUsdc = this.estimateTakerFeeUsdc({
+        shares: takeShares,
+        price,
         feeRateBps,
       });
-      filledShares += partialShares;
-      spentUsdc += partialSpentUsdc;
-      estimatedFeeUsdc += partialFeeUsdc;
       fills.push({
-        price: ask.price,
-        shares: partialShares,
-        spentUsdc: partialSpentUsdc,
-        feeUsdc: partialFeeUsdc,
+        price,
+        shares: takeShares,
+        spentUsdc: takeSpentUsdc,
+        feeUsdc: takeFeeUsdc,
       });
-      remainingUsdc = 0;
-      break;
+      fillShares += takeShares;
+      spentUsdc += takeSpentUsdc;
+      feeUsdc += takeFeeUsdc;
+      remainingUsdc -= takeSpentUsdc;
+      if (remainingUsdc <= 1e-9) break;
     }
 
-    const avgFillPrice = filledShares > 0 ? (spentUsdc / filledShares) : null;
+    if (!(fillShares > 1e-9) || !(spentUsdc > 1e-9)) return null;
     return {
-      bestAsk,
-      avgFillPrice,
-      fillShares: filledShares,
+      fillShares,
       spentUsdc,
-      unfilledUsdc: remainingUsdc,
-      fullyFilled: remainingUsdc <= 0.000001,
-      askLevelsConsidered: eligible.length,
-      feeRateBps: Number(feeRateBps ?? 0),
-      estimatedFeeUsdc,
+      avgFillPrice: spentUsdc / fillShares,
+      feeRateBps,
+      estimatedFeeUsdc: feeUsdc,
+      fullyFilled: remainingUsdc <= 1e-6,
       fills,
     };
   }
 
   static async estimateMarketBuyFill(tokenId, maxPrice, amountUsdc) {
     const [book, feeRateBps] = await Promise.all([
-      ClobClient.getBook(tokenId),
-      ClobClient.getTakerFeeBps(tokenId),
+      this.getBook(tokenId, { quietNotFound: true }),
+      this.getTakerFeeBps(tokenId),
     ]);
-    return ClobClient.estimateMarketBuyFillFromBook(book, maxPrice, amountUsdc, feeRateBps);
+    if (!book) return null;
+    return this.estimateMarketBuyFillFromBook(book, maxPrice, amountUsdc, feeRateBps);
   }
 
-  // ── Order management ────────────────────────────────────────────────────────
-
-  /**
-   * Post a GTC limit BUY order to the CLOB.
-   * @param {boolean} negRisk - true for Neg Risk markets, false for standard binary markets
-   * Returns the orderId string, or throws on rejection.
-   */
-  static async postLimitBuy(wallet, tokenId, price, shares, negRisk = true) {
-    const { tickSize } = await ClobClient.getBook(tokenId);
-    const client = ClobClient._requireSdkClient();
-    const res = await client.createAndPostOrder(
-      { tokenID: tokenId, price, size: shares, side: PolymarketSide.BUY },
-      { tickSize: String(tickSize), negRisk },
-      PolymarketOrderType.GTC,
+  static async postLimitBuy(_wallet, tokenId, price, shares, negRisk = true) {
+    const response = await this._requireSdkClient().createAndPostOrder(
+      {
+        tokenID: String(tokenId),
+        price: Number(price),
+        size: Number(shares),
+        side: Side.BUY,
+      },
+      {
+        tickSize: DEFAULT_TICK_SIZE,
+        negRisk,
+      },
+      OrderType.GTC,
     );
-    const orderId = res?.orderID ?? res?.orderId ?? null;
-    if (!res?.success) throw new Error(`Order rejected: ${res?.errorMsg ?? JSON.stringify(res)}`);
-    logger.debug('CLOB: limit buy posted', { tokenId, price, shares, orderId });
-    return orderId;
+    return extractOrderId(response);
   }
 
-  static async postFOKLimitBuy(wallet, tokenId, price, shares, negRisk = true) {
-    const { tickSize } = await ClobClient.getBook(tokenId);
-    const client = ClobClient._requireSdkClient();
+  static async postFOKLimitBuy(_wallet, tokenId, price, shares, negRisk = true) {
+    const client = this._requireSdkClient();
     const order = await client.createOrder(
-      { tokenID: tokenId, price, size: shares, side: PolymarketSide.BUY },
-      { tickSize: String(tickSize), negRisk },
-    );
-    const res = await client.postOrder(order, PolymarketOrderType.FOK);
-    if (res.success === false) {
-      logger.warn('CLOB: FOK limit buy rejected', { tokenId, price, shares, errorMsg: res.errorMsg, status: res.status });
-    } else {
-      logger.debug('CLOB: FOK limit buy posted', { tokenId, price, shares, status: res.status });
-    }
-    return res;
-  }
-
-  static async postLimitSell(wallet, tokenId, price, shares, negRisk = true) {
-    const { tickSize } = await ClobClient.getBook(tokenId);
-    const client = ClobClient._requireSdkClient();
-    const res = await client.createAndPostOrder(
-      { tokenID: tokenId, price, size: shares, side: PolymarketSide.SELL },
-      { tickSize: String(tickSize), negRisk },
-      PolymarketOrderType.GTC,
-    );
-    const orderId = res?.orderID ?? res?.orderId ?? null;
-    if (!res?.success) throw new Error(`Order rejected: ${res?.errorMsg ?? JSON.stringify(res)}`);
-    logger.debug('CLOB: limit sell posted', { tokenId, price, shares, orderId });
-    return orderId;
-  }
-
-  /**
-   * Post a FAK (Fill-And-Kill) BUY order.
-   *
-   * FAK is the correct "IOC" type on Polymarket:
-   *   – Fills as many shares as available immediately at or below maxPrice.
-   *   – Any unfilled remainder is cancelled (never rests on the book).
-   *
-   * Use this for copy-trade buys and any taker order where a partial fill
-   * is acceptable.
-   *
-   * @param {boolean} negRisk - true for Neg Risk markets, false for standard binary markets
-   */
-  static async postIOCBuy(wallet, tokenId, maxPrice, amountUsdc, negRisk = true) {
-    const { tickSize } = await ClobClient.getBook(tokenId);
-    const client = ClobClient._requireSdkClient();
-    const res = await client.createAndPostMarketOrder(
       {
-        tokenID: tokenId,
-        price: maxPrice,
-        amount: amountUsdc,
-        side: PolymarketSide.BUY,
-        orderType: PolymarketOrderType.FAK,
+        tokenID: String(tokenId),
+        price: Number(price),
+        size: Number(shares),
+        side: Side.BUY,
       },
-      { tickSize: String(tickSize), negRisk },
-      PolymarketOrderType.FAK,
-    );
-    if (res.success === false) {
-      logger.warn('CLOB: FAK buy rejected', { tokenId, errorMsg: res.errorMsg, status: res.status });
-    } else {
-      logger.debug('CLOB: FAK buy posted', { tokenId, maxPrice, amountUsdc, status: res.status });
-    }
-    return res;
-  }
-
-  /**
-   * Post a FOK (Fill-Or-Kill) BUY order.
-   *
-   * The entire order must fill immediately and completely, or the whole
-   * thing is cancelled. Use this when an all-or-nothing fill is required
-   * (e.g. arb bot needs both legs to fill equally to stay delta-neutral).
-   *
-   * @param {boolean} negRisk - true for Neg Risk markets, false for standard binary markets
-   */
-  static async postFOKBuy(wallet, tokenId, maxPrice, amountUsdc, negRisk = true) {
-    const { tickSize } = await ClobClient.getBook(tokenId);
-    const client = ClobClient._requireSdkClient();
-    const res = await client.createAndPostMarketOrder(
       {
-        tokenID: tokenId,
-        price: maxPrice,
-        amount: amountUsdc,
-        side: PolymarketSide.BUY,
-        orderType: PolymarketOrderType.FOK,
+        tickSize: DEFAULT_TICK_SIZE,
+        negRisk,
       },
-      { tickSize: String(tickSize), negRisk },
-      PolymarketOrderType.FOK,
     );
-    if (res.success === false) {
-      logger.warn('CLOB: FOK buy rejected', { tokenId, errorMsg: res.errorMsg, status: res.status });
-    } else {
-      logger.debug('CLOB: FOK buy posted', { tokenId, maxPrice, amountUsdc, status: res.status });
-    }
-    return res;
+    return client.postOrder(order, OrderType.FOK);
   }
 
-  static async postFOKSell(wallet, tokenId, minPrice, shares, negRisk = true) {
-    const { tickSize } = await ClobClient.getBook(tokenId);
-    const client = ClobClient._requireSdkClient();
-    const res = await client.createAndPostMarketOrder(
+  static async postLimitSell(_wallet, tokenId, price, shares, negRisk = true) {
+    const response = await this._requireSdkClient().createAndPostOrder(
       {
-        tokenID: tokenId,
-        price: minPrice,
-        amount: shares,
-        side: PolymarketSide.SELL,
-        orderType: PolymarketOrderType.FOK,
+        tokenID: String(tokenId),
+        price: Number(price),
+        size: Number(shares),
+        side: Side.SELL,
       },
-      { tickSize: String(tickSize), negRisk },
-      PolymarketOrderType.FOK,
+      {
+        tickSize: DEFAULT_TICK_SIZE,
+        negRisk,
+      },
+      OrderType.GTC,
     );
-    if (res.success === false) {
-      logger.warn('CLOB: FOK sell rejected', { tokenId, errorMsg: res.errorMsg, status: res.status });
-    } else {
-      logger.debug('CLOB: FOK sell posted', { tokenId, minPrice, shares, status: res.status });
-    }
-    return res;
+    return response;
   }
 
-  /**
-   * Cancel a single order by orderId.
-   */
+  static async postIOCBuy(_wallet, tokenId, maxPrice, amountUsdc, negRisk = true) {
+    return this._requireSdkClient().createAndPostMarketOrder(
+      {
+        tokenID: String(tokenId),
+        amount: Number(amountUsdc),
+        price: Number(maxPrice),
+        side: Side.BUY,
+        orderType: OrderType.FAK,
+      },
+      {
+        tickSize: DEFAULT_TICK_SIZE,
+        negRisk,
+      },
+      OrderType.FAK,
+    );
+  }
+
+  static async postFOKBuy(_wallet, tokenId, maxPrice, amountUsdc, negRisk = true) {
+    return this._requireSdkClient().createAndPostMarketOrder(
+      {
+        tokenID: String(tokenId),
+        amount: Number(amountUsdc),
+        price: Number(maxPrice),
+        side: Side.BUY,
+        orderType: OrderType.FOK,
+      },
+      {
+        tickSize: DEFAULT_TICK_SIZE,
+        negRisk,
+      },
+      OrderType.FOK,
+    );
+  }
+
+  static async postFOKSell(_wallet, tokenId, minPrice, shares, negRisk = true) {
+    return this._requireSdkClient().createAndPostMarketOrder(
+      {
+        tokenID: String(tokenId),
+        amount: Number(shares),
+        price: Number(minPrice),
+        side: Side.SELL,
+        orderType: OrderType.FOK,
+      },
+      {
+        tickSize: DEFAULT_TICK_SIZE,
+        negRisk,
+      },
+      OrderType.FOK,
+    );
+  }
+
   static async cancelOrder(orderId) {
-    const client = ClobClient._requireSdkClient();
-    const res = await client.cancelOrder({ orderID: orderId });
-    logger.debug('CLOB: order cancelled', { orderId });
-    return res;
+    return this._requireSdkClient().cancelOrder({ orderID: String(orderId) });
   }
 
-  /**
-   * Cancel all open orders for this wallet.
-   */
   static async cancelAll() {
-    const client = ClobClient._requireSdkClient();
-    const res = await client.cancelAll();
-    logger.info('CLOB: all orders cancelled');
-    return res;
+    return this._requireSdkClient().cancelAll();
   }
 
-  /**
-   * Cancel all open orders for a specific market (conditionId).
-   */
   static async cancelMarket(conditionId) {
-    const client = ClobClient._requireSdkClient();
-    const res = await client.cancelMarketOrders({ market: conditionId });
-    logger.debug('CLOB: market orders cancelled', { conditionId });
-    return res;
+    return this._requireSdkClient().cancelMarketOrders({ market: String(conditionId) });
   }
 
-  /**
-   * Get all open orders for this wallet on a market.
-   * Returns array of order objects with { id, tokenId, price, size, side }.
-   */
-  static async getOpenOrders(conditionId) {
-    const client = ClobClient._requireSdkClient();
-    const res = await client.getOpenOrders({ market: conditionId });
-    return res ?? [];
+  static async getOpenOrders(conditionId = null) {
+    return this._requireSdkClient().getOpenOrders(
+      conditionId ? { market: String(conditionId) } : undefined,
+    );
   }
 }
 
-// ── WebSocket book feed ───────────────────────────────────────────────────────
-/**
- * BookFeed subscribes to real-time order book updates for a pair of tokenIds.
- * Maintains an in-memory best-ask for each token. Wire format follows Polymarket
- * market channel docs (book, price_change / price_changes, best_bid_ask,
- * last_trade_price, tick_size_change).
- * Emits:
- *   'snapshot'   ({tokenId, bids, asks})  – initial full book
- *   'update'     ({tokenId, bestAsk})     – whenever best ask changes
- *   'trade'      ({tokenId, price, size}) – public trade / last_trade_price
- *   'error'      (err)
- *   'close'      ()
- */
 export class BookFeed extends EventEmitter {
-  constructor(tokenIds) {
+  constructor(tokenIds = []) {
     super();
-    this.tokenIds = tokenIds;
-    this.bestAsks = {};   // tokenId → { price, size }
+    this.tokenIds = [...new Set((tokenIds ?? []).map((tokenId) => String(tokenId)).filter(Boolean))];
     this._ws = null;
-    this._reconnectDelay = 1000;
-    this._closed = false;
+    this._pollTimer = null;
+    this._heartbeatTimer = null;
+    this._lastBooks = new Map();
+    this._stopped = true;
   }
 
-  start() {
-    this._connect();
+  async _emitBook(tokenId, rawBook = null) {
+    const book = rawBook ? normalizeBook(rawBook) : await ClobClient.getBook(tokenId, { quietNotFound: true });
+    if (!book) return;
+    this._lastBooks.set(String(tokenId), book);
+    const bestAsk = book.asks?.[0] ?? null;
+    const bestBid = book.bids?.[0] ?? null;
+    this.emit('update', {
+      tokenId: String(tokenId),
+      book,
+      bestAsk,
+      bestBid,
+    });
   }
 
-  stop() {
-    this._closed = true;
-    this._ws?.close();
+  async _refreshAllBooks() {
+    await Promise.all(this.tokenIds.map(async (tokenId) => {
+      try {
+        await this._emitBook(tokenId);
+      } catch (err) {
+        this.emit('error', err);
+      }
+    }));
   }
 
-  getBestAsk(tokenId) {
-    return this.bestAsks[tokenId] ?? null;
+  _startPolling() {
+    if (this._pollTimer) return;
+    this._pollTimer = setInterval(() => {
+      this._refreshAllBooks().catch((err) => this.emit('error', err));
+    }, Math.max(250, Number(BOOK_POLL_MS) || 1_000));
   }
 
-  _connect() {
-    if (this._closed) return;
-    const ws = new WebSocket(CLOB_WS_URL + 'market');
+  _clearTimers() {
+    if (this._pollTimer) {
+      clearInterval(this._pollTimer);
+      this._pollTimer = null;
+    }
+    if (this._heartbeatTimer) {
+      clearInterval(this._heartbeatTimer);
+      this._heartbeatTimer = null;
+    }
+  }
+
+  _connectWs() {
+    if (!this.tokenIds.length) return;
+    const ws = new WebSocket(`${CLOB_WS_URL.replace(/\/$/, '')}/market`);
     this._ws = ws;
 
     ws.on('open', () => {
-      logger.debug('BookFeed: WS connected, subscribing', { tokenIds: this.tokenIds });
       ws.send(JSON.stringify({
-        type:                   'market',
-        assets_ids:             this.tokenIds,
-        custom_feature_enabled: true, // enables best_bid_ask, new_market, market_resolved events
+        assets_ids: this.tokenIds,
+        type: 'market',
+        custom_feature_enabled: true,
       }));
-      this._reconnectDelay = 1000; // reset backoff on successful connect
+      this._heartbeatTimer = setInterval(() => {
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send('PING');
+        }
+      }, BOOK_HEARTBEAT_MS);
     });
 
-    ws.on('message', (raw) => {
+    ws.on('message', (buf) => {
       try {
-        const msg = JSON.parse(raw.toString());
-        this._handleMessage(msg);
-      } catch (e) {
-        logger.warn('BookFeed: parse error', { err: e.message });
+        const rawText = buf.toString();
+        if (!rawText || rawText === 'PONG' || rawText === 'PING') return;
+        if (!(rawText.startsWith('{') || rawText.startsWith('['))) return;
+        const message = JSON.parse(rawText);
+        if (!message || typeof message !== 'object') return;
+        if (message.event_type === 'book') {
+          void this._emitBook(message.asset_id ?? message.assetId, message).catch((err) => this.emit('error', err));
+          return;
+        }
+        if (message.event_type === 'best_bid_ask') {
+          const tokenId = String(message.asset_id ?? message.assetId ?? '');
+          if (!tokenId) return;
+          const previous = this._lastBooks.get(tokenId) ?? {
+            bids: [],
+            asks: [],
+            tickSize: Number(DEFAULT_TICK_SIZE),
+            minOrderSize: Number(DEFAULT_MIN_ORDER_SIZE),
+          };
+          const nextBook = {
+            ...previous,
+            asset_id: tokenId,
+            assetId: tokenId,
+            bids: Number.isFinite(Number(message.best_bid)) && Number(message.best_bid) > 0
+              ? [{ price: Number(message.best_bid), size: previous.bids?.[0]?.size ?? 0 }]
+              : previous.bids,
+            asks: Number.isFinite(Number(message.best_ask)) && Number(message.best_ask) > 0
+              ? [{ price: Number(message.best_ask), size: previous.asks?.[0]?.size ?? 0 }]
+              : previous.asks,
+            timestamp: message.timestamp,
+          };
+          void this._emitBook(tokenId, nextBook).catch((err) => this.emit('error', err));
+          return;
+        }
+        if (message.event_type === 'last_trade_price') {
+          const trade = normalizeTradeEvent(message);
+          if (trade) this.emit('trade', trade);
+          return;
+        }
+      } catch (err) {
+        this.emit('error', err);
       }
     });
 
     ws.on('error', (err) => {
-      logger.error('BookFeed: WS error', { err: err.message });
       this.emit('error', err);
     });
 
     ws.on('close', () => {
-      if (!this._closed) {
-        logger.warn(`BookFeed: WS closed, reconnecting in ${this._reconnectDelay}ms`);
+      this._clearTimers();
+      this._ws = null;
+      if (!this._stopped) {
         setTimeout(() => {
-          this._reconnectDelay = Math.min(this._reconnectDelay * 2, 30_000);
-          this._connect();
-        }, this._reconnectDelay);
-      } else {
-        this.emit('close');
+          if (!this._stopped) this._connectWs();
+        }, 1_000);
       }
     });
   }
 
-  _handleMessage(msg) {
-    const { event_type, asset_id } = msg;
-    const eventTimeMs = (() => {
-      const candidates = [msg.timestamp, msg.time, msg.created_at, msg.last_updated_at];
-      for (const candidate of candidates) {
-        const asNumber = Number(candidate);
-        if (Number.isFinite(asNumber) && asNumber > 0) {
-          return asNumber > 1e12 ? asNumber : asNumber * 1000;
-        }
-        const parsed = Date.parse(String(candidate ?? ''));
-        if (Number.isFinite(parsed)) {
-          return parsed;
-        }
-      }
-      return Date.now();
-    })();
-
-    if (event_type === 'book') {
-      const tid = asset_id ?? msg.asset_id;
-      const asks = (msg.asks ?? []).map(a => ({ price: parseFloat(a.price), size: parseFloat(a.size) }));
-      const bids = (msg.bids ?? []).map(b => ({ price: parseFloat(b.price), size: parseFloat(b.size) }));
-      this.emit('snapshot', { tokenId: tid, bids, asks });
-      const best = this._bestAsk(asks);
-      if (best && tid) {
-        this.bestAsks[tid] = best;
-        this.emit('update', { tokenId: tid, bestAsk: best });
-      }
-      return;
-    }
-
-    if (event_type === 'price_change') {
-      // Current wire format: `price_changes[]` per asset + best_bid/best_ask hints.
-      // Legacy: `changes[]` scoped to top-level `asset_id`.
-      const rows = msg.price_changes ?? msg.changes ?? [];
-      const legacyAssetId = asset_id;
-
-      for (const c of rows) {
-        const aid = c.asset_id ?? legacyAssetId;
-        if (!aid) continue;
-
-        const bestAskRaw = c.best_ask;
-        if (
-          c.side === 'SELL' &&
-          bestAskRaw !== undefined &&
-          bestAskRaw !== '' &&
-          bestAskRaw !== '0'
-        ) {
-          const bestAsk = parseFloat(bestAskRaw);
-          if (!isNaN(bestAsk) && bestAsk > 0) {
-            const cur = this.bestAsks[aid];
-            if (!cur || Math.abs(cur.price - bestAsk) > 1e-9) {
-              this.bestAsks[aid] = { price: bestAsk, size: cur?.size ?? 0 };
-              this.emit('update', { tokenId: aid, bestAsk: this.bestAsks[aid] });
-            }
-            continue;
-          }
-        }
-
-        if (c.side !== 'SELL') continue;
-        const price = parseFloat(c.price);
-        const size = parseFloat(c.size);
-        const cur = this.bestAsks[aid];
-
-        if (size === 0 && cur && Math.abs(cur.price - price) < 1e-9) {
-          this._refreshBestAsk(aid);
-        } else if (!cur || price < cur.price || (Math.abs(price - cur.price) < 1e-9 && size !== cur.size)) {
-          this.bestAsks[aid] = { price, size };
-          this.emit('update', { tokenId: aid, bestAsk: { price, size } });
-        }
-      }
-      return;
-    }
-
-    if (event_type === 'tick_size_change') {
-      const tid = asset_id ?? msg.asset_id;
-      logger.debug('BookFeed: tick_size_change', {
-        tokenId: tid,
-        oldTick: msg.old_tick_size,
-        newTick: msg.new_tick_size,
-      });
-      if (tid) this._refreshBestAsk(tid);
-      return;
-    }
-
-    if (event_type === 'best_bid_ask') {
-      const tid = asset_id ?? msg.asset_id;
-      const bestAsk = parseFloat(msg.best_ask);
-      if (!tid || isNaN(bestAsk) || bestAsk <= 0) return;
-      const cur = this.bestAsks[tid];
-      if (!cur || Math.abs(cur.price - bestAsk) > 1e-9) {
-        this.bestAsks[tid] = { price: bestAsk, size: cur?.size ?? 0 };
-        this.emit('update', { tokenId: tid, bestAsk: this.bestAsks[tid] });
-      }
-      return;
-    }
-
-    if (event_type === 'last_trade_price') {
-      const tid = asset_id ?? msg.asset_id;
-      if (tid) {
-        this.emit('trade', {
-          tokenId: tid,
-          price: parseFloat(msg.price),
-          size: parseFloat(msg.size),
-          side: msg.side ?? msg.taker_side ?? null,
-          timeMs: eventTimeMs,
-        });
-      }
-      return;
-    }
-
-    if (event_type === 'trade') {
-      const tid = asset_id ?? msg.asset_id;
-      if (tid) {
-        this.emit('trade', {
-          tokenId: tid,
-          price: parseFloat(msg.price),
-          size: parseFloat(msg.size),
-          side: msg.side ?? msg.taker_side ?? null,
-          timeMs: eventTimeMs,
-        });
-      }
-    }
+  start() {
+    this._stopped = false;
+    void this._refreshAllBooks().catch((err) => this.emit('error', err));
+    this._startPolling();
+    this._connectWs();
   }
 
-  _bestAsk(asks) {
-    if (!asks.length) return null;
-    return asks.reduce((a, b) => (a.price <= b.price ? a : b));
-  }
-
-  async _refreshBestAsk(tokenId) {
-    try {
-      const best = await ClobClient.getBestAsk(tokenId);
-      if (best) {
-        this.bestAsks[tokenId] = best;
-        this.emit('update', { tokenId, bestAsk: best });
+  stop() {
+    this._stopped = true;
+    this._clearTimers();
+    if (this._ws) {
+      try {
+        this._ws.close();
+      } catch {
+        // ignore
       }
-    } catch (e) {
-      logger.warn('BookFeed: refresh best ask failed', { tokenId, err: e.message });
+      this._ws = null;
     }
   }
 }
 
-// ── User fill WebSocket ───────────────────────────────────────────────────────
-/**
- * FillFeed subscribes to user-level fill events.
- * Emits 'fill' events: { tokenId, price, size, side, orderId, matchedAt }
- */
 export class FillFeed extends EventEmitter {
-  constructor() {
+  constructor({ markets = [] } = {}) {
     super();
+    this.markets = Array.isArray(markets) ? markets.map(String).filter(Boolean) : [];
     this._ws = null;
-    this._closed = false;
-  }
-
-  start() {
-    this._connect();
-  }
-
-  stop() {
-    this._closed = true;
-    this._ws?.close();
+    this._heartbeatTimer = null;
+    this._stopped = true;
   }
 
   _connect() {
-    if (this._closed) return;
     const creds = ClobClient.creds;
-    if (!creds) throw new Error('FillFeed: CLOB not initialised');
-
-    const ws = new WebSocket(CLOB_WS_URL + 'user');
+    if (!creds) {
+      throw new Error('FillFeed requires initialized CLOB credentials');
+    }
+    const ws = new WebSocket(`${CLOB_WS_URL.replace(/\/$/, '')}/user`);
     this._ws = ws;
 
     ws.on('open', () => {
       ws.send(JSON.stringify({
         auth: {
-          apiKey:     creds.apiKey,
-          secret:     creds.secret,
+          apiKey: creds.apiKey ?? creds.key,
+          secret: creds.secret,
           passphrase: creds.passphrase,
         },
-        markets: [],
+        ...(this.markets.length ? { markets: this.markets } : {}),
         type: 'user',
       }));
-      logger.debug('FillFeed: user WS connected');
-    });
-
-    ws.on('message', (raw) => {
-      try {
-        const msg = JSON.parse(raw.toString());
-        if (msg.event_type === 'trade' || msg.type === 'TRADE') {
-          this.emit('fill', {
-            tokenId:   msg.asset_id,
-            price:     parseFloat(msg.price),
-            size:      parseFloat(msg.size),
-            side:      msg.side,
-            orderId:   msg.id ?? msg.orderId,
-            matchedAt: msg.timestamp,
-          });
+      this._heartbeatTimer = setInterval(() => {
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send('PING');
         }
-      } catch { /* ignore */ }
+      }, USER_HEARTBEAT_MS);
     });
 
-    ws.on('error', (err) => logger.error('FillFeed: error', { err: err.message }));
-    ws.on('close', () => {
-      if (!this._closed) {
-        setTimeout(() => this._connect(), 2000);
+    ws.on('message', (buf) => {
+      try {
+        const rawText = buf.toString();
+        if (!rawText || rawText === 'PONG' || rawText === 'PING') return;
+        if (!(rawText.startsWith('{') || rawText.startsWith('['))) return;
+        const message = JSON.parse(rawText);
+        const fill = normalizeUserFill(message);
+        if (fill) {
+          this.emit('fill', fill);
+        }
+      } catch (err) {
+        this.emit('error', err);
       }
     });
+
+    ws.on('error', (err) => {
+      this.emit('error', err);
+    });
+
+    ws.on('close', () => {
+      if (this._heartbeatTimer) {
+        clearInterval(this._heartbeatTimer);
+        this._heartbeatTimer = null;
+      }
+      this._ws = null;
+      if (!this._stopped) {
+        setTimeout(() => {
+          if (!this._stopped) this._connect();
+        }, 1_000);
+      }
+    });
+  }
+
+  start() {
+    this._stopped = false;
+    this._connect();
+  }
+
+  stop() {
+    this._stopped = true;
+    if (this._heartbeatTimer) {
+      clearInterval(this._heartbeatTimer);
+      this._heartbeatTimer = null;
+    }
+    if (this._ws) {
+      try {
+        this._ws.close();
+      } catch {
+        // ignore
+      }
+      this._ws = null;
+    }
   }
 }

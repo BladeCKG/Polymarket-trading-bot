@@ -205,7 +205,8 @@ function parseSymbolTrendMoments_(symbol, fallback) {
 
 // ── Wallet ───────────────────────────────────────────────────────────────────
 export const PRIVATE_KEY    = required('PRIVATE_KEY');
-export const PROXY_WALLET   = required('PROXY_WALLET'); // Keep EIP-55 checksum as-is
+export const PROXY_WALLET   = optional('PROXY_WALLET', ''); // Keep EIP-55 checksum as-is when used
+export const DEPOSIT_WALLET_ADDRESS = optional('DEPOSIT_WALLET_ADDRESS', ''); // Keep EIP-55 checksum as-is when used
 export const TARGET_WALLET  = optional('TARGET_WALLET', '').toLowerCase();
 
 // Signature type for EIP-712 order signing (see Polymarket auth docs).
@@ -215,6 +216,13 @@ export const TARGET_WALLET  = optional('TARGET_WALLET', '').toLowerCase();
 //  3 = POLY_1271   – deposit-wallet flow for new API users (funder = deposit wallet)
 // https://docs.polymarket.com/api-reference/authentication#signature-types-and-funder
 export const SIGNATURE_TYPE = parseFloat_('SIGNATURE_TYPE', 2);
+export const IS_DEPOSIT_WALLET_FLOW = Number(SIGNATURE_TYPE) === 3;
+export const FUNDER_ADDRESS = (() => {
+  if (IS_DEPOSIT_WALLET_FLOW) {
+    return required('DEPOSIT_WALLET_ADDRESS');
+  }
+  return required('PROXY_WALLET');
+})();
 
 // ── API credentials (optional on first run; auth.js generates them) ─────────
 export const API_KEY        = optional('POLY_API_KEY', '');
@@ -295,6 +303,7 @@ export const BEAT_PROBABILITY_REQUIRED_EDGE = parseFloat_('BEAT_PROBABILITY_REQU
 export const BEAT_PROBABILITY_PAIR_COST_MAX = parseFloat_('BEAT_PROBABILITY_PAIR_COST_MAX', 1.0);
 export const BEAT_PROBABILITY_VOL_LAMBDA = parseFloat_('BEAT_PROBABILITY_VOL_LAMBDA', 0.97);
 export const BEAT_PROBABILITY_DRIFT_SHRINK = parseFloat_('BEAT_PROBABILITY_DRIFT_SHRINK', 0.35);
+export const BEAT_PROBABILITY_OFI_WEIGHT = parseFloat_('BEAT_PROBABILITY_OFI_WEIGHT', 0.20);
 export const BEAT_PROBABILITY_CONFIDENCE = parseFloat_('BEAT_PROBABILITY_CONFIDENCE', 0.80);
 export const BEAT_PROBABILITY_MIN = parseFloat_('BEAT_PROBABILITY_MIN', 0.05);
 export const BEAT_PROBABILITY_MAX = parseFloat_('BEAT_PROBABILITY_MAX', 0.95);
