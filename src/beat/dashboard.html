@@ -452,6 +452,34 @@
       stroke-linejoin: round;
     }
 
+    .graph-trade-line-directional {
+      stroke: rgba(15, 118, 110, 0.55);
+      stroke-width: 1.5;
+      stroke-dasharray: 4 4;
+    }
+
+    .graph-trade-line-pair {
+      stroke: rgba(180, 35, 24, 0.6);
+      stroke-width: 1.5;
+      stroke-dasharray: 2 3;
+    }
+
+    .graph-trade-label {
+      font-size: 9px;
+      fill: var(--ink);
+      font-weight: 700;
+    }
+
+    .graph-trade-badge-directional {
+      fill: rgba(15, 118, 110, 0.12);
+      stroke: rgba(15, 118, 110, 0.35);
+    }
+
+    .graph-trade-badge-pair {
+      fill: rgba(180, 35, 24, 0.12);
+      stroke: rgba(180, 35, 24, 0.35);
+    }
+
     .settlement {
       display: grid;
       gap: 12px;
@@ -530,6 +558,26 @@
       gap: 6px;
     }
 
+    .buy-item.paired {
+      background: rgba(22, 101, 52, 0.06);
+      border-color: rgba(22, 101, 52, 0.2);
+    }
+
+    .buy-item.unpaired {
+      background: rgba(180, 35, 24, 0.06);
+      border-color: rgba(180, 35, 24, 0.18);
+    }
+
+    .buy-item.paired {
+      background: rgba(22, 101, 52, 0.06);
+      border-color: rgba(22, 101, 52, 0.2);
+    }
+
+    .buy-item.unpaired {
+      background: rgba(180, 35, 24, 0.06);
+      border-color: rgba(180, 35, 24, 0.18);
+    }
+
     .buy-item .head {
       display: flex;
       justify-content: space-between;
@@ -544,6 +592,94 @@
       color: var(--muted);
       font-size: 0.8rem;
       line-height: 1.45;
+    }
+
+    .trade-chip-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+
+    .trade-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 5px 8px;
+      border-radius: 999px;
+      font-size: 0.72rem;
+      font-weight: 800;
+      letter-spacing: 0.02em;
+      border: 1px solid rgba(15, 118, 110, 0.12);
+      background: rgba(255, 255, 255, 0.8);
+      color: var(--ink);
+    }
+
+    .trade-chip.directional {
+      background: rgba(15, 118, 110, 0.08);
+      color: var(--accent);
+      border-color: rgba(15, 118, 110, 0.18);
+    }
+
+    .trade-chip.pair {
+      background: rgba(180, 35, 24, 0.08);
+      color: var(--bad);
+      border-color: rgba(180, 35, 24, 0.18);
+    }
+
+    .trade-chip.good {
+      background: rgba(22, 101, 52, 0.08);
+      color: var(--good);
+      border-color: rgba(22, 101, 52, 0.18);
+    }
+
+    .trade-chip.warn {
+      background: rgba(180, 35, 24, 0.08);
+      color: var(--bad);
+      border-color: rgba(180, 35, 24, 0.18);
+    }
+
+    .trade-chip-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+
+    .trade-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 5px 8px;
+      border-radius: 999px;
+      font-size: 0.72rem;
+      font-weight: 800;
+      letter-spacing: 0.02em;
+      border: 1px solid rgba(15, 118, 110, 0.12);
+      background: rgba(255, 255, 255, 0.8);
+      color: var(--ink);
+    }
+
+    .trade-chip.directional {
+      background: rgba(15, 118, 110, 0.08);
+      color: var(--accent);
+      border-color: rgba(15, 118, 110, 0.18);
+    }
+
+    .trade-chip.pair {
+      background: rgba(180, 35, 24, 0.08);
+      color: var(--bad);
+      border-color: rgba(180, 35, 24, 0.18);
+    }
+
+    .trade-chip.good {
+      background: rgba(22, 101, 52, 0.08);
+      color: var(--good);
+      border-color: rgba(22, 101, 52, 0.18);
+    }
+
+    .trade-chip.warn {
+      background: rgba(180, 35, 24, 0.08);
+      color: var(--bad);
+      border-color: rgba(180, 35, 24, 0.18);
     }
 
     .summary-positive { color: var(--good); }
@@ -853,6 +989,13 @@
       return `${sec}s`;
     }
 
+    function secondsAfterMarketOpenRaw(entry, market) {
+      const eventMs = Number(entry?.recordedAt ?? entry?.pairedAt ?? NaN);
+      const openMs = getWindowOpenMs(market);
+      if (!Number.isFinite(eventMs) || !Number.isFinite(openMs)) return Number.NaN;
+      return (eventMs - openMs) / 1000;
+    }
+
     function getWindowCloseMs(market) {
       const closeMs = Number(market?.windowCloseAt ?? null);
       return Number.isFinite(closeMs) ? closeMs : null;
@@ -897,6 +1040,44 @@
       if (market.outcome) return market.outcome;
       if (market.settled) return 'unknown';
       return '-';
+    }
+
+    function tradePairMap(market) {
+      const buyEvents = Array.isArray(market.buyEvents) ? market.buyEvents : [];
+      const pairEvents = Array.isArray(market.pairEvents) ? market.pairEvents : [];
+      const map = new Map();
+      for (const buy of buyEvents) {
+        const id = String(buy?.id ?? '').trim();
+        if (!id) continue;
+        map.set(id, { id, pairIds: [], pairedShares: 0, originalShares: Number(buy?.shares ?? 0) });
+      }
+      for (const pair of pairEvents) {
+        const pairId = String(pair?.id ?? '').trim();
+        const shares = Number(pair?.shares ?? 0);
+        for (const id of [pair?.upLotId, pair?.downLotId].map((value) => String(value ?? '').trim()).filter(Boolean)) {
+          if (!map.has(id)) {
+            map.set(id, { id, pairIds: [], pairedShares: 0, originalShares: 0 });
+          }
+          const entry = map.get(id);
+          entry.pairIds.push(pairId);
+          entry.pairedShares += Number.isFinite(shares) ? shares : 0;
+        }
+      }
+      return map;
+    }
+
+    function tradeAnnotations(market) {
+      const buyEvents = Array.isArray(market.buyEvents) ? market.buyEvents : [];
+      return buyEvents.map((buy, index) => {
+        const second = secondsAfterMarketOpenRaw(buy, market);
+        if (!Number.isFinite(second)) return null;
+        const id = String(buy?.id ?? `buy-${index + 1}`);
+        return {
+          second,
+          label: `${id.replace(/^buy-/, 'T')} ${Math.round(second)}s`,
+          intent: String(buy?.intent ?? '').toLowerCase() === 'pair-buy' ? 'pair' : 'directional',
+        };
+      }).filter(Boolean);
     }
 
     function tradeSummary(market) {
@@ -1165,19 +1346,164 @@
       `;
     }
 
+    function annotatedChartSvg(seriesList, { centerValue, minRadius = 0.01, fixedRadius = null, yFormatter, annotations = [] }) {
+      const width = 520;
+      const height = 228;
+      const paddingX = 34;
+      const paddingY = 20;
+      const allValues = seriesList.flatMap((series) =>
+        series.points
+          .map((point) => point.value)
+          .filter((value) => Number.isFinite(value)),
+      );
+      if (!allValues.length) {
+        return `<div class="graph-empty">Waiting for monitoring samples...</div>`;
+      }
+
+      const radius = Number.isFinite(Number(fixedRadius)) && Number(fixedRadius) > 0
+        ? Number(fixedRadius)
+        : Math.max(
+          minRadius,
+          ...allValues.map((value) => Math.abs(value - centerValue)),
+        );
+      const centerY = paddingY + ((height - (paddingY * 2)) / 2);
+      const bottomY = height - paddingY;
+      const rightX = width - paddingX;
+      const usableWidth = width - (paddingX * 2);
+      const pathHtml = seriesList
+        .map((series) => {
+          const path = linePath(series.points, centerValue, radius, width, height, paddingX, paddingY);
+          return path ? `<path class="${series.className}" d="${path}"></path>` : '';
+        })
+        .join('');
+      const annotationHtml = annotations
+        .filter((annotation) => Number.isFinite(Number(annotation?.second)))
+        .map((annotation, index) => {
+          const second = Math.max(0, Math.min(300, Number(annotation.second)));
+          const x = paddingX + (second / 300) * usableWidth;
+          const lineClass = annotation.intent === 'pair' ? 'graph-trade-line-pair' : 'graph-trade-line-directional';
+          const badgeClass = annotation.intent === 'pair' ? 'graph-trade-badge-pair' : 'graph-trade-badge-directional';
+          const y = paddingY + 4 + ((index % 4) * 14);
+          const label = escapeHtml(annotation.label ?? `${Math.round(second)}s`);
+          const badgeWidth = Math.max(34, (String(annotation.label ?? '').length * 5.9) + 8);
+          return `
+            <line class="${lineClass}" x1="${x.toFixed(2)}" y1="${paddingY}" x2="${x.toFixed(2)}" y2="${bottomY}"></line>
+            <rect class="${badgeClass}" x="${(x - (badgeWidth / 2)).toFixed(2)}" y="${(y - 9).toFixed(2)}" rx="5" ry="5" width="${badgeWidth.toFixed(2)}" height="12"></rect>
+            <text class="graph-trade-label" x="${x.toFixed(2)}" y="${y.toFixed(2)}" text-anchor="middle">${label}</text>
+          `;
+        })
+        .join('');
+
+      return `
+        <svg class="graph-svg" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" aria-hidden="true">
+          <line class="graph-track" x1="${paddingX}" y1="${paddingY}" x2="${paddingX}" y2="${bottomY}"></line>
+          <line class="graph-track" x1="${paddingX}" y1="${bottomY}" x2="${rightX}" y2="${bottomY}"></line>
+          <line class="graph-axis-line center" x1="${paddingX}" y1="${centerY}" x2="${rightX}" y2="${centerY}"></line>
+          <line class="graph-axis-line" x1="${paddingX}" y1="${paddingY}" x2="${rightX}" y2="${paddingY}"></line>
+          ${pathHtml}
+          ${annotationHtml}
+          <text class="graph-axis-label" x="${paddingX}" y="${height - 2}" text-anchor="start">0s</text>
+          <text class="graph-axis-label" x="${rightX}" y="${height - 2}" text-anchor="end">300s</text>
+          <text class="graph-axis-label" x="${paddingX - 6}" y="${paddingY + 4}" text-anchor="end">${escapeHtml(yFormatter(centerValue + radius))}</text>
+          <text class="graph-axis-label" x="${paddingX - 6}" y="${centerY + 4}" text-anchor="end">${escapeHtml(yFormatter(centerValue))}</text>
+          <text class="graph-axis-label" x="${paddingX - 6}" y="${bottomY + 4}" text-anchor="end">${escapeHtml(yFormatter(centerValue - radius))}</text>
+        </svg>
+      `;
+    }
+
+    function tradeSummaryRich(market) {
+      if (!market.tradeOccurred && !market.buyShares) {
+        return `<div class="empty">No trade executed on this market.</div>`;
+      }
+      const pnl = Number(market.pnl ?? 0);
+      const title = market.settled ? 'Settlement summary' : 'Trade summary';
+      const buyEvents = Array.isArray(market.buyEvents) ? market.buyEvents : [];
+      const pairEvents = Array.isArray(market.pairEvents) ? market.pairEvents : [];
+      const pairMap = tradePairMap(market);
+      const buyRows = buyEvents.length
+        ? buyEvents.map((buy, index) => {
+          const buyMove = Number(buy?.moveAtBuyUsd ?? null);
+          const buyMovePct = buy?.moveAtBuyPct;
+          const buyId = String(buy?.id ?? `buy-${index + 1}`);
+          const mapping = pairMap.get(buyId);
+          const pairIds = Array.isArray(mapping?.pairIds) ? mapping.pairIds : [];
+          const paired = pairIds.length > 0;
+          const tradeIntent = String(buy?.intent ?? '').toLowerCase() === 'pair-buy' ? 'pair' : 'directional';
+          return `
+            <div class="buy-item ${paired ? 'paired' : 'unpaired'}">
+              <div class="head">
+                <span>${escapeHtml(buyId)} ${buy?.side ? `(${buy.side})` : ''}</span>
+                <span>${money(buy?.usdc)}</span>
+              </div>
+              <div class="trade-chip-row">
+                <span class="trade-chip ${tradeIntent === 'pair' ? 'pair' : 'directional'}">${tradeIntent === 'pair' ? 'Pair Buy' : 'Directional Buy'}</span>
+                <span class="trade-chip ${paired ? 'good' : 'warn'}">${paired ? 'Paired' : 'Unpaired'}</span>
+                ${paired ? `<span class="trade-chip good">Pair IDs: ${escapeHtml(pairIds.join(', '))}</span>` : ''}
+              </div>
+              <div class="meta">
+                ${buy?.shares != null ? `${Number(buy.shares).toFixed(4)} shares` : '-'} at ${price(buy?.price)}
+                ${buyMovePct != null ? ` • move ${signedMoney(buyMove)} (${buyMovePct >= 0 ? '+' : ''}${Number(buyMovePct).toFixed(2)}%)` : ''}
+                ${buy?.recordedAt ? ` • ${secondsAfterMarketOpen(buy, market)}` : ''}
+              </div>
+            </div>
+          `;
+        }).join('')
+        : '';
+      const pairRows = pairEvents.length
+        ? pairEvents.map((pair, index) => `
+          <div class="buy-item paired">
+            <div class="head">
+              <span>${escapeHtml(String(pair?.id ?? `pair-${index + 1}`))}</span>
+              <span>${Number(pair?.shares ?? 0).toFixed(4)} shares</span>
+            </div>
+            <div class="trade-chip-row">
+              <span class="trade-chip pair">Pair</span>
+              <span class="trade-chip good">${escapeHtml(String(pair?.upLotId ?? '-'))} / ${escapeHtml(String(pair?.downLotId ?? '-'))}</span>
+            </div>
+            <div class="meta">
+              cost ${price(pair?.averagePairCost)} = Up ${price(pair?.upPrice)} + Down ${price(pair?.downPrice)}
+              ${pair?.pairedAt ? ` • ${secondsAfterMarketOpen({ pairedAt: pair.pairedAt }, market)}` : ''}
+            </div>
+          </div>
+        `).join('')
+        : '';
+      return `
+        <div class="settlement">
+          <div class="title">${title}</div>
+          <div class="settlement-grid">
+            <div class="summary-box"><div class="label">Outcome</div><div class="value">${outcomeLabel(market)}</div></div>
+            <div class="summary-box"><div class="label">Market PnL</div><div class="value ${pnl >= 0 ? 'summary-positive' : 'summary-negative'}">${money(pnl)}</div></div>
+            <div class="summary-box"><div class="label">Chosen Side</div><div class="value">${market.chosenSide || '-'}</div></div>
+            <div class="summary-box"><div class="label">Buy Shares</div><div class="value">${market.buyShares != null ? Number(market.buyShares).toFixed(4) : '-'}</div></div>
+            <div class="summary-box"><div class="label">Total Buy USDC</div><div class="value">${money(market.buyUsdc)}</div></div>
+            <div class="summary-box"><div class="label">Buy Price</div><div class="value">${price(market.buyPrice)}</div></div>
+            <div class="summary-box"><div class="label">Buy Count</div><div class="value">${market.buyCount != null ? Number(market.buyCount) : '-'}</div></div>
+            <div class="summary-box"><div class="label">Paired Shares</div><div class="value">${Number(market.pairedShares ?? 0).toFixed(4)}</div></div>
+            <div class="summary-box"><div class="label">Avg Pair Cost</div><div class="value">${price(market.averagePairedCost)}</div></div>
+            <div class="summary-box"><div class="label">Unpaired Up</div><div class="value">${Number(market.unpairedUpShares ?? 0).toFixed(4)}</div></div>
+            <div class="summary-box"><div class="label">Unpaired Down</div><div class="value">${Number(market.unpairedDownShares ?? 0).toFixed(4)}</div></div>
+          </div>
+        </div>
+        ${buyRows ? `<div class="buy-history"><div class="title">Buy History</div><div class="buy-list">${buyRows}</div></div>` : ''}
+        ${pairRows ? `<div class="buy-history"><div class="title">Pair History</div><div class="buy-list">${pairRows}</div></div>` : ''}
+      `;
+    }
+
     function renderMonitoringGraphs(market, symbol, move) {
       const movePoints = seriesPoints(market, 'move');
       const upAskPoints = seriesPoints(market, 'upAsk');
       const downAskPoints = seriesPoints(market, 'downAsk');
-      const moveChart = chartSvg(
+      const annotations = tradeAnnotations(market);
+      const moveChart = annotatedChartSvg(
         [{ points: movePoints, className: 'graph-line-move' }],
         {
           centerValue: 0,
           minRadius: 10,
           yFormatter: (value) => signedMoney(value, 0),
+          annotations,
         },
       );
-      const askChart = chartSvg(
+      const askChart = annotatedChartSvg(
         [
           { points: upAskPoints, className: 'graph-line-up' },
           { points: downAskPoints, className: 'graph-line-down' },
@@ -1186,6 +1512,7 @@
           centerValue: 0.5,
           fixedRadius: 0.5,
           yFormatter: (value) => price(value),
+          annotations,
         },
       );
 
@@ -1198,6 +1525,8 @@
             </div>
             <div class="graph-legend">
               <span class="legend-item"><span class="legend-swatch" style="background:#0f766e;"></span>Now ${signedMoney(move)}</span>
+              <span class="legend-item"><span class="legend-swatch" style="background:rgba(15,118,110,0.55);"></span>Directional buy</span>
+              <span class="legend-item"><span class="legend-swatch" style="background:rgba(180,35,24,0.55);"></span>Pair buy</span>
             </div>
             <div class="graph-shell">${moveChart}</div>
           </section>
@@ -1209,6 +1538,8 @@
             <div class="graph-legend">
               <span class="legend-item"><span class="legend-swatch" style="background:#166534;"></span>Up Ask ${price(market.upBestAsk)}</span>
               <span class="legend-item"><span class="legend-swatch" style="background:#b42318;"></span>Down Ask ${price(market.downBestAsk)}</span>
+              <span class="legend-item"><span class="legend-swatch" style="background:rgba(15,118,110,0.55);"></span>Directional buy</span>
+              <span class="legend-item"><span class="legend-swatch" style="background:rgba(180,35,24,0.55);"></span>Pair buy</span>
             </div>
             <div class="graph-shell">${askChart}</div>
           </section>
@@ -1339,7 +1670,7 @@
             <div class="metric"><div class="label">Trade Status</div><div class="value small">${statusText}</div></div>
             <div class="metric"><div class="label">Settlement</div><div class="value small">${settled ? (market.outcome || '-') : (preOpen ? '' : countdown(market.windowCloseAt))}</div></div>
           </div>
-          ${traded ? tradeSummary(market) : ''}
+          ${traded ? tradeSummaryRich(market) : ''}
         </article>
       `;
     }

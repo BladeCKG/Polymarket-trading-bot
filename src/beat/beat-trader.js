@@ -1416,10 +1416,27 @@ export class BeatTrader {
         return { side, leg, affordable: true, maxPrice, reason: null, sideProbability, directionalEdge, effectiveDirectionalEdge, pairCompletionModel, distanceFromMid, dynamicMoveMax };
       }));
 
+    const pairCandidates = (await Promise.all([
+      this._buildArbPairCandidate('Up', {
+        tokenId: this.market.upToken.tokenId,
+        book: this.latestQuotes.up?.book ?? null,
+        bid: this.latestQuotes.up?.bid ?? null,
+        ask: this.latestQuotes.up?.ask ?? null,
+        bookAgeMs: bookAgeMs(this.latestQuotes.up?.book),
+      }, snapshot),
+      this._buildArbPairCandidate('Down', {
+        tokenId: this.market.downToken.tokenId,
+        book: this.latestQuotes.down?.book ?? null,
+        bid: this.latestQuotes.down?.bid ?? null,
+        ask: this.latestQuotes.down?.ask ?? null,
+        bookAgeMs: bookAgeMs(this.latestQuotes.down?.book),
+      }, snapshot),
+    ])).filter(Boolean);
+
     const affordableLegs = candidateLegs.filter((entry) => entry.affordable);
-    if (!affordableLegs.length) {
+    if (!affordableLegs.length && !pairCandidates.length) {
       this._recordAudit('decision_skip', {
-        reason: 'no-affordable-side',
+        reason: 'no-affordable-side-or-pair',
         delta,
         absoluteMove,
         moment,
@@ -1452,23 +1469,6 @@ export class BeatTrader {
         if (askDiff !== 0) return askDiff;
         return String(a.side).localeCompare(String(b.side));
       });
-
-    const pairCandidates = (await Promise.all([
-      this._buildArbPairCandidate('Up', {
-        tokenId: this.market.upToken.tokenId,
-        book: this.latestQuotes.up?.book ?? null,
-        bid: this.latestQuotes.up?.bid ?? null,
-        ask: this.latestQuotes.up?.ask ?? null,
-        bookAgeMs: bookAgeMs(this.latestQuotes.up?.book),
-      }, snapshot),
-      this._buildArbPairCandidate('Down', {
-        tokenId: this.market.downToken.tokenId,
-        book: this.latestQuotes.down?.book ?? null,
-        bid: this.latestQuotes.down?.bid ?? null,
-        ask: this.latestQuotes.down?.ask ?? null,
-        bookAgeMs: bookAgeMs(this.latestQuotes.down?.book),
-      }, snapshot),
-    ])).filter(Boolean);
 
     const directionalCandidates = [];
     for (const selected of selectedLegs) {
@@ -3139,6 +3139,8 @@ export class BeatTrader {
     this.tradeSummary.buyPrice = this.tradeSummary.buyUsdc / this.tradeSummary.buyShares;
     this.tradeSummary.tradeOccurred = true;
     this.tradeSummary.buyEvents.push({
+      id: newLot.id,
+      intent: meta?.intent === 'arb-pair' ? 'pair-buy' : 'directional-buy',
       side,
       shares,
       usdc: spentUsdc,
