@@ -76,13 +76,6 @@ function momentsForConfig(market, config) {
   return Array.isArray(moments) ? moments : [];
 }
 
-function trendMomentsForConfig(market, config) {
-  const symbol = traderSymbol(market, config);
-  const key = `BEAT_TREND_MOMENTS_${symbol}`;
-  const moments = config?.[key];
-  return Array.isArray(moments) ? moments : [];
-}
-
 function summarizeBook(book) {
   const bids = Array.isArray(book?.bids) ? book.bids : [];
   const asks = Array.isArray(book?.asks) ? book.asks : [];
@@ -352,9 +345,6 @@ export class BeatTrader {
         probabilityPairCostMax: cfg.BEAT_PROBABILITY_PAIR_COST_MAX,
         arbPairEnabled: cfg.BEAT_ARB_PAIR_ENABLED,
         arbPairCostMax: cfg.BEAT_ARB_PAIR_COST_MAX,
-        trendMinProbability: cfg.BEAT_TREND_MIN_PROBABILITY,
-        trendMinSignalScore: cfg.BEAT_TREND_MIN_SIGNAL_SCORE,
-        trendMoments: trendMomentsForConfig(this.market, cfg),
         moments: momentsForLog,
       },
       auditLogPath: getMarketLogFilePath(this.market.slug),
@@ -1259,10 +1249,6 @@ export class BeatTrader {
       return;
     }
 
-    if (await this._maybeExecuteArbPair(snapshot)) {
-      return;
-    }
-
     let tick = this.latestBtcTick;
     if (!tick) {
       this._recordAudit('decision_skip', { reason: 'missing-btc-tick', snapshot });
@@ -1306,26 +1292,10 @@ export class BeatTrader {
     }
     // Determine per-moment thresholds (seconds after market open)
     const secondsAfterOpen = Math.floor(Date.now() / 1000) - this.market.windowTs;
-    const trendMoments = trendMomentsForConfig(this.market, cfg);
-    const trendMoment = trendMoments.find((m) => secondsAfterOpen >= Number(m.start ?? 0) && secondsAfterOpen < Number(m.end ?? cfg.MARKET_WINDOW_SECONDS)) || null;
-
-    if (trendMoment) {
-      const trendBuyExecuted = await this._maybeTrendBuy({
-        snapshot,
-        tick,
-        delta,
-        secondsAfterOpen,
-        trendMoment,
-        probabilityModel,
-      });
-      if (trendBuyExecuted) {
-        return;
-      }
-    }
-
     const moments = momentsForConfig(this.market, cfg);
     const moment = moments.find((m) => secondsAfterOpen >= Number(m.start ?? 0) && secondsAfterOpen < Number(m.end ?? cfg.MARKET_WINDOW_SECONDS)) || null;
-    // Require an explicit moment with thresholds to allow buys. If no moment or missing values, do not buy.
+    // Require an explicit moment with thresholds to allow buys. `buyMax` now
+    // means the minimum distance from 0.5 for the side ask to qualify.
     if (!moment || !Number.isFinite(Number(moment.btcmoveMax)) || !Number.isFinite(Number(moment.buyMax))) {
       this._recordAudit('decision_skip', {
         reason: 'no-active-moment',
@@ -1339,7 +1309,7 @@ export class BeatTrader {
     }
 
     const thresholds = { upMax: Number(moment.btcmoveMax), downMax: Number(moment.btcmoveMax) };
-    const resolvedBuyMax = Number(moment.buyMax);
+    const minDistanceFromMid = Number(moment.buyMax);
     const bookState = {
       Up: {
         tokenId: this.market.upToken.tokenId,
@@ -1347,7 +1317,7 @@ export class BeatTrader {
         bid: this.latestQuotes.up?.bid ?? null,
         ask: this.latestQuotes.up?.ask ?? null,
         bookAgeMs: bookAgeMs(this.latestQuotes.up?.book),
-        maxBuyPrice: resolvedBuyMax,
+        minDistanceFromMid,
       },
       Down: {
         tokenId: this.market.downToken.tokenId,
@@ -1355,7 +1325,7 @@ export class BeatTrader {
         bid: this.latestQuotes.down?.bid ?? null,
         ask: this.latestQuotes.down?.ask ?? null,
         bookAgeMs: bookAgeMs(this.latestQuotes.down?.book),
-        maxBuyPrice: resolvedBuyMax,
+        minDistanceFromMid,
       },
     };
 
@@ -1372,17 +1342,26 @@ export class BeatTrader {
         thresholds,
         moment,
         snapshot,
-      });
+        });
       return;
     }
-    const preferredSide = delta > 0 ? 'Up' : (delta < 0 ? 'Down' : null);
     const candidateLegs = await Promise.all(Object.entries(bookState)
       .map(async ([side, leg]) => {
         const sideProbability = probabilityModel
           ? (side === 'Up' ? probabilityModel.pUp : probabilityModel.pDown)
           : null;
-        const modelEdge = Number.isFinite(sideProbability) && Number.isFinite(leg.ask?.price)
-          ? sideProbability - leg.ask.price
+        const askPrice = Number(leg.ask?.price);
+        const distanceFromMid = Number.isFinite(askPrice)
+          ? Math.abs(0.5 - askPrice)
+          : null;
+        const directionalEdge = Number.isFinite(sideProbability) && Number.isFinite(askPrice)
+          ? (
+              askPrice < 0.5
+                ? sideProbability - askPrice
+                : askPrice > 0.5
+                  ? askPrice - sideProbability
+                  : Math.abs(sideProbability - askPrice)
+            )
           : null;
         const pairCompletionModel = probabilityModel
           ? await this._pairCompletionModel({
@@ -1393,17 +1372,11 @@ export class BeatTrader {
           })
           : null;
         const pairCompletionProbability = Number(pairCompletionModel?.completionProbability);
-        const effectiveModelEdge = Number.isFinite(modelEdge) && Number.isFinite(pairCompletionProbability)
-          ? modelEdge * pairCompletionProbability
-          : modelEdge;
-        const dynamicBuyMax = probabilityModel && Number.isFinite(sideProbability)
-          ? Math.min(
-            leg.maxBuyPrice,
-            Math.max(0, sideProbability - Number(cfg.BEAT_PROBABILITY_REQUIRED_EDGE)),
-          )
-          : leg.maxBuyPrice;
-        const edgeFactor = Number.isFinite(effectiveModelEdge)
-          ? clamp(effectiveModelEdge / Math.max(0.0001, Number(cfg.BEAT_PROBABILITY_REQUIRED_EDGE)), 0, 1)
+        const effectiveDirectionalEdge = Number.isFinite(directionalEdge) && Number.isFinite(pairCompletionProbability)
+          ? directionalEdge * pairCompletionProbability
+          : directionalEdge;
+        const edgeFactor = Number.isFinite(effectiveDirectionalEdge)
+          ? clamp(effectiveDirectionalEdge / Math.max(0.0001, Number(cfg.BEAT_PROBABILITY_REQUIRED_EDGE)), 0, 1)
           : 0;
         const baseMoveMax = side === 'Up' ? thresholds.upMax : thresholds.downMax;
         const dynamicMoveMax = probabilityModel
@@ -1414,40 +1387,39 @@ export class BeatTrader {
           : baseMoveMax;
 
         if (!leg.ask) {
-          return { side, leg, affordable: false, maxPrice: null, reason: 'missing-best-ask', sideProbability, modelEdge, effectiveModelEdge, pairCompletionModel, dynamicBuyMax, dynamicMoveMax };
+          return { side, leg, affordable: false, maxPrice: null, reason: 'missing-best-ask', sideProbability, directionalEdge, effectiveDirectionalEdge, pairCompletionModel, distanceFromMid, dynamicMoveMax };
         }
         if (!Number.isFinite(leg.bookAgeMs) || leg.bookAgeMs > cfg.BEAT_BOOK_MAX_AGE_MS) {
-          return { side, leg, affordable: false, maxPrice: null, reason: 'stale-book', sideProbability, modelEdge, effectiveModelEdge, pairCompletionModel, dynamicBuyMax, dynamicMoveMax };
+          return { side, leg, affordable: false, maxPrice: null, reason: 'stale-book', sideProbability, directionalEdge, effectiveDirectionalEdge, pairCompletionModel, distanceFromMid, dynamicMoveMax };
+        }
+        if (!Number.isFinite(distanceFromMid) || distanceFromMid + 1e-9 < leg.minDistanceFromMid) {
+          return { side, leg, affordable: false, maxPrice: null, reason: 'distance-from-mid-too-small', sideProbability, directionalEdge, effectiveDirectionalEdge, pairCompletionModel, distanceFromMid, dynamicMoveMax };
         }
         if (probabilityModel) {
           if (!Number.isFinite(probabilityModel.pairCost) || probabilityModel.pairCost > Number(cfg.BEAT_PROBABILITY_PAIR_COST_MAX)) {
-            return { side, leg, affordable: false, maxPrice: null, reason: 'pair-cost-too-high', sideProbability, modelEdge, effectiveModelEdge, pairCompletionModel, dynamicBuyMax, dynamicMoveMax };
+            return { side, leg, affordable: false, maxPrice: null, reason: 'pair-cost-too-high', sideProbability, directionalEdge, effectiveDirectionalEdge, pairCompletionModel, distanceFromMid, dynamicMoveMax };
           }
           if (!Number.isFinite(pairCompletionProbability) || pairCompletionProbability < Number(cfg.BEAT_PAIR_COMPLETION_MIN_PROBABILITY)) {
-            return { side, leg, affordable: false, maxPrice: null, reason: 'pair-completion-probability-too-small', sideProbability, modelEdge, effectiveModelEdge, pairCompletionModel, dynamicBuyMax, dynamicMoveMax };
+            return { side, leg, affordable: false, maxPrice: null, reason: 'pair-completion-probability-too-small', sideProbability, directionalEdge, effectiveDirectionalEdge, pairCompletionModel, distanceFromMid, dynamicMoveMax };
           }
-          if (!Number.isFinite(effectiveModelEdge) || effectiveModelEdge < Number(cfg.BEAT_PROBABILITY_REQUIRED_EDGE)) {
-            return { side, leg, affordable: false, maxPrice: null, reason: 'probability-edge-too-small', sideProbability, modelEdge, effectiveModelEdge, pairCompletionModel, dynamicBuyMax, dynamicMoveMax };
+          if (!Number.isFinite(effectiveDirectionalEdge) || effectiveDirectionalEdge < Number(cfg.BEAT_PROBABILITY_REQUIRED_EDGE)) {
+            return { side, leg, affordable: false, maxPrice: null, reason: 'probability-edge-too-small', sideProbability, directionalEdge, effectiveDirectionalEdge, pairCompletionModel, distanceFromMid, dynamicMoveMax };
           }
           if (absoluteMove > dynamicMoveMax) {
-            return { side, leg, affordable: false, maxPrice: null, reason: 'move-above-dynamic-cap', sideProbability, modelEdge, effectiveModelEdge, pairCompletionModel, dynamicBuyMax, dynamicMoveMax };
+            return { side, leg, affordable: false, maxPrice: null, reason: 'move-above-dynamic-cap', sideProbability, directionalEdge, effectiveDirectionalEdge, pairCompletionModel, distanceFromMid, dynamicMoveMax };
           }
         }
-        if (leg.ask.price > dynamicBuyMax) {
-          return { side, leg, affordable: false, maxPrice: null, reason: 'ask-above-buy-max', sideProbability, modelEdge, effectiveModelEdge, pairCompletionModel, dynamicBuyMax, dynamicMoveMax };
-        }
-        const maxPrice = clampMaxPrice(leg.ask.price, dynamicBuyMax, cfg.BEAT_MAX_SLIPPAGE);
+        const maxPrice = clampMaxPrice(leg.ask.price, 1, cfg.BEAT_MAX_SLIPPAGE);
         if (maxPrice + 1e-9 < leg.ask.price) {
-          return { side, leg, affordable: false, maxPrice, reason: 'clamped-price-below-ask', sideProbability, modelEdge, effectiveModelEdge, pairCompletionModel, dynamicBuyMax, dynamicMoveMax };
+          return { side, leg, affordable: false, maxPrice, reason: 'clamped-price-below-ask', sideProbability, directionalEdge, effectiveDirectionalEdge, pairCompletionModel, distanceFromMid, dynamicMoveMax };
         }
-        return { side, leg, affordable: true, maxPrice, reason: null, sideProbability, modelEdge, effectiveModelEdge, pairCompletionModel, dynamicBuyMax, dynamicMoveMax };
+        return { side, leg, affordable: true, maxPrice, reason: null, sideProbability, directionalEdge, effectiveDirectionalEdge, pairCompletionModel, distanceFromMid, dynamicMoveMax };
       }));
 
     const affordableLegs = candidateLegs.filter((entry) => entry.affordable);
     if (!affordableLegs.length) {
       this._recordAudit('decision_skip', {
         reason: 'no-affordable-side',
-        preferredSide,
         delta,
         absoluteMove,
         moment,
@@ -1457,12 +1429,13 @@ export class BeatTrader {
           reason: entry.reason,
           askPrice: entry.leg.ask?.price ?? null,
           bookAgeMs: entry.leg.bookAgeMs ?? null,
-          maxBuyPrice: entry.dynamicBuyMax ?? entry.leg.maxBuyPrice,
+          minDistanceFromMid: entry.leg.minDistanceFromMid ?? null,
+          distanceFromMid: entry.distanceFromMid ?? null,
           dynamicMoveMax: entry.dynamicMoveMax ?? null,
           maxPrice: entry.maxPrice,
           sideProbability: entry.sideProbability ?? null,
-          modelEdge: entry.modelEdge ?? null,
-          effectiveModelEdge: entry.effectiveModelEdge ?? null,
+          directionalEdge: entry.directionalEdge ?? null,
+          effectiveDirectionalEdge: entry.effectiveDirectionalEdge ?? null,
           pairCompletionModel: entry.pairCompletionModel ?? null,
         })),
         probabilityModel,
@@ -1470,120 +1443,717 @@ export class BeatTrader {
       return;
     }
 
-    const selected = affordableLegs
+    const selectedLegs = affordableLegs
       .sort((a, b) => {
-        const aEdge = Number.isFinite(a.effectiveModelEdge) ? -a.effectiveModelEdge : Infinity;
-        const bEdge = Number.isFinite(b.effectiveModelEdge) ? -b.effectiveModelEdge : Infinity;
+        const aEdge = Number.isFinite(a.effectiveDirectionalEdge) ? -a.effectiveDirectionalEdge : Infinity;
+        const bEdge = Number.isFinite(b.effectiveDirectionalEdge) ? -b.effectiveDirectionalEdge : Infinity;
         if (aEdge !== bEdge) return aEdge - bEdge;
-        const aPreferred = a.side === preferredSide ? 0 : 1;
-        const bPreferred = b.side === preferredSide ? 0 : 1;
-        if (aPreferred !== bPreferred) return aPreferred - bPreferred;
         const askDiff = Number(a.leg.ask?.price ?? Infinity) - Number(b.leg.ask?.price ?? Infinity);
         if (askDiff !== 0) return askDiff;
         return String(a.side).localeCompare(String(b.side));
-      })[0];
-    const leg = selected.leg;
-    const chosenSide = selected.side;
-    const ofiDecision = this.ofi.decisionFor(
-      leg.tokenId,
-      Number(leg.book?.tickSize ?? 0.01),
-      Date.now(),
-    );
-    if (ofiDecision.suppress) {
-      this._recordAudit('decision_skip', {
-        reason: 'ofi-suppressed',
-        secondsAfterOpen,
-        chosenSide,
-        preferredSide,
-        delta,
-        absoluteMove,
-        beatPrice: this.beatPrice,
-        btcPrice: tick.price,
-        moment,
-        ofiDecision,
-        probabilityModel,
       });
-      return;
+
+    const pairCandidates = (await Promise.all([
+      this._buildArbPairCandidate('Up', {
+        tokenId: this.market.upToken.tokenId,
+        book: this.latestQuotes.up?.book ?? null,
+        bid: this.latestQuotes.up?.bid ?? null,
+        ask: this.latestQuotes.up?.ask ?? null,
+        bookAgeMs: bookAgeMs(this.latestQuotes.up?.book),
+      }, snapshot),
+      this._buildArbPairCandidate('Down', {
+        tokenId: this.market.downToken.tokenId,
+        book: this.latestQuotes.down?.book ?? null,
+        bid: this.latestQuotes.down?.bid ?? null,
+        ask: this.latestQuotes.down?.ask ?? null,
+        bookAgeMs: bookAgeMs(this.latestQuotes.down?.book),
+      }, snapshot),
+    ])).filter(Boolean);
+
+    const directionalCandidates = [];
+    for (const selected of selectedLegs) {
+      const leg = selected.leg;
+      const chosenSide = selected.side;
+      const ofiDecision = this.ofi.decisionFor(
+        leg.tokenId,
+        Number(leg.book?.tickSize ?? 0.01),
+        Date.now(),
+      );
+      if (ofiDecision.suppress) {
+        this._recordAudit('decision_skip', {
+          reason: 'ofi-suppressed',
+          secondsAfterOpen,
+          chosenSide,
+          delta,
+          absoluteMove,
+          beatPrice: this.beatPrice,
+          btcPrice: tick.price,
+          moment,
+          ofiDecision,
+          probabilityModel,
+        });
+        continue;
+      }
+
+      const softenedMaxPrice = Math.max(0, selected.maxPrice - ofiDecision.adjustPrice);
+      if (softenedMaxPrice + 1e-9 < Number(leg.ask?.price ?? Infinity)) {
+        this._recordAudit('decision_skip', {
+          reason: 'ofi-softened-price-below-ask',
+          secondsAfterOpen,
+          chosenSide,
+          delta,
+          absoluteMove,
+          beatPrice: this.beatPrice,
+          btcPrice: tick.price,
+          moment,
+          ofiDecision,
+          askPrice: leg.ask?.price ?? null,
+          originalMaxPrice: selected.maxPrice,
+          softenedMaxPrice,
+          probabilityModel,
+        });
+        continue;
+      }
+
+      const plan = this._buildDirectionalPlan({
+        side: chosenSide,
+        tokenId: leg.tokenId,
+        book: leg.book,
+        bestBid: leg.bid,
+        bestAsk: leg.ask,
+        maxPrice: softenedMaxPrice,
+        delta,
+        btcPrice: tick.price,
+      });
+      if (!plan) {
+        continue;
+      }
+
+      const futurePairViability = await this._directionalFuturePairTradeViability({
+        side: chosenSide,
+        plan,
+      });
+      if (!futurePairViability?.viable) {
+        this._recordAudit('decision_skip', {
+          reason: 'future-pair-trade-below-min-size',
+          secondsAfterOpen,
+          chosenSide,
+          tokenId: leg.tokenId,
+          delta,
+          absoluteMove,
+          beatPrice: this.beatPrice,
+          btcPrice: tick.price,
+          moment,
+          plan,
+          futurePairViability,
+          probabilityModel,
+        });
+        continue;
+      }
+
+      directionalCandidates.push({
+        intent: 'directional',
+        side: chosenSide,
+        tokenId: leg.tokenId,
+        book: leg.book,
+        bestBid: leg.bid,
+        bestAsk: leg.ask,
+        bookAgeMs: leg.bookAgeMs,
+        maxPrice: softenedMaxPrice,
+        plan,
+        ofiDecision,
+        sideProbability: selected.sideProbability ?? null,
+        directionalEdge: selected.directionalEdge ?? null,
+        effectiveDirectionalEdge: selected.effectiveDirectionalEdge ?? null,
+        pairCompletionModel: selected.pairCompletionModel ?? null,
+        futurePairViability,
+        distanceFromMid: selected.distanceFromMid ?? null,
+        dynamicMoveMax: selected.dynamicMoveMax ?? null,
+      });
     }
 
-    const maxPrice = Math.max(0, selected.maxPrice - ofiDecision.adjustPrice);
-    if (maxPrice + 1e-9 < Number(leg.ask?.price ?? Infinity)) {
-      this._recordAudit('decision_skip', {
-        reason: 'ofi-softened-price-below-ask',
-        secondsAfterOpen,
-        chosenSide,
-        preferredSide,
+    const batchCandidates = this._buildBuyBatch({
+      directionalCandidates,
+      pairCandidates,
+      delta,
+      btcPrice: tick.price,
+      snapshot,
+      probabilityModel,
+      moment,
+      candidateLegs,
+      secondsAfterOpen,
+      absoluteMove,
+    });
+
+    if (!batchCandidates.length) {
+      return false;
+    }
+
+    if (cfg.BEAT_ORDER_MODE === 'USDC' && batchCandidates.length > 1) {
+      return this._executeBuyBatch({
+        candidates: batchCandidates,
         delta,
-        absoluteMove,
-        beatPrice: this.beatPrice,
         btcPrice: tick.price,
+        secondsAfterOpen,
+        absoluteMove,
         moment,
-        ofiDecision,
-        askPrice: leg.ask?.price ?? null,
-        originalMaxPrice: selected.maxPrice,
-        softenedMaxPrice: maxPrice,
         probabilityModel,
       });
-      return;
+    }
+
+    let executedBuy = false;
+    for (const selected of batchCandidates) {
+      const spentBefore = this.totalSpent;
+      const lastBuyAtBefore = this.lastBuyAt;
+      if (selected.intent === 'arb-pair') {
+        await this._executePairBuy(selected);
+      } else {
+        await this._executeBuy({
+          side: selected.side,
+          tokenId: selected.tokenId,
+          book: selected.book,
+          bestBid: selected.bestBid,
+          bestAsk: selected.bestAsk,
+          maxPrice: selected.maxPrice,
+          delta,
+          btcPrice: tick.price,
+          precomputedPlan: selected.plan,
+        });
+      }
+      if (this.totalSpent > spentBefore || this.lastBuyAt !== lastBuyAtBefore) {
+        executedBuy = true;
+      }
+    }
+    return executedBuy;
+  }
+
+  _buildDirectionalPlan({ side, tokenId, book, bestBid, bestAsk, maxPrice, delta, btcPrice }) {
+    const cfg = this.config;
+    const remainingBudget = cfg.MAX_SPEND_PER_MARKET - this.totalSpent;
+    if (remainingBudget <= 1e-9) {
+      this._recordAudit('decision_skip', {
+        reason: 'max-spend-cap-reached',
+        side,
+        remainingBudget,
+        totalSpent: this.totalSpent,
+        maxSpendPerMarket: cfg.MAX_SPEND_PER_MARKET,
+      });
+      return null;
+    }
+
+    if (cfg.BEAT_ORDER_MODE === 'SHARES') {
+      const minSharesRequired = this._minSharesRequired(book, maxPrice);
+      const requestedShares = Math.min(
+        cfg.BEAT_ORDER_SIZE_SHARES,
+        remainingBudget / Math.max(bestAsk?.price ?? 0.0001, 0.0001),
+      );
+      if (requestedShares <= 0) {
+        this._recordAudit('decision_skip', {
+          reason: 'requested-shares-nonpositive',
+          side,
+          remainingBudget,
+          bestAsk: bestAsk?.price ?? null,
+          requestedShares,
+        });
+        return null;
+      }
+      if (requestedShares + 1e-9 < minSharesRequired) {
+        this._recordAudit('decision_skip', {
+          reason: 'requested-shares-below-minimum',
+          side,
+          requestedShares,
+          minSharesRequired,
+          bestAsk: bestAsk?.price ?? null,
+          maxPrice,
+        });
+        return null;
+      }
+
+      const plan = estimateSharesFromBook(book, maxPrice, requestedShares);
+      this._recordAudit('order_plan', {
+        side,
+        orderMode: cfg.BEAT_ORDER_MODE,
+        tokenId,
+        requestedShares,
+        remainingBudget,
+        maxPrice,
+        bestBid: bestBid ?? null,
+        bestAsk: bestAsk ?? null,
+        delta,
+        btcPrice,
+        plan,
+        book: summarizeBook(book),
+      });
+      if (!plan?.fullyFilled || plan.fillShares <= 0 || plan.spentUsdc <= 0) {
+        this._recordAudit('decision_skip', {
+          reason: 'share-plan-not-fillable',
+          side,
+          tokenId,
+          requestedShares,
+          plan,
+          maxPrice,
+        });
+        return null;
+      }
+      if (plan.fillShares + 1e-9 < minSharesRequired) {
+        this._recordAudit('decision_skip', {
+          reason: 'share-plan-below-minimum',
+          side,
+          tokenId,
+          minSharesRequired,
+          plan,
+          maxPrice,
+        });
+        return null;
+      }
+      return plan;
+    }
+
+    const minUsdcRequired = this._minUsdcRequired(book);
+    const amountUsdc = Math.min(cfg.BEAT_ORDER_SIZE_USDC, remainingBudget);
+    if (amountUsdc <= 0) {
+      this._recordAudit('decision_skip', {
+        reason: 'amount-usdc-nonpositive',
+        side,
+        remainingBudget,
+        amountUsdc,
+      });
+      return null;
+    }
+    if (amountUsdc + 1e-9 < minUsdcRequired) {
+      this._recordAudit('decision_skip', {
+        reason: 'amount-usdc-below-minimum',
+        side,
+        amountUsdc,
+        minUsdcRequired,
+        remainingBudget,
+      });
+      return null;
+    }
+
+    const plan = ClobClient.estimateMarketBuyFillFromBook(book, maxPrice, amountUsdc, 0);
+    this._recordAudit('order_plan', {
+      side,
+      orderMode: cfg.BEAT_ORDER_MODE,
+      tokenId,
+      requestedUsdc: amountUsdc,
+      remainingBudget,
+      maxPrice,
+      bestBid: bestBid ?? null,
+      bestAsk: bestAsk ?? null,
+      delta,
+      btcPrice,
+      plan,
+      book: summarizeBook(book),
+    });
+    if (!plan || plan.fillShares <= 0 || plan.spentUsdc <= 0) {
+      this._recordAudit('decision_skip', {
+        reason: 'usdc-plan-not-fillable',
+        side,
+        tokenId,
+        amountUsdc,
+        plan,
+        maxPrice,
+      });
+      return null;
+    }
+    if (plan.spentUsdc + 1e-9 < minUsdcRequired) {
+      this._recordAudit('decision_skip', {
+        reason: 'usdc-plan-below-minimum',
+        side,
+        tokenId,
+        minUsdcRequired,
+        amountUsdc,
+        plan,
+        maxPrice,
+      });
+      return null;
+    }
+    return plan;
+  }
+
+  async _directionalFuturePairTradeViability({ side, plan }) {
+    const cfg = this.config;
+    if (cfg.BEAT_ORDER_MODE !== 'USDC') {
+      return { viable: true, reason: 'non-usdc-mode' };
+    }
+
+    const shares = Number(plan?.fillShares ?? 0);
+    const avgPrice = Number(plan?.avgFillPrice ?? 0);
+    if (!Number.isFinite(shares) || shares <= 0 || !Number.isFinite(avgPrice) || avgPrice <= 0) {
+      return {
+        viable: false,
+        reason: 'missing-directional-fill-shares-or-price',
+        shares,
+        avgPrice,
+      };
+    }
+
+    const oppositeSide = this._oppositeSide(side);
+    const oppositeTokenId = oppositeSide === 'Up' ? this.market.upToken?.tokenId : this.market.downToken?.tokenId;
+    const oppositeFeeRateBps = await this._getTokenTakerFeeBps(oppositeTokenId);
+    const pairCostThreshold = this._pairCostThreshold();
+    const targetOppositeAsk = this._maxFeeAdjustedPairBuyPrice(avgPrice, oppositeFeeRateBps, pairCostThreshold);
+    if (!Number.isFinite(targetOppositeAsk) || targetOppositeAsk <= 0) {
+      return {
+        viable: false,
+        reason: 'future-pair-target-unavailable',
+        oppositeSide,
+        shares,
+        avgPrice,
+        targetOppositeAsk,
+        oppositeFeeRateBps,
+        pairCostThreshold,
+      };
+    }
+
+    const projectedPairSpentUsdc = shares * targetOppositeAsk;
+    const requiredMinUsdc = Number(cfg.BEAT_ORDER_SIZE_USDC);
+    return {
+      viable: projectedPairSpentUsdc + 1e-9 >= requiredMinUsdc,
+      reason: projectedPairSpentUsdc + 1e-9 >= requiredMinUsdc
+        ? 'future-pair-trade-meets-min-size'
+        : 'future-pair-trade-below-min-size',
+      oppositeSide,
+      shares,
+      avgPrice,
+      targetOppositeAsk,
+      projectedPairSpentUsdc,
+      requiredMinUsdc,
+      oppositeFeeRateBps,
+      pairCostThreshold,
+    };
+  }
+
+  _projectedLotStateAfterBatch(buys = []) {
+    const lotState = this._lotState();
+    const totals = Array.isArray(buys)
+      ? buys.reduce((acc, buy) => {
+        const shares = Number(buy?.shares ?? 0);
+        if (!Number.isFinite(shares) || shares <= 0) return acc;
+        if (buy.side === 'Up') acc.up += shares;
+        if (buy.side === 'Down') acc.down += shares;
+        return acc;
+      }, { up: 0, down: 0 })
+      : { up: 0, down: 0 };
+
+    const projectedUp = Math.max(0, Number(lotState.unpairedUpShares ?? 0) + totals.up);
+    const projectedDown = Math.max(0, Number(lotState.unpairedDownShares ?? 0) + totals.down);
+    const pairedNow = Math.min(projectedUp, projectedDown);
+    return {
+      unpairedUpShares: Math.max(0, projectedUp - projectedDown),
+      unpairedDownShares: Math.max(0, projectedDown - projectedUp),
+      imbalanceShares: Math.abs(projectedUp - projectedDown),
+      pairedShares: Number(lotState.pairedShares ?? 0) + pairedNow,
+      addedUpShares: totals.up,
+      addedDownShares: totals.down,
+    };
+  }
+
+  _batchWouldIncreaseImbalancePastCap(candidates = []) {
+    const cap = Number(this.config.BEAT_MAX_INVENTORY_IMBALANCE_SHARES);
+    if (!Number.isFinite(cap) || cap <= 0) return null;
+
+    const currentLotState = this._lotState();
+    const currentImbalanceShares = Math.abs(
+      Number(currentLotState.unpairedUpShares ?? 0) - Number(currentLotState.unpairedDownShares ?? 0),
+    );
+    const projectedLotState = this._projectedLotStateAfterBatch(candidates.map((candidate) => ({
+      side: candidate.side,
+      shares: Number(candidate?.plan?.fillShares ?? 0),
+    })));
+    return {
+      currentImbalanceShares,
+      projectedImbalanceShares: projectedLotState.imbalanceShares,
+      exceedsCap: projectedLotState.imbalanceShares - cap > 1e-9,
+      increasesImbalance: projectedLotState.imbalanceShares - currentImbalanceShares > 1e-9,
+      projectedLotState,
+      maxInventoryImbalanceShares: cap,
+    };
+  }
+
+  _buildBuyBatch({
+    directionalCandidates = [],
+    pairCandidates = [],
+    delta,
+    btcPrice,
+    snapshot,
+    probabilityModel,
+    moment,
+    candidateLegs,
+    secondsAfterOpen,
+    absoluteMove,
+  }) {
+    const cfg = this.config;
+    const chosenBySide = new Map();
+
+    for (const candidate of pairCandidates) {
+      if (!candidate) continue;
+      chosenBySide.set(candidate.side, candidate);
+    }
+    for (const candidate of directionalCandidates) {
+      if (!candidate || chosenBySide.has(candidate.side)) continue;
+      chosenBySide.set(candidate.side, candidate);
+    }
+
+    let batch = Array.from(chosenBySide.values());
+    if (!batch.length) return [];
+
+    const directionalCandidatesInBatch = batch
+      .filter((candidate) => candidate.intent === 'directional')
+      .sort((a, b) => Number(a.effectiveDirectionalEdge ?? 0) - Number(b.effectiveDirectionalEdge ?? 0));
+    let remainingDirectionalBudget = cfg.MAX_SPEND_PER_MARKET - this.totalSpent;
+    const keptDirectional = new Set();
+    for (const candidate of directionalCandidatesInBatch.reverse()) {
+      const spend = Number(candidate?.plan?.spentUsdc ?? 0);
+      if (spend - remainingDirectionalBudget > 1e-9) {
+        this._recordAudit('decision_skip', {
+          reason: 'batch-max-spend-cap-would-be-exceeded',
+          side: candidate.side,
+          tokenId: candidate.tokenId,
+          spend,
+          remainingDirectionalBudget,
+          effectiveDirectionalEdge: candidate.effectiveDirectionalEdge ?? null,
+        });
+        continue;
+      }
+      keptDirectional.add(candidate.side);
+      remainingDirectionalBudget -= spend;
+    }
+    batch = batch.filter((candidate) => candidate.intent !== 'directional' || keptDirectional.has(candidate.side));
+    if (!batch.length) return [];
+
+    while (batch.length) {
+      const imbalanceProjection = this._batchWouldIncreaseImbalancePastCap(batch);
+      if (!imbalanceProjection?.exceedsCap || !imbalanceProjection?.increasesImbalance) {
+        break;
+      }
+
+      const removable = [...batch].sort((a, b) => {
+        const aPriority = a.intent === 'arb-pair' ? 1 : 0;
+        const bPriority = b.intent === 'arb-pair' ? 1 : 0;
+        if (aPriority !== bPriority) return aPriority - bPriority;
+        const aScore = a.intent === 'arb-pair'
+          ? Number(a.pairEdge ?? -Infinity)
+          : Number(a.effectiveDirectionalEdge ?? -Infinity);
+        const bScore = b.intent === 'arb-pair'
+          ? Number(b.pairEdge ?? -Infinity)
+          : Number(b.effectiveDirectionalEdge ?? -Infinity);
+        return aScore - bScore;
+      });
+      const removed = removable[0];
+      this._recordAudit('decision_skip', {
+        reason: 'batch-inventory-imbalance-would-be-exceeded',
+        side: removed.side,
+        tokenId: removed.tokenId,
+        intent: removed.intent,
+        ...imbalanceProjection,
+      });
+      batch = batch.filter((candidate) => candidate !== removed);
+    }
+
+    if (!batch.length) {
+      this._recordAudit('decision_skip', {
+        reason: 'no-buyable-batch-after-batch-validation',
+        delta,
+        absoluteMove,
+        moment,
+        snapshot,
+        probabilityModel,
+      });
+      return [];
     }
 
     this._recordAudit('decision_buy_signal', {
       secondsAfterOpen,
-      chosenSide,
-      preferredSide,
       delta,
       absoluteMove,
       beatPrice: this.beatPrice,
-      btcPrice: tick.price,
-      thresholds,
+      btcPrice,
       moment,
       snapshot,
+      probabilityModel,
       candidateLegs: candidateLegs.map((entry) => ({
         side: entry.side,
         affordable: entry.affordable,
         reason: entry.reason,
         askPrice: entry.leg.ask?.price ?? null,
-        bookAgeMs: entry.leg.bookAgeMs ?? null,
-        maxBuyPrice: entry.dynamicBuyMax ?? entry.leg.maxBuyPrice,
-        dynamicMoveMax: entry.dynamicMoveMax ?? null,
         maxPrice: entry.maxPrice,
         sideProbability: entry.sideProbability ?? null,
-        modelEdge: entry.modelEdge ?? null,
-        effectiveModelEdge: entry.effectiveModelEdge ?? null,
-        pairCompletionModel: entry.pairCompletionModel ?? null,
+        directionalEdge: entry.directionalEdge ?? null,
+        effectiveDirectionalEdge: entry.effectiveDirectionalEdge ?? null,
       })),
-      selectedLeg: {
-        tokenId: leg.tokenId,
-        bestBid: leg.bid,
-        bestAsk: leg.ask,
-        bookAgeMs: leg.bookAgeMs ?? null,
-        maxBuyPrice: selected.dynamicBuyMax ?? leg.maxBuyPrice,
-        dynamicMoveMax: selected.dynamicMoveMax ?? null,
-        maxPrice,
-        sideProbability: selected.sideProbability ?? null,
-        modelEdge: selected.modelEdge ?? null,
-        effectiveModelEdge: selected.effectiveModelEdge ?? null,
-        pairCompletionModel: selected.pairCompletionModel ?? null,
-      },
-      ofiDecision,
-      probabilityModel,
+      selectedBatch: batch.map((candidate) => ({
+        intent: candidate.intent,
+        side: candidate.side,
+        tokenId: candidate.tokenId,
+        maxPrice: candidate.maxPrice,
+        fillShares: candidate.plan?.fillShares ?? null,
+        spentUsdc: candidate.plan?.spentUsdc ?? null,
+        effectiveDirectionalEdge: candidate.effectiveDirectionalEdge ?? null,
+        pairEdge: candidate.pairEdge ?? null,
+      })),
+      batchImbalanceProjection: this._batchWouldIncreaseImbalancePastCap(batch),
     });
 
-    await this._executeBuy({
-      side: chosenSide,
-      tokenId: leg.tokenId,
-      book: leg.book,
-      bestBid: leg.bid,
-      bestAsk: leg.ask,
-      maxPrice,
-      delta,
-      btcPrice: tick.price,
+    return batch.sort((a, b) => {
+      if (a.intent !== b.intent) return a.intent === 'arb-pair' ? -1 : 1;
+      if (a.side !== b.side) return String(a.side).localeCompare(String(b.side));
+      return Number(b.effectiveDirectionalEdge ?? b.pairEdge ?? 0) - Number(a.effectiveDirectionalEdge ?? a.pairEdge ?? 0);
     });
+  }
+
+  async _executeBuyBatch({ candidates, delta, btcPrice, secondsAfterOpen, absoluteMove, moment, probabilityModel }) {
+    const cfg = this.config;
+    const batch = Array.isArray(candidates) ? candidates.filter(Boolean) : [];
+    if (!batch.length) return false;
+
+    this._recordAudit('order_batch_submit', {
+      orderMode: cfg.BEAT_ORDER_MODE,
+      candidateCount: batch.length,
+      batch: batch.map((candidate) => ({
+        intent: candidate.intent,
+        side: candidate.side,
+        tokenId: candidate.tokenId,
+        maxPrice: candidate.maxPrice,
+        fillShares: candidate.plan?.fillShares ?? null,
+        spentUsdc: candidate.plan?.spentUsdc ?? null,
+      })),
+    });
+
+    if (!cfg.BEAT_DRY_RUN) {
+      try {
+        const response = await ClobClient.postBatchIOCBuys(this.wallet, batch.map((candidate) => ({
+          tokenId: candidate.tokenId,
+          maxPrice: candidate.maxPrice,
+          amountUsdc: candidate.plan.spentUsdc,
+        })));
+        this._recordAudit('order_batch_result', {
+          orderMode: cfg.BEAT_ORDER_MODE,
+          candidateCount: batch.length,
+          response,
+        });
+      } catch (err) {
+        this.log.warn('BeatTrader: directional batch buy failed', { err: err.message });
+        this._recordAudit('order_batch_error', {
+          err: err.message,
+          stack: err.stack ?? null,
+          orderMode: cfg.BEAT_ORDER_MODE,
+          batch: batch.map((candidate) => ({
+            intent: candidate.intent,
+            side: candidate.side,
+            tokenId: candidate.tokenId,
+            maxPrice: candidate.maxPrice,
+            spentUsdc: candidate.plan?.spentUsdc ?? null,
+          })),
+        });
+        this._publishOrderIssue({
+          tradeStatus: 'batch buy error',
+          extra: {
+            orderMode: cfg.BEAT_ORDER_MODE,
+            err: err.message,
+          },
+        });
+        return false;
+      }
+    }
+
+    for (const candidate of batch) {
+      if (candidate.intent === 'arb-pair') {
+        const fills = Array.isArray(candidate.plan?.fills) && candidate.plan.fills.length
+          ? candidate.plan.fills
+          : [{
+            price: candidate.plan.avgFillPrice,
+            shares: candidate.plan.fillShares,
+            spentUsdc: candidate.plan.spentUsdc,
+            feeUsdc: 0,
+          }];
+        fills.forEach((fill, index) => {
+          const spentUsdc = Number(fill?.spentUsdc ?? 0) + Math.max(0, Number(fill?.feeUsdc ?? 0));
+          this._recordBuy(candidate.side, Number(fill?.price ?? 0), Number(fill?.shares ?? 0), spentUsdc, null, null, {
+            intent: 'arb-pair',
+            pairCostCap: cfg.BEAT_ARB_PAIR_COST_MAX,
+            executionSource: cfg.BEAT_DRY_RUN ? 'dry-run-batch-estimate' : 'batch-estimated-plan',
+            executionFillIndex: index + 1,
+            executionFillCount: fills.length,
+          });
+        });
+      } else {
+        this._recordBuy(
+          candidate.side,
+          candidate.plan.avgFillPrice ?? candidate.bestAsk?.price ?? null,
+          candidate.plan.fillShares,
+          candidate.plan.spentUsdc,
+          delta,
+          btcPrice,
+          {
+            executionSource: cfg.BEAT_DRY_RUN ? 'dry-run-batch-estimate' : 'batch-estimated-plan',
+            estimatedPlan: candidate.plan,
+            batchIntent: 'directional',
+          },
+        );
+      }
+    }
+
+    if (!cfg.BEAT_DRY_RUN) {
+      await this._syncBalances(this.market.upToken.tokenId, this.market.downToken.tokenId);
+    }
+
+    this.lastBuyAt = Date.now();
+    this._publishTrade({
+      lifecycle: BEAT_LIFECYCLE.MONITORING,
+      tradeStatus: cfg.BEAT_DRY_RUN ? 'dry-run batch buy placed' : 'batch buy placed',
+      chosenSide: this.tradeSummary?.chosenSide ?? null,
+      buyShares: this.tradeSummary?.buyShares ?? 0,
+      buyUsdc: this.tradeSummary?.buyUsdc ?? 0,
+      buyPrice: this.tradeSummary?.buyPrice ?? null,
+    });
+    this.log.info(`BeatTrader: ${cfg.BEAT_DRY_RUN ? 'dry-run batch buy' : 'batch buy executed'}`, {
+      candidateCount: batch.length,
+      orderMode: cfg.BEAT_ORDER_MODE,
+      secondsAfterOpen,
+      absoluteMove,
+      delta,
+      btcPrice,
+      beatPrice: this.beatPrice,
+      batch: batch.map((candidate) => ({
+        intent: candidate.intent,
+        side: candidate.side,
+        spentUsdc: candidate.plan?.spentUsdc ?? null,
+        fillShares: candidate.plan?.fillShares ?? null,
+        maxPrice: candidate.maxPrice,
+      })),
+      probabilityModel: probabilityModel ? {
+        pUp: probabilityModel.pUp,
+        pDown: probabilityModel.pDown,
+        pairCost: probabilityModel.pairCost,
+      } : null,
+      moment,
+    });
+    this._recordAudit('order_batch_filled', {
+      orderMode: cfg.BEAT_ORDER_MODE,
+      dryRun: cfg.BEAT_DRY_RUN,
+      batch: batch.map((candidate) => ({
+        intent: candidate.intent,
+        side: candidate.side,
+        tokenId: candidate.tokenId,
+        maxPrice: candidate.maxPrice,
+        plan: candidate.plan,
+        pairEdge: candidate.pairEdge ?? null,
+        effectiveDirectionalEdge: candidate.effectiveDirectionalEdge ?? null,
+      })),
+      balances: {
+        up: this.balanceUp,
+        down: this.balanceDown,
+      },
+      tradeSummary: this.tradeSummary,
+    });
+    return true;
   }
 
 
 
-  async _executeBuy({ side, tokenId, book, bestBid, bestAsk, maxPrice, delta, btcPrice }) {
+  async _executeBuy({ side, tokenId, book, bestBid, bestAsk, maxPrice, delta, btcPrice, precomputedPlan = null }) {
     const cfg = this.config;
     const remainingBudget = cfg.MAX_SPEND_PER_MARKET - this.totalSpent;
     if (remainingBudget <= 1e-9) {
@@ -1797,7 +2367,7 @@ export class BeatTrader {
       return;
     }
 
-    const plan = ClobClient.estimateMarketBuyFillFromBook(book, maxPrice, amountUsdc, 0);
+    const plan = precomputedPlan ?? ClobClient.estimateMarketBuyFillFromBook(book, maxPrice, amountUsdc, 0);
     this._recordAudit('order_plan', {
       side,
       orderMode: cfg.BEAT_ORDER_MODE,
@@ -1990,263 +2560,6 @@ export class BeatTrader {
       },
       tradeSummary: this.tradeSummary,
     });
-  }
-
-  async _maybeTrendBuy({ snapshot = {}, tick, delta, secondsAfterOpen, trendMoment, probabilityModel = null }) {
-    const cfg = this.config;
-    const absoluteMove = Math.abs(delta);
-    const chosenSide = delta > 0 ? 'Up' : (delta < 0 ? 'Down' : null);
-    if (!chosenSide) {
-      this._recordAudit('trend_moment_skip', {
-        reason: 'zero-delta',
-        secondsAfterOpen,
-        trendMoment,
-        delta,
-      });
-      return false;
-    }
-    if (absoluteMove < Number(trendMoment.btcmoveMin ?? Infinity)) {
-      this._recordAudit('trend_moment_skip', {
-        reason: 'move-below-min',
-        secondsAfterOpen,
-        trendMoment,
-        delta,
-        absoluteMove,
-      });
-      return false;
-    }
-
-    const directionSign = chosenSide === 'Up' ? 1 : -1;
-    const chosenProbability = probabilityModel
-      ? Number(chosenSide === 'Up' ? probabilityModel.pUp : probabilityModel.pDown)
-      : null;
-    const oppositeProbability = probabilityModel
-      ? Number(chosenSide === 'Up' ? probabilityModel.pDown : probabilityModel.pUp)
-      : null;
-    const probabilityEdge = Number.isFinite(chosenProbability) && Number.isFinite(oppositeProbability)
-      ? chosenProbability - oppositeProbability
-      : null;
-    const velocityDirectional = probabilityModel
-      ? directionSign * Number(probabilityModel.features?.velocityComposite ?? 0)
-      : null;
-    const accelerationDirectional = probabilityModel
-      ? directionSign * Number(probabilityModel.features?.accelerationComposite ?? 0)
-      : null;
-    const momentumDirectional = probabilityModel
-      ? directionSign * Number(probabilityModel.features?.momentumComposite ?? 0)
-      : null;
-    const ofiDirectional = probabilityModel
-      ? directionSign * Number(probabilityModel.features?.ofiDiff ?? 0)
-      : null;
-    const trendSignalScore = probabilityModel
-      ? (
-          (0.45 * clamp(((chosenProbability ?? 0) - 0.5) / 0.25, -1, 1)) +
-          (0.30 * clamp((momentumDirectional ?? 0) / 2, -1, 1)) +
-          (0.15 * clamp((velocityDirectional ?? 0) / 2, -1, 1)) +
-          (0.10 * clamp((accelerationDirectional ?? 0) / 2, -1, 1)) +
-          (0.15 * clamp((ofiDirectional ?? 0) / 200, -1, 1))
-        )
-      : null;
-    if (probabilityModel) {
-      if (!Number.isFinite(chosenProbability) || chosenProbability < Number(cfg.BEAT_TREND_MIN_PROBABILITY)) {
-        this._recordAudit('trend_moment_skip', {
-          reason: 'probability-below-min',
-          chosenSide,
-          secondsAfterOpen,
-          trendMoment,
-          chosenProbability,
-          minProbability: cfg.BEAT_TREND_MIN_PROBABILITY,
-          probabilityModel,
-        });
-        return false;
-      }
-      if (!Number.isFinite(trendSignalScore) || trendSignalScore < Number(cfg.BEAT_TREND_MIN_SIGNAL_SCORE)) {
-        this._recordAudit('trend_moment_skip', {
-          reason: 'trend-signal-too-weak',
-          chosenSide,
-          secondsAfterOpen,
-          trendMoment,
-          chosenProbability,
-          probabilityEdge,
-          momentumDirectional,
-          velocityDirectional,
-          accelerationDirectional,
-          ofiDirectional,
-          trendSignalScore,
-          minTrendSignalScore: cfg.BEAT_TREND_MIN_SIGNAL_SCORE,
-          probabilityModel,
-        });
-        return false;
-      }
-    }
-
-    const leg = chosenSide === 'Up'
-      ? {
-          tokenId: this.market.upToken.tokenId,
-          book: this.latestQuotes.up?.book ?? null,
-          bid: this.latestQuotes.up?.bid ?? null,
-          ask: this.latestQuotes.up?.ask ?? null,
-          bookAgeMs: bookAgeMs(this.latestQuotes.up?.book),
-        }
-      : {
-          tokenId: this.market.downToken.tokenId,
-          book: this.latestQuotes.down?.book ?? null,
-          bid: this.latestQuotes.down?.bid ?? null,
-          ask: this.latestQuotes.down?.ask ?? null,
-          bookAgeMs: bookAgeMs(this.latestQuotes.down?.book),
-        };
-
-    if (!leg.ask) {
-      this._recordAudit('trend_moment_skip', {
-        reason: 'missing-best-ask',
-        chosenSide,
-        secondsAfterOpen,
-        trendMoment,
-      });
-      return false;
-    }
-    if (!Number.isFinite(leg.bookAgeMs) || leg.bookAgeMs > cfg.BEAT_BOOK_MAX_AGE_MS) {
-      this._recordAudit('trend_moment_skip', {
-        reason: 'stale-book',
-        chosenSide,
-        secondsAfterOpen,
-        trendMoment,
-        bookAgeMs: leg.bookAgeMs,
-      });
-      return false;
-    }
-
-    const askPrice = Number(leg.ask.price);
-    const askMin = Number(trendMoment.askMin);
-    const askMax = Number(trendMoment.askMax);
-    if (!Number.isFinite(askPrice) || askPrice < askMin || askPrice > askMax) {
-      this._recordAudit('trend_moment_skip', {
-        reason: 'ask-outside-range',
-        chosenSide,
-        secondsAfterOpen,
-        trendMoment,
-        askPrice,
-      });
-      return false;
-    }
-
-    const pairCompletionModel = probabilityModel
-      ? await this._pairCompletionModel({
-        buySide: chosenSide,
-        buyPrice: askPrice,
-        snapshot,
-      })
-      : null;
-    const pairCompletionProbability = Number(pairCompletionModel?.completionProbability);
-    const pairAdjustedEdge = Number.isFinite(chosenProbability) && Number.isFinite(askPrice) && Number.isFinite(pairCompletionProbability)
-      ? ((chosenProbability - askPrice) * pairCompletionProbability)
-      : null;
-    if (probabilityModel) {
-      if (!Number.isFinite(pairCompletionProbability) || pairCompletionProbability < Number(cfg.BEAT_PAIR_COMPLETION_MIN_PROBABILITY)) {
-        this._recordAudit('trend_moment_skip', {
-          reason: 'pair-completion-probability-too-small',
-          chosenSide,
-          secondsAfterOpen,
-          trendMoment,
-          askPrice,
-          chosenProbability,
-          pairAdjustedEdge,
-          pairCompletionModel,
-        });
-        return false;
-      }
-      if (!Number.isFinite(pairAdjustedEdge) || pairAdjustedEdge < Number(cfg.BEAT_PROBABILITY_REQUIRED_EDGE)) {
-        this._recordAudit('trend_moment_skip', {
-          reason: 'pair-adjusted-edge-too-small',
-          chosenSide,
-          secondsAfterOpen,
-          trendMoment,
-          askPrice,
-          chosenProbability,
-          pairAdjustedEdge,
-          pairCompletionModel,
-        });
-        return false;
-      }
-    }
-
-    const ofiDecision = this.ofi.decisionFor(
-      leg.tokenId,
-      Number(leg.book?.tickSize ?? 0.01),
-      Date.now(),
-    );
-    if (ofiDecision.suppress) {
-      this._recordAudit('trend_moment_skip', {
-        reason: 'ofi-suppressed',
-        chosenSide,
-        secondsAfterOpen,
-        trendMoment,
-        askPrice,
-        ofiDecision,
-      });
-      return false;
-    }
-
-    const unclampedMaxPrice = clampMaxPrice(askPrice, askMax, cfg.BEAT_MAX_SLIPPAGE);
-    const maxPrice = Math.max(0, unclampedMaxPrice - ofiDecision.adjustPrice);
-    if (maxPrice + 1e-9 < askPrice) {
-      this._recordAudit('trend_moment_skip', {
-        reason: 'ofi-softened-price-below-ask',
-        chosenSide,
-        secondsAfterOpen,
-        trendMoment,
-        askPrice,
-        unclampedMaxPrice,
-        maxPrice,
-        ofiDecision,
-        chosenProbability,
-        probabilityEdge,
-        pairAdjustedEdge,
-        pairCompletionModel,
-        momentumDirectional,
-        velocityDirectional,
-        accelerationDirectional,
-        ofiDirectional,
-        trendSignalScore,
-      });
-      return false;
-    }
-
-    this._recordAudit('trend_moment_buy_signal', {
-      chosenSide,
-      secondsAfterOpen,
-      trendMoment,
-      delta,
-      absoluteMove,
-      beatPrice: this.beatPrice,
-      btcPrice: tick.price,
-      askPrice,
-      maxPrice,
-      chosenProbability,
-      probabilityEdge,
-      pairAdjustedEdge,
-      pairCompletionModel,
-      momentumDirectional,
-      velocityDirectional,
-      accelerationDirectional,
-      ofiDirectional,
-      trendSignalScore,
-      snapshot,
-      ofiDecision,
-      probabilityModel,
-    });
-
-    await this._executeBuy({
-      side: chosenSide,
-      tokenId: leg.tokenId,
-      book: leg.book,
-      bestBid: leg.bid,
-      bestAsk: leg.ask,
-      maxPrice,
-      delta,
-      btcPrice: tick.price,
-    });
-    return true;
   }
 
   _oppositeSide(side) {

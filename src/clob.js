@@ -474,6 +474,44 @@ export class ClobClient {
     );
   }
 
+  static async postBatchIOCBuys(_wallet, orders = [], negRisk = true) {
+    const client = this._requireSdkClient();
+    const normalizedOrders = Array.isArray(orders)
+      ? orders.filter((order) =>
+        order &&
+        String(order.tokenId ?? '').trim() &&
+        Number.isFinite(Number(order.maxPrice)) &&
+        Number(order.maxPrice) > 0 &&
+        Number.isFinite(Number(order.amountUsdc)) &&
+        Number(order.amountUsdc) > 0)
+      : [];
+    if (!normalizedOrders.length) {
+      throw new Error('No valid batch IOC buy orders provided');
+    }
+
+    const builtOrders = await Promise.all(normalizedOrders.map((order) =>
+      client.createMarketOrder(
+        {
+          tokenID: String(order.tokenId),
+          amount: Number(order.amountUsdc),
+          price: Number(order.maxPrice),
+          side: Side.BUY,
+          orderType: OrderType.FAK,
+        },
+        {
+          tickSize: DEFAULT_TICK_SIZE,
+          negRisk,
+        },
+      )));
+
+    return client.postOrders(
+      builtOrders.map((order) => ({
+        order,
+        orderType: OrderType.FAK,
+      })),
+    );
+  }
+
   static async postFOKBuy(_wallet, tokenId, maxPrice, amountUsdc, negRisk = true) {
     return this._requireSdkClient().createAndPostMarketOrder(
       {

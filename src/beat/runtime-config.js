@@ -17,8 +17,6 @@ import {
   BEAT_PAIR_COMPLETION_DRIFT_SHRINK,
   BEAT_ARB_PAIR_ENABLED,
   BEAT_ARB_PAIR_COST_MAX,
-  BEAT_TREND_MIN_PROBABILITY,
-  BEAT_TREND_MIN_SIGNAL_SCORE,
   BEAT_DASHBOARD_ENABLED,
   BEAT_DASHBOARD_HOST,
   BEAT_DASHBOARD_PORT,
@@ -30,13 +28,6 @@ import {
   BEAT_MOMENTS_HYPE,
   BEAT_MOMENTS_SOL,
   BEAT_MOMENTS_XRP,
-  BEAT_TREND_MOMENTS_BNB,
-  BEAT_TREND_MOMENTS_BTC,
-  BEAT_TREND_MOMENTS_DOGE,
-  BEAT_TREND_MOMENTS_ETH,
-  BEAT_TREND_MOMENTS_HYPE,
-  BEAT_TREND_MOMENTS_SOL,
-  BEAT_TREND_MOMENTS_XRP,
   BEAT_SYMBOLS,
   BEAT_MAX_SLIPPAGE,
   BEAT_MAX_INVENTORY_IMBALANCE_SHARES,
@@ -83,8 +74,6 @@ const DEFAULTS = Object.freeze({
   BEAT_PAIR_COMPLETION_DRIFT_SHRINK,
   BEAT_ARB_PAIR_ENABLED,
   BEAT_ARB_PAIR_COST_MAX,
-  BEAT_TREND_MIN_PROBABILITY,
-  BEAT_TREND_MIN_SIGNAL_SCORE,
   BEAT_ORDER_MODE,
   BEAT_MIN_BUY_USDC,
   BEAT_MIN_BUY_SHARES,
@@ -105,13 +94,6 @@ const DEFAULTS = Object.freeze({
   BEAT_MOMENTS_BNB,
   BEAT_MOMENTS_DOGE,
   BEAT_MOMENTS_HYPE,
-  BEAT_TREND_MOMENTS_BTC,
-  BEAT_TREND_MOMENTS_ETH,
-  BEAT_TREND_MOMENTS_SOL,
-  BEAT_TREND_MOMENTS_XRP,
-  BEAT_TREND_MOMENTS_BNB,
-  BEAT_TREND_MOMENTS_DOGE,
-  BEAT_TREND_MOMENTS_HYPE,
   MAX_SPEND_PER_MARKET,
   BEAT_DASHBOARD_ENABLED,
   BEAT_DASHBOARD_HOST,
@@ -169,39 +151,6 @@ function normalizeMoments(value, fallback) {
   return next.length ? next : fallback;
 }
 
-function normalizeTrendMoments(value, fallback) {
-  if (!Array.isArray(value)) return fallback;
-  const next = [];
-  for (const item of value) {
-    let candidate = null;
-    if (Array.isArray(item)) {
-      if (item.length < 5) return fallback;
-      const [start, end, btcmoveMin, askMin, askMax] = item;
-      candidate = { start, end, btcmoveMin, askMin, askMax };
-    } else if (item && typeof item === 'object') {
-      candidate = item;
-    } else {
-      return fallback;
-    }
-    const normalized = {
-      start: Number(candidate.start ?? 0),
-      end: Number(candidate.end ?? DEFAULTS.MARKET_WINDOW_SECONDS),
-      btcmoveMin: Number(candidate.btcmoveMin),
-      askMin: Number(candidate.askMin),
-      askMax: Number(candidate.askMax),
-    };
-    if (
-      !Number.isFinite(normalized.start) ||
-      !Number.isFinite(normalized.end) ||
-      !Number.isFinite(normalized.btcmoveMin) ||
-      !Number.isFinite(normalized.askMin) ||
-      !Number.isFinite(normalized.askMax)
-    ) return fallback;
-    next.push(normalized);
-  }
-  return next.length ? next : fallback;
-}
-
 function coerceValue(key, value) {
   const fallback = DEFAULTS[key];
   if (fallback === undefined) return undefined;
@@ -221,19 +170,6 @@ function coerceValue(key, value) {
         }
       })() : null);
     return normalizeMoments(parsed, fallback);
-  }
-
-  if (key.startsWith('BEAT_TREND_MOMENTS')) {
-    const parsed = Array.isArray(value)
-      ? value
-      : (typeof value === 'string' ? (() => {
-        try {
-          return JSON.parse(value);
-        } catch {
-          return null;
-        }
-      })() : null);
-    return normalizeTrendMoments(parsed, fallback);
   }
 
   if (typeof fallback === 'boolean') {
