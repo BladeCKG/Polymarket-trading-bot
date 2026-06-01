@@ -1054,12 +1054,37 @@
       for (const pair of pairEvents) {
         const pairId = String(pair?.id ?? '').trim();
         const shares = Number(pair?.shares ?? 0);
-        for (const id of [pair?.upLotId, pair?.downLotId].map((value) => String(value ?? '').trim()).filter(Boolean)) {
+        // 한 페어가 여러 로트를 소비할 수 있으므로 소비한 모든 로트를 연결한다.
+        // 신규 포맷(upLotShares/downLotShares: [{id,shares}])을 우선 사용하고,
+        // 없으면 구 포맷(upLotIds/downLotIds 배열 또는 upLotId/downLotId 단일)으로 폴백.
+        const perLot = [
+          ...(Array.isArray(pair?.upLotShares) ? pair.upLotShares : []),
+          ...(Array.isArray(pair?.downLotShares) ? pair.downLotShares : []),
+        ].filter((entry) => entry && String(entry.id ?? '').trim());
+
+        if (perLot.length) {
+          for (const { id: rawId, shares: lotShares } of perLot) {
+            const id = String(rawId).trim();
+            if (!map.has(id)) {
+              map.set(id, { id, pairIds: [], pairedShares: 0, originalShares: 0 });
+            }
+            const entry = map.get(id);
+            if (!entry.pairIds.includes(pairId)) entry.pairIds.push(pairId);
+            entry.pairedShares += Number.isFinite(Number(lotShares)) ? Number(lotShares) : 0;
+          }
+          continue;
+        }
+
+        const idList = [
+          ...(Array.isArray(pair?.upLotIds) ? pair.upLotIds : [pair?.upLotId]),
+          ...(Array.isArray(pair?.downLotIds) ? pair.downLotIds : [pair?.downLotId]),
+        ].map((value) => String(value ?? '').trim()).filter(Boolean);
+        for (const id of idList) {
           if (!map.has(id)) {
             map.set(id, { id, pairIds: [], pairedShares: 0, originalShares: 0 });
           }
           const entry = map.get(id);
-          entry.pairIds.push(pairId);
+          if (!entry.pairIds.includes(pairId)) entry.pairIds.push(pairId);
           entry.pairedShares += Number.isFinite(shares) ? shares : 0;
         }
       }

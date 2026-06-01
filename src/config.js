@@ -263,6 +263,52 @@ export const BEAT_DASHBOARD_ENABLED = parseBool_('BEAT_DASHBOARD_ENABLED', false
 export const BEAT_DASHBOARD_HOST = optional('BEAT_DASHBOARD_HOST', '127.0.0.1');
 export const BEAT_DASHBOARD_PORT = parseInt_('BEAT_DASHBOARD_PORT', 8798);
 
+// ═══════════════════════════════════════════════════════════════════════════
+// BEAT v2 — 다중 거래소 데이터 허브 + 근사-완벽 확률 모델 설정
+// ───────────────────────────────────────────────────────────────────────────
+// 전략 요약:
+//   1) 여러 거래소(현물)의 체결/호가/오더북/거래량을 실시간 수집한다.
+//   2) Polymarket Up/Down 토큰의 오더북·체결·미드를 함께 수집한다.
+//   3) 위 신호를 융합해 "지금 시점에서 5분 종료 시 Up/Down 일 확률"을 계산한다.
+//   4) 모델 공정확률(fair prob)이 해당 사이드의 ask 보다 (edge 이상) 높으면
+//      그 사이드가 저평가된 것이므로 매수한다. 이후 반대편이 싸지면
+//      pair(차익) 완성으로 손익을 고정한다.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// 실시간 데이터를 수집할 현물 거래소 목록.
+export const BEAT_EXCHANGES = parseArray_('BEAT_EXCHANGES', ['binance', 'okx', 'bybit', 'coinbase'])
+  .map((value) => String(value ?? '').trim().toLowerCase())
+  .filter(Boolean);
+
+// 체결 흐름(CVD 등) 계산용 롤링 버퍼 길이.
+export const BEAT_HUB_TRADE_WINDOW_MS = parseInt_('BEAT_HUB_TRADE_WINDOW_MS', 60_000);
+// 통합 가격 히스토리 보관 길이(변동성/모멘텀 추정용).
+export const BEAT_HUB_PRICE_HISTORY_MS = parseInt_('BEAT_HUB_PRICE_HISTORY_MS', 120_000);
+// 통합 가격 틱이 이보다 오래되면 매매 판단에서 제외.
+export const BEAT_HUB_MAX_TICK_AGE_MS = parseInt_('BEAT_HUB_MAX_TICK_AGE_MS', 2_500);
+
+// ── 확률 모델 가중치(드리프트 방향 신호) ────────────────────────────────────
+// 모든 신호는 [-1, 1] 로 정규화되어 가중 평균된 뒤 z-score 를 이동시킨다.
+export const BEAT_MODEL_MOMENTUM_WEIGHT   = parseFloat_('BEAT_MODEL_MOMENTUM_WEIGHT', 0.40);
+export const BEAT_MODEL_OBI_WEIGHT        = parseFloat_('BEAT_MODEL_OBI_WEIGHT', 0.20);
+export const BEAT_MODEL_CVD_WEIGHT        = parseFloat_('BEAT_MODEL_CVD_WEIGHT', 0.25);
+export const BEAT_MODEL_MICROPRICE_WEIGHT = parseFloat_('BEAT_MODEL_MICROPRICE_WEIGHT', 0.15);
+// 방향 신호가 z-score 를 최대 얼마나 이동시킬지 스케일.
+export const BEAT_MODEL_DRIFT_Z_SCALE     = parseFloat_('BEAT_MODEL_DRIFT_Z_SCALE', 1.0);
+// Polymarket 시장 내재확률을 사전분포로 얼마나 섞을지(0=섞지 않음, edge 보존).
+export const BEAT_MODEL_MARKET_PRIOR_WEIGHT = parseFloat_('BEAT_MODEL_MARKET_PRIOR_WEIGHT', 0.0);
+
+// ── 매매 윈도우/가드 ─────────────────────────────────────────────────────────
+// 시장 오픈 후 이 시간(초)이 지나야 첫 매수 시도.
+export const BEAT_ENTRY_DELAY_SECONDS = parseInt_('BEAT_ENTRY_DELAY_SECONDS', 5);
+// 종료 이 시간(초) 전부터는 신규 방향성 매수 중단.
+export const BEAT_STOP_BUYING_BEFORE_CLOSE_SECONDS = parseInt_('BEAT_STOP_BUYING_BEFORE_CLOSE_SECONDS', 20);
+// 변동성/모멘텀 추정을 신뢰하기 위한 최소 데이터 누적 시간.
+export const BEAT_MIN_HISTORY_MS = parseInt_('BEAT_MIN_HISTORY_MS', 15_000);
+// 방향성 매수를 허용하는 ask 가격 범위.
+export const BEAT_SIDE_MAX_ASK = parseFloat_('BEAT_SIDE_MAX_ASK', 0.95);
+export const BEAT_SIDE_MIN_ASK = parseFloat_('BEAT_SIDE_MIN_ASK', 0.02);
+
 // Per-market time-segment configuration for directional buys.
 // Env vars `BEAT_MOMENTS_<SYMBOL>` should be JSON arrays of objects like:
 // [{"start":0,"end":15,"btcmoveMax":100,"buyMax":0.1}, ...]
