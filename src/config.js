@@ -254,38 +254,24 @@ export const BEAT_SIDE_MIN_ASK = parseFloat_('BEAT_SIDE_MIN_ASK', 0.02);
 // 동안 임계 이상 유지될 때만 방향성 매수. 1 이면 즉시(과거 동작).
 export const BEAT_EDGE_PERSISTENCE_SNAPSHOTS = parseInt_('BEAT_EDGE_PERSISTENCE_SNAPSHOTS', 3);
 
-// ── 강제 페어 청산(미페어 방향성 손실 축소) ──────────────────────────────────
-// 정상적인 무위험 페어(비용 < pairCostMax)가 더 이상 불가능한 미페어 방향성
-// 포지션을, 모델이 "질 것 같다"고 볼 때 반대편을 사서 강제로 페어링해 손실을
-// 줄인다. 완성 페어는 정산 시 정확히 $1 를 지급하므로 손실이 확정·상한된다.
-//   force-pair 조건(+EV): pA + p_opp(ask) + fee <= 1 - margin
-//     (A 사이드 공정 승률 + 반대편 가격이 1 미만 → 지금 잠그는 게 보유보다 유리)
-export const BEAT_FORCE_PAIR_ENABLED = parseBool_('BEAT_FORCE_PAIR_ENABLED', true);
-// +EV 트리거에 요구하는 최소 마진(클수록 보수적, 더 확실할 때만 강제 페어).
-export const BEAT_FORCE_PAIR_EV_MARGIN = parseFloat_('BEAT_FORCE_PAIR_EV_MARGIN', 0.04);
-// 강제 페어를 고려하기 시작하는, 보유 사이드 공정 승률 상한.
-// (pA 가 이 값보다 낮을 때만 = 충분히 불리할 때만 청산 검토)
-export const BEAT_FORCE_PAIR_MAX_WIN_PROB = parseFloat_('BEAT_FORCE_PAIR_MAX_WIN_PROB', 0.45);
-// 한 주(share)당 "편하게" 감수하는 기본 확정 손실(동적 손실 상한의 하단).
-// 락인 손실이 이 값 이하면 항상 강제 페어를 허용한다.
-export const BEAT_FORCE_PAIR_MAX_LOSS_PER_SHARE = parseFloat_('BEAT_FORCE_PAIR_MAX_LOSS_PER_SHARE', 0.20);
-// 한 주(share)당 절대 넘지 않는 파국적 손실 상한(동적 손실 상한의 상단).
-// 강제 페어의 목적은 "완전 손실(complete loss)을 피하고 감내 가능한 손실만 확정"하는 것이라,
-// 보유 사이드가 질 가능성(1-pA)과 남은 시간 압박이 커질수록 허용 손실을
-// MAX_LOSS_PER_SHARE → 이 값까지 동적으로 키운다. 단 이 값은 넘지 않는다
-// (망가진/정체된 호가에 무의미하게 큰 손실을 못 박도록 하는 안전 천장).
-export const BEAT_FORCE_PAIR_CATASTROPHIC_LOSS_PER_SHARE = parseFloat_('BEAT_FORCE_PAIR_CATASTROPHIC_LOSS_PER_SHARE', 0.50);
-// 최소 보유 시간(초): 방향성 진입 후 이 시간이 지나야 강제 페어를 고려한다.
-// 진입 직후 모델이 1~2틱 뒤집힌 것만으로 손실을 확정(패닉 락인)하는 것을 막는다.
-// 엔드게임(마감 임박)에서는 손실 상한이 우선이므로 이 가드를 무시한다.
-export const BEAT_FORCE_PAIR_MIN_HOLD_SECONDS = parseInt_('BEAT_FORCE_PAIR_MIN_HOLD_SECONDS', 20);
-// 엔드게임 백스톱: 종료 이 시간(초) 전부터는, 보유 사이드가 불리하면(pA<0.5)
-// +EV 마진을 완화해서라도 강제 페어로 손실을 상한한다(설정 손실 한도는 유지).
-export const BEAT_FORCE_PAIR_ENDGAME_SECONDS = parseInt_('BEAT_FORCE_PAIR_ENDGAME_SECONDS', 30);
-// 엔드게임에서 모델이 평가 불가(가격 정체/히스토리 부족)일 때의 대체 판단 기준.
-// 정산 규칙(합의가 vs 기준가)으로 "지는 중"을 판정한다. 기준가 대비 이 bps 이상
-// 불리한 쪽에 있으면 지는 것으로 보고 강제 페어(손실 한도 내에서)한다.
-export const BEAT_FORCE_PAIR_LOSING_MARGIN_BPS = parseFloat_('BEAT_FORCE_PAIR_LOSING_MARGIN_BPS', 2);
+// ── 미페어 방향성 lot 의 동적 페어 비용 상향(손실 축소 청산) ───────────────────
+// 미페어로 남은 방향성 lot 의 "페어 허용 비용 상한(pairCostMax)"을 arctan 곡선으로
+// 계산한다. 곡선의 중심은 "매수 시점 반대편 ask(b0)"이며, 거기서 cap=1 이다.
+//   p     = 이 lot 매수가,  a = 현재 반대편 ask,  b0 = 매수 시점 반대편 ask
+//   delta = a - b0          (매수 후 반대편가 변화량)
+//   cap   = arctan(g·delta)·d + 1
+//   - delta>0(반대편 비싸짐=지는 중): d=(2/π)·p        → 점근선 1+p (완전손실 한계)
+//   - delta<0(반대편 싸짐=이기는 중): d=(2/π)·(1-base)  → 점근선 base(BEAT_ARB_PAIR_COST_MAX)
+//   - delta=0:                        cap=1
+//   g = gainMin + (gainMax-gainMin)·timeFrac,  timeFrac = clamp(1 - secondsLeft/window, 0, 1)
+// → delta 가 클수록(반대편이 매수 때보다 비싸질수록) cap 이 1+p 로, 시간이 흐를수록(g↑)
+//   같은 delta 에서도 더 빨리 점근선에 접근한다.
+export const BEAT_ARB_PAIR_LOSS_ESCALATION_ENABLED = parseBool_('BEAT_ARB_PAIR_LOSS_ESCALATION_ENABLED', true);
+// arctan 기울기 g 의 잔여시간 양 끝값. 잔여 = window(개장)일 때 gainMin, 0(마감)일 때 gainMax.
+// 클수록 곡선이 가팔라(작은 delta 에도 cap 이 점근선에 빨리 근접).
+export const BEAT_ARB_PAIR_ARCTAN_GAIN_MIN = parseFloat_('BEAT_ARB_PAIR_ARCTAN_GAIN_MIN', 1.0);
+export const BEAT_ARB_PAIR_ARCTAN_GAIN_MAX = parseFloat_('BEAT_ARB_PAIR_ARCTAN_GAIN_MAX', 3.0);
+
 
 // 라이브 매수 후, API 응답이 불확실할 때 온체인 OrderFilled 확정을 기다리는 최대 시간(ms).
 export const BEAT_FILL_CONFIRM_TIMEOUT_MS = parseInt_('BEAT_FILL_CONFIRM_TIMEOUT_MS', 4_000);

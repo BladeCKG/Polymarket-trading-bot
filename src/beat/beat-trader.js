@@ -132,8 +132,6 @@ export class BeatTrader {
     this._loopCount = 0;
     // 엣지 지속성(연속 스냅샷 동안 임계 이상 유지된 횟수). 단발 outlier 진입 방지.
     this._edgeStreak = { Up: 0, Down: 0 };
-    // 사이드별 가장 최근 "방향성" 매수 시각(ms). 강제 페어 최소 보유 시간 가드용.
-    this._lastDirectionalBuyAt = { Up: 0, Down: 0 };
   }
 
   // ── 메인 라이프사이클 ────────────────────────────────────────────────────────
@@ -320,11 +318,11 @@ export class BeatTrader {
         this._updateEdgeStreak(snapshot, model);
 
         const allowNewBuys = nowSec < stopBuyingTs;
-        // 1) 무위험 페어 완성(반대편 저가) 시도.
+        // 1) 페어 완성(반대편 매수). 미페어 lot 은 보유시간↑ 에 따라 페어 허용 비용
+        //    상한이 base→ceiling 으로 올라가, 정상 차익페어가 안 되면 손실을 감수한
+        //    페어로 완전 손실을 줄인다(별도 강제페어 경로 없음).
         await this._maybeCompletePairs(snapshot, model);
-        // 2) 정상 페어가 불가능한 미페어 포지션은 강제 페어로 손실 축소(항상 평가).
-        await this._maybeForcePairExit(snapshot, model);
-        // 3) 신규 방향성 매수.
+        // 2) 신규 방향성 매수.
         if (allowNewBuys) {
           await this._maybeDirectionalBuy(snapshot, model);
         }
@@ -517,16 +515,21 @@ export class BeatTrader {
     });
   }
 
-  // ── 무위험 페어 완성(반대편이 싸지면 잠그기) ──────────────────────────────────
+  // ── 페어 완성(반대편 매수로 미페어 lot 닫기) ──────────────────────────────────
   // 핵심: lot 단위로 "지금 페어 가능한" 만큼 즉시 페어한다(전량 일괄이 아님).
   // 비싼 lot 때문에 평균비용이 올라가 싼 lot 의 페어 기회를 막던 버그를 제거한다.
+  //
+  // 각 lot 의 페어 허용 비용 상한(cap)은 "반대편 ask 가 기대가에서 얼마나 멀어졌나"
+  // + "잔여 시간" 으로 동적 계산된다(min-hold 없음). _escalatedPairCap 참조.
+  //   - 반대편 ask 가 기대가(1-p) 근처면 cap 거의 안 오름(base 유지) → 무위험 페어만.
+  //   - ask 가 멀어질수록(=손실↑) cap 이 (1+p) 까지 커짐. 시간 적을수록 더 커짐.
   async _maybeCompletePairs(snapshot, model) {
     const cfg = this.config;
     if (!cfg.BEAT_ARB_PAIR_ENABLED) return;
     const pm = snapshot.pm;
     if (!pm) return;
 
-    const pairCostMax = Number(cfg.BEAT_ARB_PAIR_COST_MAX);
+    const baseCap = Number(cfg.BEAT_ARB_PAIR_COST_MAX);
     for (const heldSide of ['Up', 'Down']) {
       const oppSide = this._oppositeSide(heldSide);
       if (this._unpairedShares(heldSide) <= 1e-6) continue;
@@ -537,16 +540,19 @@ export class BeatTrader {
       if (Number(oppLeg.ageMs) > Number(cfg.BEAT_BOOK_MAX_AGE_MS)) continue;
 
       const oppUnitFee = this._unitFeeUsdc(oppSide, oppAsk);
-      // lot 별로 (수수료 포함) 페어 총비용이 cap 이하인 lot 만 "지금 페어 가능"으로 본다.
-      //   heldPrice + heldFee(heldPrice) + oppAsk + oppFee <= cap
-      // 싼 lot 은 비싼 lot 과 무관하게 즉시 페어된다(블렌디드 평균 게이트 제거).
+      // lot 별로 (수수료 포함) 페어 총비용이 그 lot 의 동적 cap 이하인 lot 만
+      // "지금 페어 가능"으로 본다. 싼 lot 은 비싼 lot 과 무관하게 즉시 페어된다.
+      //   heldPrice + heldFee(heldPrice) + oppAsk + oppFee <= cap(lot, oppAsk, time)
       let pairableShares = 0;
       let cheapestPairableCost = null;
+      let maxLotCap = baseCap;
       for (const lot of this.openLots[heldSide]) {
         const lp = Number(lot.avgPrice);
         const heldUnitFee = this._unitFeeUsdc(heldSide, lp);
         const totalUnitCost = lp + heldUnitFee + oppAsk + oppUnitFee;
-        if (totalUnitCost <= pairCostMax + 1e-9) {
+        const lotCap = this._escalatedPairCap(lot, oppAsk, snapshot);
+        if (lotCap > maxLotCap) maxLotCap = lotCap;
+        if (totalUnitCost <= lotCap + 1e-9) {
           pairableShares += Number(lot.shares ?? 0);
           if (cheapestPairableCost == null || totalUnitCost < cheapestPairableCost) {
             cheapestPairableCost = totalUnitCost;
@@ -556,13 +562,15 @@ export class BeatTrader {
       if (pairableShares <= 1e-6) continue;
 
       // dust 방지: 지금 페어 가능한 양이 최소 주문 단위 미만이면 주문하지 않는다.
-      // (남은 미세 잔량은 다음 기회/강제 페어/정산으로 처리 → 0.01 micro-order 방지)
+      // (남은 미세 잔량은 다음 기회/정산으로 처리 → 0.01 micro-order 방지)
       if (cfg.BEAT_ORDER_MODE === 'SHARES') {
         if (pairableShares + 1e-9 < Number(cfg.BEAT_MIN_BUY_SHARES)) continue;
       } else if (pairableShares * oppAsk + 1e-9 < Number(cfg.BEAT_MIN_BUY_USDC)) {
         continue;
       }
 
+      // 손실 감수 페어 여부(cap>1 구간에서 닫히는지)를 감사 로그에 남긴다.
+      const lossTolerant = maxLotCap > 1 + 1e-9 || (cheapestPairableCost != null && cheapestPairableCost > 1 + 1e-9);
       // 페어 완성은 위험을 줄이는 거래이므로 MAX_SPEND_PER_MARKET / BEAT_ORDER_SIZE 한도를 무시.
       // 지금 페어 가능한 만큼(pairableShares)만 반대편을 매수한다. 부분 체결이면 다음 루프에서 이어짐.
       await this._executeBuy({
@@ -574,205 +582,60 @@ export class BeatTrader {
         model,
         reasonTag: 'pair-completion',
         targetShares: pairableShares,
-        pairContext: { heldSide, oppAsk, oppUnitFee, pairableShares, cheapestPairableCost, pairCostMax },
+        pairContext: { heldSide, oppAsk, oppUnitFee, pairableShares, cheapestPairableCost, baseCap, maxLotCap, lossTolerant },
       });
     }
   }
 
-  // ── 강제 페어 청산(미페어 방향성 손실 축소) ──────────────────────────────────
-  // 정상 무위험 페어가 불가능한 미페어 방향성 포지션을, "질 것 같다"고 볼 때
-  // 반대편을 사서 강제로 페어링한다. 완성 페어는 정산 시 정확히 $1 를 지급하므로
-  // 손실이 확정·상한된다.
-  //
-  // 비교(보유 사이드 A, 1주 기준, 보유비용은 양쪽 모두 매몰):
-  //   보유 → 정산:   기대값 = pA (불확실: 0 또는 1)
-  //   지금 강제 페어: 가치 = 1 - p_opp(ask) - fee (확정)
-  // ⇒ pA + p_opp + fee < 1 이면 강제 페어가 보유보다 유리(+EV 손실 축소).
-  //
-  // "시간이 지나도 이길 수 없는" 판단은 두 경로로 한다:
-  //   (1) 모델이 정상이면 pA 가 시간(secondsLeft) 감소와 불리한 가격으로 0 에 수렴.
-  //   (2) 모델이 평가 불가(가격 정체/히스토리 부족)여도, 엔드게임에서는 정산 규칙
-  //       (합의가 vs 기준가)으로 "지는 중"을 직접 판정해 손실을 상한한다.
-  async _maybeForcePairExit(snapshot, model) {
+  // 미페어 lot 의 동적 페어 허용 비용 상한(cap)을 arctan 곡선으로 계산한다.
+  //   y = arctan(g·(x - b))·d + c        (y = pair cost cap)
+  // 변수(반대편 사이드 가격 기준):
+  //   d0 = p           = 이 lot 의 방향성 매수가
+  //   a0 = 1 - p       = 기대 반대편가(손익분기: p + a = 1)
+  //   b0               = 매수 시점 반대편 ask (lot.oppAskAtBuy)
+  //   c0 = a           = 현재 반대편 ask
+  //   x = c0 - a0,  b = b0 - a0  → (x - b) = c0 - b0 (a0 상쇄) = 매수 후 반대편가 변화량(delta)
+  //   c = 1            = delta=0(반대편가 그대로) 일 때 cap = 1
+  // 진폭 d(점근선까지 거리):
+  //   delta > 0 (반대편 비싸짐=지는 중): d = (2/π)·p        → 우측 점근선 1 + p (완전손실 한계)
+  //   delta < 0 (반대편 싸짐=이기는 중): d = (2/π)·(1-base)  → 좌측 점근선 base(BEAT_ARB_PAIR_COST_MAX)
+  //   delta = 0:                         cap = 1
+  // 기울기 g(시간 의존, 잔여시간 300s→1, 0s→3 선형):
+  //   g = gainMin + (gainMax - gainMin)·timeFrac,  timeFrac = clamp(1 - secondsLeft/window, 0, 1)
+  // → 시간이 흐를수록 곡선이 가팔라져, 같은 delta 에서도 cap 이 더 빨리 점근선(1±..)에 접근한다.
+  _escalatedPairCap(lot, oppAsk, snapshot) {
     const cfg = this.config;
-    if (!cfg.BEAT_FORCE_PAIR_ENABLED) return;
-    const pm = snapshot?.pm;
-    if (!pm) return;
+    const baseCap = Number(cfg.BEAT_ARB_PAIR_COST_MAX);
+    if (!cfg.BEAT_ARB_PAIR_LOSS_ESCALATION_ENABLED) return baseCap;
 
-    const secondsLeft = Number(snapshot.secondsLeft);
-    const endgame = Number.isFinite(secondsLeft) && secondsLeft <= Number(cfg.BEAT_FORCE_PAIR_ENDGAME_SECONDS);
-    const modelOk = Boolean(model?.ok);
-    // 모델이 없고 엔드게임도 아니면(=시간 여유 + 신호 불가) 보수적으로 대기.
-    if (!modelOk && !endgame) {
-      return;
-    }
+    const p = Number(lot?.avgPrice);
+    const a = Number(oppAsk);                    // c0 = 현재 반대편 ask
+    const b0 = Number(lot?.oppAskAtBuy);         // 매수 시점 반대편 ask
+    if (!Number.isFinite(p) || !Number.isFinite(a) || p <= 0) return baseCap;
+    // b0 정보가 없으면(구 lot) 손익분기 기준으로 폴백.
+    const center = Number.isFinite(b0) ? b0 : (1 - p);
 
-    const evMargin = Number(cfg.BEAT_FORCE_PAIR_EV_MARGIN);
-    const maxWinProb = Number(cfg.BEAT_FORCE_PAIR_MAX_WIN_PROB);
-    const maxLossPerShare = Number(cfg.BEAT_FORCE_PAIR_MAX_LOSS_PER_SHARE);
-    const catastrophicLossPerShare = Math.max(
-      maxLossPerShare,
-      Number(cfg.BEAT_FORCE_PAIR_CATASTROPHIC_LOSS_PER_SHARE),
-    );
-    const pairCostMax = Number(cfg.BEAT_ARB_PAIR_COST_MAX);
+    const upperCeiling = 1 + p;                  // delta>0 점근선(완전손실 한계)
+    const lowerFloor = baseCap;                  // delta<0 점근선
+    const delta = a - center;                    // (x - b) = c0 - b0
+
+    // 시간 의존 기울기 g: 300s→gainMin, 0s→gainMax (선형).
+    const gainMin = Number(cfg.BEAT_ARB_PAIR_ARCTAN_GAIN_MIN);
+    const gainMax = Number(cfg.BEAT_ARB_PAIR_ARCTAN_GAIN_MAX);
     const windowSeconds = Number(cfg.MARKET_WINDOW_SECONDS) || 300;
+    const secondsLeft = Number(snapshot?.secondsLeft);
+    const timeFrac = Number.isFinite(secondsLeft)
+      ? clamp(1 - secondsLeft / windowSeconds, 0, 1)
+      : 1;
+    const g = gainMin + (gainMax - gainMin) * timeFrac;
 
-    // 모델 부재 시 정산 규칙으로 "지는 중" 판정에 쓸 합의가/기준가.
-    const consensusPrice = Number(snapshot?.hub?.consensusPrice);
-    const beatPrice = Number(this.beatPrice);
-    const losingMargin = beatPrice * (Number(cfg.BEAT_FORCE_PAIR_LOSING_MARGIN_BPS) / 10_000);
-
-    for (const heldSide of ['Up', 'Down']) {
-      const unpairedShares = this._unpairedShares(heldSide);
-      if (unpairedShares <= 1e-6) continue;
-
-      // 최소 보유 시간 가드: 방금 진입한 포지션을 모델이 1~2틱 뒤집혔다는 이유로
-      // 즉시 손실 확정하지 않는다. 진입 후 N초가 지나야 강제 페어를 고려한다.
-      // 단, 엔드게임(마감 임박)에서는 손실 상한이 우선이므로 이 가드를 무시한다.
-      const minHoldMs = Math.max(0, Number(cfg.BEAT_FORCE_PAIR_MIN_HOLD_SECONDS) || 0) * 1000;
-      if (!endgame && minHoldMs > 0) {
-        const heldSinceMs = Date.now() - Number(this._lastDirectionalBuyAt[heldSide] ?? 0);
-        if (heldSinceMs < minHoldMs) {
-          this._recordAudit('force_pair_skip', {
-            reason: 'min-hold-not-elapsed',
-            heldSide,
-            heldSinceMs: Math.round(heldSinceMs),
-            minHoldMs,
-            secondsLeft,
-          });
-          continue;
-        }
-      }
-
-      const oppSide = this._oppositeSide(heldSide);
-      const oppLeg = oppSide === 'Up' ? pm.up : pm.down;
-      const oppAsk = positiveFiniteOrNull(oppLeg?.bestAsk);
-      if (oppAsk == null) continue;
-      if (Number(oppLeg.ageMs) > Number(cfg.BEAT_BOOK_MAX_AGE_MS)) continue;
-
-      const heldAvgCost = this._unpairedAvgCost(heldSide);
-      const oppUnitFee = this._unitFeeUsdc(oppSide, oppAsk);
-
-      // 이미 정상(이익) 페어가 가능한 구간이면 _maybeCompletePairs 가 처리하므로 건너뜀.
-      const profitablePairCost = heldAvgCost + this._unitFeeUsdc(heldSide, heldAvgCost) + oppAsk + oppUnitFee;
-      if (profitablePairCost <= pairCostMax) continue;
-
-      // 강제 페어로 확정되는 1주당 손익.
-      const heldUnitFee = this._unitFeeUsdc(heldSide, heldAvgCost);
-      const lockedValuePerShare = 1 - oppAsk - oppUnitFee;        // 페어 완성 시 1주 가치
-      const lockedPnlPerShare = lockedValuePerShare - heldAvgCost - heldUnitFee;
-      const lockedLossPerShare = Math.max(0, -lockedPnlPerShare);
-
-      // ── 청산 판단 ──────────────────────────────────────────────────────────
-      let shouldExit = false;
-      let decisionReason = null;
-      let pA = null;
-
-      if (modelOk) {
-        // (1) 모델 경로: +EV 트리거 + 불리(adverse).
-        pA = heldSide === 'Up' ? Number(model.pUp) : Number(model.pDown);
-        if (Number.isFinite(pA)) {
-          const effectiveMargin = endgame ? 0 : evMargin;
-          const evTrigger = (pA + oppAsk + oppUnitFee) <= (1 - effectiveMargin);
-          const adverse = endgame ? (pA < 0.5) : (pA <= maxWinProb);
-          shouldExit = evTrigger && adverse;
-          decisionReason = shouldExit
-            ? (endgame ? 'model-endgame' : 'model-ev')
-            : (!evTrigger ? 'ev-trigger-not-met' : 'held-side-not-adverse');
-        } else {
-          decisionReason = 'model-pA-not-finite';
-        }
-      } else if (endgame) {
-        // (2) 모델 부재 + 엔드게임: 정산 규칙으로 "지는 중"이면 손실 상한.
-        //     Up 은 consensus < beat - margin, Down 은 consensus > beat + margin 이면 패배 중.
-        if (Number.isFinite(consensusPrice) && Number.isFinite(beatPrice)) {
-          const losing = heldSide === 'Up'
-            ? consensusPrice < (beatPrice - losingMargin)
-            : consensusPrice > (beatPrice + losingMargin);
-          shouldExit = losing;
-          decisionReason = losing ? 'price-vs-beat-losing-endgame' : 'price-vs-beat-not-losing';
-        } else {
-          decisionReason = 'no-consensus-or-beat-price';
-        }
-      }
-
-      if (!shouldExit) {
-        this._recordAudit('force_pair_skip', {
-          reason: decisionReason ?? 'no-decision',
-          heldSide, oppSide, pA, oppAsk, oppUnitFee,
-          consensusPrice: Number.isFinite(consensusPrice) ? consensusPrice : null,
-          beatPrice: Number.isFinite(beatPrice) ? beatPrice : null,
-          endgame, modelOk, secondsLeft,
-        });
-        continue;
-      }
-
-      // ── 동적 손실 상한 가드 ───────────────────────────────────────────────
-      // 강제 페어의 목적은 "완전 손실(보유→정산 패배 시 매몰비용 c 전액 손실)"을 피하고
-      // "감내 가능한 손실"만 확정하는 것이다. 완성 페어의 락인 손실(c+a+fee-1)은 항상
-      // 완전 손실 c 보다 작으므로(반대편 a<1), 원칙적으로 잠그는 게 보유보다 낫다.
-      //
-      // 따라서 고정 손실 한도로 "깊게 질수록 강제 페어를 막는" 역설을 없애고,
-      // 허용 손실을 동적으로 키운다:
-      //   - 보유 사이드가 불리할수록(pA 가 낮을수록 → severity↑)
-      //   - 마감이 가까울수록(timeFrac↑)
-      // 허용치를 base(MAX_LOSS_PER_SHARE) → catastrophic(CATASTROPHIC_LOSS_PER_SHARE) 로 확장.
-      // catastrophic 천장만은 절대 넘지 않는다(반대편 ask 가 1 에 근접한 망가진/정체 호가일 때,
-      // 락인 이득이 미미하면서 자본만 소진하는 무의미한 락인을 막는 안전장치).
-      let severity;
-      if (Number.isFinite(pA)) {
-        // pA=0.5 → 0(불리하지 않음), pA=0 → 1(완전 불리).
-        severity = clamp((0.5 - pA) / 0.5, 0, 1);
-      } else {
-        // 모델 부재 + 엔드게임에서 "지는 중"으로 판정된 경로 → 완전 불리로 간주.
-        severity = 1;
-      }
-      const timeLeft = Number.isFinite(secondsLeft) ? secondsLeft : windowSeconds;
-      const timeFrac = clamp(1 - timeLeft / windowSeconds, 0, 1);
-      const escalation = Math.max(severity, timeFrac);
-      const dynamicLossCap = maxLossPerShare + (catastrophicLossPerShare - maxLossPerShare) * escalation;
-
-      if (lockedLossPerShare > dynamicLossCap + 1e-9) {
-        this._recordAudit('force_pair_skip', {
-          reason: 'locked-loss-exceeds-dynamic-cap',
-          heldSide, oppSide, heldAvgCost, oppAsk, lockedLossPerShare,
-          dynamicLossCap, maxLossPerShare, catastrophicLossPerShare,
-          severity, timeFrac, pA, secondsLeft, modelOk,
-        });
-        continue;
-      }
-
-      this.log.info('BeatTrader v2: force-pair exit', {
-        heldSide, oppSide, unpairedShares: unpairedShares.toFixed(4),
-        reason: decisionReason, pA: Number.isFinite(pA) ? pA.toFixed(4) : null,
-        oppAsk: oppAsk.toFixed(4), lockedPnlPerShare: lockedPnlPerShare.toFixed(4),
-        endgame, modelOk, secondsLeft: Math.round(secondsLeft),
-      });
-      this._recordAudit('force_pair_trigger', {
-        heldSide, oppSide, unpairedShares, reason: decisionReason, pA,
-        oppAsk, oppUnitFee, heldAvgCost, lockedValuePerShare, lockedPnlPerShare, lockedLossPerShare,
-        dynamicLossCap, severity, timeFrac,
-        consensusPrice: Number.isFinite(consensusPrice) ? consensusPrice : null,
-        beatPrice: Number.isFinite(beatPrice) ? beatPrice : null,
-        endgame, modelOk, secondsLeft,
-      });
-
-      // 미페어 보유 전량을 반대편으로 매수해 강제 페어링(예산/주문크기 한도 무시).
-      await this._executeBuy({
-        side: oppSide,
-        leg: oppLeg,
-        fairProb: modelOk ? (oppSide === 'Up' ? model.pUp : model.pDown) : null,
-        edge: null,
-        snapshot,
-        model,
-        reasonTag: 'force-pair',
-        targetShares: unpairedShares,
-        pairContext: {
-          heldSide, heldAvgCost, oppAsk, oppUnitFee,
-          pA, lockedPnlPerShare, endgame, modelOk, reason: decisionReason, mode: 'force-pair',
-        },
-      });
-    }
+    // 진폭 d: delta 방향에 따라 점근선까지 거리(2/π 배). arctan∈(-π/2,π/2) 이므로
+    //   arctan(·)·d ∈ (-d·π/2, d·π/2) → cap ∈ (1 - (1-base), 1 + p) = (base, 1+p).
+    const d = delta >= 0
+      ? (2 / Math.PI) * (upperCeiling - 1)       // = (2/π)·p
+      : (2 / Math.PI) * (1 - lowerFloor);        // = (2/π)·(1-base)
+    const cap = Math.atan(g * delta) * d + 1;
+    return clamp(cap, lowerFloor, upperCeiling);
   }
 
   // ── 매수 실행(드라이런=시뮬레이션, 라이브=IOC) ──────────────────────────────────
@@ -783,9 +646,9 @@ export class BeatTrader {
     if (ask == null) return;
 
     const maxPrice = clamp(ask + Number(cfg.BEAT_MAX_SLIPPAGE), 0.01, 0.999);
-    // 페어 완성/강제 페어는 위험을 줄이는 거래라 MAX_SPEND_PER_MARKET 한도를 무시한다.
+    // 페어 완성은 위험을 줄이는 거래라 MAX_SPEND_PER_MARKET 한도를 무시한다.
     // 신규 방향성 매수만 잔여 예산으로 제한한다.
-    const isPairCompletion = reasonTag === 'pair-completion' || reasonTag === 'force-pair';
+    const isPairCompletion = reasonTag === 'pair-completion';
     const remainingBudget = isPairCompletion
       ? Infinity
       : Number(cfg.MAX_SPEND_PER_MARKET) - this.totalSpent;
@@ -978,7 +841,14 @@ export class BeatTrader {
   _registerFill({ side, shares, avgPrice, spentUsdc, reasonTag, fairProb, edge, snapshot }) {
     this.totalSpent += spentUsdc;
     const lotId = `buy-${this._nextLotId++}`;
-    this.openLots[side].push({ id: lotId, side, shares, avgPrice, costUsdc: spentUsdc });
+    // oppAskAtBuy(b0): 매수 시점 반대편 best ask. arctan 페어 cap 곡선의 중심점.
+    const oppSide = this._oppositeSide(side);
+    const oppLegAtBuy = oppSide === 'Up' ? snapshot?.pm?.up : snapshot?.pm?.down;
+    const oppAskAtBuy = positiveFiniteOrNull(oppLegAtBuy?.bestAsk);
+    this.openLots[side].push({
+      id: lotId, side, shares, avgPrice, costUsdc: spentUsdc,
+      boughtAt: Date.now(), oppAskAtBuy,
+    });
     this.pnl.recordBuy(this.market.slug, side, avgPrice, shares);
 
     const consensus = Number(snapshot?.hub?.consensusPrice);
@@ -990,9 +860,7 @@ export class BeatTrader {
       ts: Date.now(),
       recordedAt: Date.now(),
       side,
-      intent: reasonTag === 'force-pair'
-        ? 'force-pair'
-        : (reasonTag === 'pair-completion' ? 'pair-buy' : 'directional'),
+      intent: reasonTag === 'pair-completion' ? 'pair-buy' : 'directional',
       reasonTag,
       shares,
       price: avgPrice,
@@ -1015,19 +883,11 @@ export class BeatTrader {
     this.tradeSummary.moveAtBuyPct = movePct;
     this.tradeSummary.btcPriceAtBuy = Number.isFinite(consensus) ? consensus : null;
 
-    // 강제 페어 최소 보유 시간 가드용: 방향성 매수 시각 기록.
-    // (force-pair / pair-completion 같은 청산성 매수는 보유 시계를 리셋하지 않는다.)
-    if (reasonTag === 'directional') {
-      this._lastDirectionalBuyAt[side] = Date.now();
-    }
-
     // 페어 매칭(반대편 미페어 로트와 즉시 상계 → 잠금 이익 기록).
     this._reconcilePairs();
     this._recordAudit('buy_registered', { event, lotState: this._lotState() });
     this._publishMarket({
-      tradeStatus: reasonTag === 'force-pair'
-        ? 'force paired'
-        : (reasonTag === 'pair-completion' ? 'pair locked' : 'buy placed'),
+      tradeStatus: reasonTag === 'pair-completion' ? 'pair locked' : 'buy placed',
     });
   }
 

@@ -265,6 +265,36 @@
       word-break: break-word;
     }
 
+    .slug-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .copy-slug-btn {
+      border: 1px solid rgba(15, 118, 110, 0.18);
+      background: rgba(255, 255, 255, 0.88);
+      color: var(--ink);
+      border-radius: 8px;
+      padding: 3px 8px;
+      font-size: 0.72rem;
+      font-weight: 700;
+      line-height: 1;
+      cursor: pointer;
+      flex: none;
+    }
+
+    .copy-slug-btn:hover {
+      border-color: rgba(15, 118, 110, 0.42);
+    }
+
+    .copy-slug-btn.copied {
+      background: var(--good-soft);
+      color: var(--good);
+      border-color: rgba(22, 101, 52, 0.35);
+    }
+
     .status-chip {
       display: inline-flex;
       align-items: center;
@@ -321,6 +351,14 @@
     .metric .value.small {
       font-size: 0.92rem;
       font-weight: 700;
+    }
+
+    .metric .subvalue {
+      margin-top: 4px;
+      color: var(--accent);
+      font-size: 0.78rem;
+      font-weight: 700;
+      letter-spacing: -0.01em;
     }
 
     .market-graphs {
@@ -886,6 +924,11 @@
       return Number.isFinite(n) ? '$' + n.toFixed(4) : '-';
     }
 
+    function probPct(v) {
+      const n = Number(v);
+      return Number.isFinite(n) ? (n * 100).toFixed(1) + '%' : '-';
+    }
+
     function exactPrice(v) {
       const n = Number(v);
       if (!Number.isFinite(n)) return '-';
@@ -1111,14 +1154,12 @@
     function tradeIntentClass(buy) {
       const intent = String(buy?.intent ?? '').toLowerCase();
       const reason = String(buy?.reasonTag ?? '').toLowerCase();
-      if (intent === 'force-pair' || reason === 'force-pair') return 'force';
       if (intent === 'pair-buy' || reason === 'pair-completion') return 'pair';
       return 'directional';
     }
 
     function tradeIntentLabel(cls) {
-      if (cls === 'force') return 'Force Pair';
-      if (cls === 'pair') return 'Arb Pair';
+      if (cls === 'pair') return 'Pair';
       return 'Directional Buy';
     }
 
@@ -1476,6 +1517,12 @@
       const buyEvents = Array.isArray(market.buyEvents) ? market.buyEvents : [];
       const pairEvents = Array.isArray(market.pairEvents) ? market.pairEvents : [];
       const pairMap = tradePairMap(market);
+      // 페어 ID → 사용된 arb pair cost(=Up가+Down가) 룩업.
+      const pairCostById = new Map();
+      for (const pair of pairEvents) {
+        const pid = String(pair?.id ?? '').trim();
+        if (pid) pairCostById.set(pid, Number(pair?.averagePairCost));
+      }
       const buyRows = buyEvents.length
         ? buyEvents.map((buy, index) => {
           const buyMove = Number(buy?.moveAtBuyUsd ?? null);
@@ -1485,6 +1532,30 @@
           const pairIds = Array.isArray(mapping?.pairIds) ? mapping.pairIds : [];
           const paired = pairIds.length > 0;
           const tradeIntent = tradeIntentClass(buy);
+          // arb pair cost 표시(directional 매수에만):
+          //   미페어 → 지금 페어한다면 드는 비용(live) = 이 매수가 + 현재 반대편 ask
+          //   페어됨 → 실제로 사용된 페어 비용(used) = 속한 pair 의 averagePairCost
+          let arbPairCostChip = '';
+          if (tradeIntent === 'directional') {
+            if (paired) {
+              const usedCosts = pairIds
+                .map((pid) => pairCostById.get(pid))
+                .filter((c) => Number.isFinite(c));
+              if (usedCosts.length) {
+                const usedLabel = [...new Set(usedCosts.map((c) => price(c)))].join(', ');
+                arbPairCostChip = `<span class="trade-chip">Used pair cost: ${usedLabel}</span>`;
+              }
+            } else {
+              const oppAsk = buy?.side === 'Up'
+                ? Number(market.downBestAsk)
+                : (buy?.side === 'Down' ? Number(market.upBestAsk) : NaN);
+              const buyPrice = Number(buy?.price);
+              const livePairCost = (Number.isFinite(buyPrice) && Number.isFinite(oppAsk))
+                ? buyPrice + oppAsk
+                : null;
+              arbPairCostChip = `<span class="trade-chip">Live pair cost: ${livePairCost != null ? price(livePairCost) : '-'}</span>`;
+            }
+          }
           return `
             <div class="buy-item ${paired ? 'paired' : 'unpaired'}">
               <div class="head">
@@ -1494,6 +1565,7 @@
               <div class="trade-chip-row">
                 <span class="trade-chip ${tradeIntent}">${tradeIntentLabel(tradeIntent)}</span>
                 <span class="trade-chip ${paired ? 'good' : 'warn'}">${paired ? 'Paired' : 'Unpaired'}</span>
+                ${arbPairCostChip}
                 ${paired ? `<span class="trade-chip good">Pair IDs: ${escapeHtml(pairIds.join(', '))}</span>` : ''}
               </div>
               <div class="meta">
@@ -1582,8 +1654,7 @@
             <div class="graph-legend">
               <span class="legend-item"><span class="legend-swatch" style="background:#0f766e;"></span>Now ${signedMoney(move)}</span>
               <span class="legend-item"><span class="legend-swatch" style="background:rgba(15,118,110,0.55);"></span>Directional buy</span>
-              <span class="legend-item"><span class="legend-swatch" style="background:rgba(180,35,24,0.55);"></span>Arb pair</span>
-              <span class="legend-item"><span class="legend-swatch" style="background:rgba(217,119,6,0.7);"></span>Force pair</span>
+              <span class="legend-item"><span class="legend-swatch" style="background:rgba(180,35,24,0.55);"></span>Pair</span>
             </div>
             <div class="graph-shell">${moveChart}</div>
           </section>
@@ -1595,9 +1666,10 @@
             <div class="graph-legend">
               <span class="legend-item"><span class="legend-swatch" style="background:#166534;"></span>Up Ask ${price(market.upBestAsk)}</span>
               <span class="legend-item"><span class="legend-swatch" style="background:#b42318;"></span>Down Ask ${price(market.downBestAsk)}</span>
+              <span class="legend-item">P(Up) ${probPct(market.fairProbUp)}</span>
+              <span class="legend-item">P(Down) ${probPct(market.fairProbDown)}</span>
               <span class="legend-item"><span class="legend-swatch" style="background:rgba(15,118,110,0.55);"></span>Directional buy</span>
-              <span class="legend-item"><span class="legend-swatch" style="background:rgba(180,35,24,0.55);"></span>Arb pair</span>
-              <span class="legend-item"><span class="legend-swatch" style="background:rgba(217,119,6,0.7);"></span>Force pair</span>
+              <span class="legend-item"><span class="legend-swatch" style="background:rgba(180,35,24,0.55);"></span>Pair</span>
             </div>
             <div class="graph-shell">${askChart}</div>
           </section>
@@ -1708,7 +1780,10 @@
           <div class="market-head">
             <div class="market-name">
               <div class="eyebrow">${settled ? 'Settled market' : (preOpen ? 'Upcoming market' : (lifecycle === 'resolving' ? 'Resolving market' : 'Live market'))}</div>
-              <h3>${market.slug || '?'}</h3>
+              <div class="slug-row">
+                <h3>${escapeHtml(market.slug || '?')}</h3>
+                ${market.slug ? `<button class="copy-slug-btn" type="button" data-copy-slug="${escapeHtml(market.slug)}" title="Copy slug">Copy</button>` : ''}
+              </div>
             </div>
             <span class="status-chip ${chipClass(statusText)}">${statusText}</span>
           </div>
@@ -1722,9 +1797,9 @@
             ${!settled ? `<div class="metric"><div class="label">${moveLabel}</div><div class="value ${moveValueClass}">${moveValueText}</div></div>` : ''}
             ${traded && !settled ? `<div class="metric"><div class="label">Simulated If Up</div><div class="value ${pnlIfUp >= 0 ? 'summary-positive' : 'summary-negative'}">${money(pnlIfUp)}</div></div><div class="metric"><div class="label">Simulated If Down</div><div class="value ${pnlIfDown >= 0 ? 'summary-positive' : 'summary-negative'}">${money(pnlIfDown)}</div></div>` : ''}
             <div class="metric"><div class="label">Up Bid</div><div class="value">${price(market.upBestBid)}</div></div>
-            <div class="metric"><div class="label">Up Ask</div><div class="value">${price(market.upBestAsk)}</div></div>
+            <div class="metric"><div class="label">Up Ask</div><div class="value">${price(market.upBestAsk)}</div><div class="subvalue">P(Up) ${probPct(market.fairProbUp)}</div></div>
             <div class="metric"><div class="label">Down Bid</div><div class="value">${price(market.downBestBid)}</div></div>
-            <div class="metric"><div class="label">Down Ask</div><div class="value">${price(market.downBestAsk)}</div></div>
+            <div class="metric"><div class="label">Down Ask</div><div class="value">${price(market.downBestAsk)}</div><div class="subvalue">P(Down) ${probPct(market.fairProbDown)}</div></div>
             <div class="metric"><div class="label">Trade Status</div><div class="value small">${statusText}</div></div>
             <div class="metric"><div class="label">Settlement</div><div class="value small">${settled ? (market.outcome || '-') : (preOpen ? '' : countdown(market.windowCloseAt))}</div></div>
           </div>
@@ -1838,6 +1913,12 @@
       if (sectionsEl.dataset.bound === 'true') return;
       sectionsEl.dataset.bound = 'true';
       sectionsEl.addEventListener('click', (event) => {
+        const copyBtn = event.target?.closest?.('[data-copy-slug]');
+        if (copyBtn) {
+          const slug = copyBtn.getAttribute('data-copy-slug') || '';
+          copySlugToClipboard(slug, copyBtn);
+          return;
+        }
         const button = event.target?.closest?.('[data-panel-toggle]');
         if (!button) return;
         const sectionKey = button.getAttribute('data-panel-toggle');
@@ -1845,6 +1926,39 @@
         sectionCollapsed[sectionKey] = !sectionCollapsed[sectionKey];
         scheduleRender('markets');
       });
+    }
+
+    function copySlugToClipboard(slug, button) {
+      if (!slug) return;
+      const markCopied = () => {
+        const original = button.textContent;
+        button.textContent = 'Copied';
+        button.classList.add('copied');
+        setTimeout(() => {
+          button.textContent = original;
+          button.classList.remove('copied');
+        }, 1200);
+      };
+      const fallback = () => {
+        try {
+          const ta = document.createElement('textarea');
+          ta.value = slug;
+          ta.style.position = 'fixed';
+          ta.style.opacity = '0';
+          document.body.appendChild(ta);
+          ta.select();
+          document.execCommand('copy');
+          document.body.removeChild(ta);
+          markCopied();
+        } catch (err) {
+          /* noop */
+        }
+      };
+      if (navigator.clipboard?.writeText) {
+        navigator.clipboard.writeText(slug).then(markCopied).catch(fallback);
+      } else {
+        fallback();
+      }
     }
 
     function renderLogs() {

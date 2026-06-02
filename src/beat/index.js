@@ -158,6 +158,11 @@ export async function main() {
   const pnl = new PnlTracker();
   const runningTasks = new Set();
   const latestStagedSlug = new Map();
+  // 같은 윈도우(slug)에 대해 트레이더가 중복 생성되는 것을 막는다.
+  // 메인 루프의 sleep 이 윈도우 경계보다 몇 ms 일찍 깨면 currentWindowTs() 가
+  // 직전 윈도우를 다시 반환해, 동일 slug 로 두 번째(빈) 트레이더가 떠서
+  // 정산/PnL 집계가 어긋난다(빈 인스턴스가 실제 거래 인스턴스를 덮어씀).
+  const handledSlugs = new Set();
 
   let stopping = false;
   const onStop = (sig) => {
@@ -209,6 +214,11 @@ export async function main() {
     const wts = currentWindowTs(beatConfig.MARKET_WINDOW_SECONDS);
     const symbolTasks = symbols.map(async (symbol) => {
       const slug = slugFor(wts, symbol);
+      // 동일 slug 중복 처리 방지(윈도우 경계 조기 기상으로 인한 재진입 차단).
+      if (handledSlugs.has(slug)) {
+        return;
+      }
+      handledSlugs.add(slug);
       let market;
       try {
         market = await fetchMarketWithRetry(slug, 30, 3_000);
@@ -241,7 +251,9 @@ export async function main() {
 
     await Promise.all(symbolTasks);
 
-    const nextLoopMs = msUntil(wts + beatConfig.MARKET_WINDOW_SECONDS);
+    // 다음 윈도우 시작까지 대기. 경계보다 살짝 늦게(+250ms) 깨워서 currentWindowTs()
+    // 가 방금 처리한 윈도우를 다시 반환(중복 트레이더 생성)하지 않도록 한다.
+    const nextLoopMs = msUntil(wts + beatConfig.MARKET_WINDOW_SECONDS) + 250;
     if (nextLoopMs > 0) await sleep(nextLoopMs);
   }
 
