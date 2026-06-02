@@ -75,7 +75,7 @@ export class BeatTrader {
     market,
     wallet,
     pnl,
-    { dashboard = null, hub = null, beatPriceFeed = null, pmFeed = null, config = null, onSettled = null } = {},
+    { dashboard = null, hub = null, beatPriceFeed = null, pmFeed = null, fillFeed = null, config = null, onSettled = null } = {},
   ) {
     this.market = market;
     this.wallet = wallet;
@@ -85,6 +85,7 @@ export class BeatTrader {
     this.beatPriceFeed = beatPriceFeed;
     this.pmFeed = pmFeed;
     this._ownsPmFeed = !pmFeed;
+    this._fillFeed = fillFeed;
     this.onSettled = typeof onSettled === 'function' ? onSettled : null;
     this.config = config ?? createBeatRuntimeConfig();
     this.log = marketLogger(market.slug);
@@ -189,6 +190,11 @@ export class BeatTrader {
 
     // 토큰별 테이커 수수료(bps)를 1회 조회해 캐싱(윈도우 내 변동 거의 없음).
     await this._primeTokenFees();
+
+    // 온체인 체결 피드에 이 마켓의 토큰을 등록(라이브 모드에서 실제 체결 확정용).
+    if (this._fillFeed) {
+      this._fillFeed.trackTokens([upToken.tokenId, downToken.tokenId]);
+    }
 
     try {
       // 1) 오픈 대기.
@@ -631,26 +637,91 @@ export class BeatTrader {
         side, reasonTag, shares: filledShares.toFixed(4), avgPrice: avgPrice.toFixed(4), spent: spentUsdc.toFixed(4), edge,
       });
     } else {
+      // 온체인 확정 체결의 기준선(누적값)을 주문 직전에 스냅샷.
+      const feed = this._fillFeed;
+      const baseShares = feed?.active ? feed.cumulativeShares(tokenId) : 0;
+      const baseUsdc = feed?.active ? feed.cumulativeUsdc(tokenId) : 0;
+
+      let resp;
       try {
-        const resp = cfg.BEAT_ORDER_MODE === 'SHARES'
+        resp = cfg.BEAT_ORDER_MODE === 'SHARES'
           ? await ClobClient.postFOKLimitBuy(this.wallet, tokenId, maxPrice, filledShares, true)
           : await ClobClient.postIOCBuy(this.wallet, tokenId, maxPrice, amountUsdc, true);
-        const actual = this._extractFill(resp);
-        if (actual && actual.shares > 1e-9) {
-          filledShares = actual.shares;
-          spentUsdc = actual.spentUsdc;
-          avgPrice = spentUsdc / filledShares;
-        }
-        this._recordAudit('order_submitted', { side, reasonTag, tokenId, maxPrice, response: this._safeResp(resp), filledShares, spentUsdc });
       } catch (err) {
         this.log.warn('BeatTrader v2: order failed', { side, reasonTag, err: err.message });
         this._recordAudit('order_failed', { side, reasonTag, err: err.message });
         return;
       }
+
+      // 실제 체결 결과 확보: (API 응답 파싱) vs (온체인 OrderFilled) 중 먼저 도착한 확정값 사용.
+      const resolved = await this._resolveActualFill({
+        resp, tokenId, baseShares, baseUsdc, reasonTag, side,
+      });
+
+      if (resolved.kind === 'zero') {
+        // 체결 없음(미체결/취소/거부) → 포지션 변화 없음.
+        this.log.info('BeatTrader v2: order not filled', { side, reasonTag, source: resolved.source, status: resolved.status });
+        this._recordAudit('order_unfilled', {
+          side, reasonTag, tokenId, source: resolved.source, status: resolved.status,
+          response: this._safeResp(resp),
+        });
+        return;
+      }
+
+      filledShares = resolved.shares;
+      spentUsdc = resolved.spentUsdc;
+      avgPrice = spentUsdc / filledShares;
+      this._recordAudit('order_submitted', {
+        side, reasonTag, tokenId, maxPrice,
+        fillSource: resolved.source, status: resolved.status,
+        response: this._safeResp(resp), filledShares, spentUsdc, avgPrice,
+      });
     }
 
     this._registerFill({ side, shares: filledShares, avgPrice, spentUsdc, reasonTag, fairProb, edge, snapshot });
     this.lastBuyAt = Date.now();
+  }
+
+  /**
+   * 라이브 매수의 실제 체결 결과를 확정한다.
+   *   - API 응답(_extractFill) 과 온체인 OrderFilled(waitForIncrease) 를 동시에 기다려
+   *     "먼저 도착한 확정값"을 사용한다(요구사항: whatever first arrives).
+   *   - API 가 즉시 0/미체결을 명시하면 그대로 채택.
+   *   - 둘 다 확정 못하면 plan(예상값)으로 폴백하되 audit 에 불확실로 남긴다.
+   * 반환: { kind:'filled'|'zero', shares, spentUsdc, source, status }
+   */
+  async _resolveActualFill({ resp, tokenId, baseShares, baseUsdc, reasonTag, side }) {
+    const api = this._extractFill(resp);
+    const status = api?.status ?? null;
+
+    // 1) API 가 명확한 양수 체결을 즉시 반환 → 채택(가장 빠름).
+    if (api && Number.isFinite(api.shares) && api.shares > 1e-9 && Number.isFinite(api.spentUsdc) && api.spentUsdc > 1e-9) {
+      return { kind: 'filled', shares: api.shares, spentUsdc: api.spentUsdc, source: 'api', status };
+    }
+    // 2) API 가 명확한 0 체결(미체결/취소) → 채택.
+    if (api && api.filledKind === 'zero') {
+      return { kind: 'zero', shares: 0, spentUsdc: 0, source: 'api', status };
+    }
+
+    // 3) API 가 불확실(unknown/null) → 온체인 확정 체결을 대기(먼저 도착하면 채택).
+    const feed = this._fillFeed;
+    if (feed?.active) {
+      const timeoutMs = Math.max(1_000, Number(this.config.BEAT_FILL_CONFIRM_TIMEOUT_MS) || 4_000);
+      const onchain = await feed.waitForIncrease(tokenId, baseShares, baseUsdc, timeoutMs);
+      if (onchain && onchain.shares > 1e-9 && onchain.spentUsdc > 1e-9) {
+        return { kind: 'filled', shares: onchain.shares, spentUsdc: onchain.spentUsdc, source: 'chain', status };
+      }
+    }
+
+    // 4) 온체인도 확인 못함. API 가 양수였다면(부분이라도) 사용, 아니면 plan 폴백.
+    if (api && Number.isFinite(api.shares) && api.shares > 1e-9 && Number.isFinite(api.spentUsdc) && api.spentUsdc > 1e-9) {
+      return { kind: 'filled', shares: api.shares, spentUsdc: api.spentUsdc, source: 'api-late', status };
+    }
+    this._recordAudit('fill_unconfirmed_fallback', {
+      side, reasonTag, tokenId, status,
+      note: 'api-and-chain-unconfirmed; using estimated plan',
+    });
+    return { kind: 'zero', shares: 0, spentUsdc: 0, source: 'unconfirmed', status };
   }
 
   _registerFill({ side, shares, avgPrice, spentUsdc, reasonTag, fairProb, edge, snapshot }) {
@@ -937,13 +1008,54 @@ export class BeatTrader {
     };
   }
 
+  /**
+   * clob-client-v2 의 OrderResponse 를 안전하게 파싱한다.
+   *   OrderResponse { success, errorMsg, orderID, status,
+   *                   takingAmount, makingAmount, transactionsHashes?, tradeIDs? }
+   * BUY(테이커 마켓) 기준:
+   *   - takingAmount = 받은 shares
+   *   - makingAmount = 지불한 USDC
+   * 반환: { shares, spentUsdc, status, success, filledKind } 또는 null(파싱 불가).
+   *   filledKind: 'full' | 'partial' | 'zero'  (가능하면 추정)
+   */
   _extractFill(resp) {
     if (!resp || typeof resp !== 'object') return null;
-    const shares = Number(resp.makingAmount ?? resp.making_amount ?? resp.sizeMatched ?? resp.size_matched ?? resp.filledSize);
-    const spent = Number(resp.takingAmount ?? resp.taking_amount ?? resp.spent);
-    if (Number.isFinite(shares) && shares > 0 && Number.isFinite(spent) && spent > 0) {
-      return { shares, spentUsdc: spent };
+
+    const num = (v) => {
+      const n = Number(v);
+      return Number.isFinite(n) ? n : null;
+    };
+
+    const status = typeof resp.status === 'string' ? resp.status.toLowerCase() : null;
+    const success = resp.success !== false; // 명시적 false 만 실패로 간주
+
+    // BUY: takingAmount = shares 수령, makingAmount = USDC 지불.
+    // 다양한 SDK/HTTP 표기를 폭넓게 허용.
+    const shares = num(resp.takingAmount ?? resp.taking_amount ?? resp.sizeMatched ?? resp.size_matched ?? resp.filledSize ?? resp.matchedSize);
+    const spent = num(resp.makingAmount ?? resp.making_amount ?? resp.spentUsdc ?? resp.spent);
+
+    // 명시적 실패/미체결.
+    if (resp.success === false) {
+      return { shares: 0, spentUsdc: 0, status, success: false, filledKind: 'zero', errorMsg: resp.errorMsg ?? null };
     }
+    if (status && /unmatched|cancel|reject|fail/.test(status)) {
+      return { shares: 0, spentUsdc: 0, status, success, filledKind: 'zero' };
+    }
+
+    if (Number.isFinite(shares) && shares > 0 && Number.isFinite(spent) && spent > 0) {
+      return { shares, spentUsdc: spent, status, success, filledKind: status === 'matched' ? 'full' : 'partial' };
+    }
+
+    // 금액 필드가 없지만 체결된 상태로 보이는 경우(예: matched 인데 amount 누락) → 불확실.
+    if (status === 'matched' && (!Number.isFinite(shares) || !Number.isFinite(spent))) {
+      return { shares: null, spentUsdc: null, status, success, filledKind: 'unknown' };
+    }
+
+    // GTC 처럼 즉시 체결이 없을 수 있는 상태(live/delayed)는 0 체결로 처리.
+    if (status && /live|delayed|matched_pending|new/.test(status)) {
+      return { shares: 0, spentUsdc: 0, status, success, filledKind: 'zero' };
+    }
+
     return null;
   }
 

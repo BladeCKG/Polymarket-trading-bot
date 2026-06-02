@@ -309,6 +309,9 @@ export const BEAT_MIN_HISTORY_MS = parseInt_('BEAT_MIN_HISTORY_MS', 15_000);
 export const BEAT_SIDE_MAX_ASK = parseFloat_('BEAT_SIDE_MAX_ASK', 0.95);
 export const BEAT_SIDE_MIN_ASK = parseFloat_('BEAT_SIDE_MIN_ASK', 0.02);
 
+// 라이브 매수 후, API 응답이 불확실할 때 온체인 OrderFilled 확정을 기다리는 최대 시간(ms).
+export const BEAT_FILL_CONFIRM_TIMEOUT_MS = parseInt_('BEAT_FILL_CONFIRM_TIMEOUT_MS', 4_000);
+
 // Per-market time-segment configuration for directional buys.
 // Env vars `BEAT_MOMENTS_<SYMBOL>` should be JSON arrays of objects like:
 // [{"start":0,"end":15,"btcmoveMax":100,"buyMax":0.1}, ...]

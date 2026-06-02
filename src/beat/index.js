@@ -22,6 +22,7 @@ import { PnlTracker } from '../pnl.js';
 import { BeatTrader } from './beat-trader.js';
 import { BtcPriceFeed } from './btc-price-feed.js';
 import { ExchangeHub } from './exchange-hub.js';
+import { BeatFillFeed } from './fill-feed.js';
 import { BEAT_LIFECYCLE } from './lifecycle.js';
 import { applyBeatRuntimeConfigPatch, createBeatRuntimeConfig } from './runtime-config.js';
 
@@ -118,6 +119,20 @@ export async function main() {
     beatPriceFeeds.set(symbol, new BtcPriceFeed({ source: 'binance', productId: `${symbol}USDT` }));
   }
 
+  // 온체인 체결 피드(전 마켓 공유). 라이브 모드 + POLYGON_WS_RPC 있을 때만 가동.
+  // 라이브 매수의 실제 체결 결과를 API 폴링 없이 OrderFilled 이벤트로 확보한다.
+  let fillFeed = null;
+  if (!beatConfig.BEAT_DRY_RUN) {
+    fillFeed = new BeatFillFeed([]);
+    try {
+      const started = await fillFeed.start();
+      if (!started) fillFeed = null;
+    } catch (err) {
+      logger.warn('Beat v2 main: on-chain fill feed failed to start, falling back to API only', { err: err.message });
+      fillFeed = null;
+    }
+  }
+
   // 대시보드 가격 표시는 허브의 합의 가격으로 구동(거래소 차단에도 견고).
   let pricePublishTimer = null;
   if (dashboard) {
@@ -207,6 +222,7 @@ export async function main() {
         dashboard,
         hub: hubs.get(symbol),
         beatPriceFeed: beatPriceFeeds.get(symbol),
+        fillFeed,
         config: beatConfig,
         onSettled: recordSettledMarketStats,
       });
@@ -237,6 +253,7 @@ export async function main() {
   if (pricePublishTimer) clearInterval(pricePublishTimer);
   for (const hub of hubs.values()) hub.stop();
   for (const feed of beatPriceFeeds.values()) feed.stop();
+  fillFeed?.stop();
   dashboard?.stop();
   logger.info('Beat v2 main: stopped');
   process.exit(0);
