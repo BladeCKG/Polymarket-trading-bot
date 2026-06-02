@@ -588,53 +588,56 @@ export class BeatTrader {
   }
 
   // 미페어 lot 의 동적 페어 허용 비용 상한(cap)을 arctan 곡선으로 계산한다.
-  //   y = arctan(g·(x - b))·d + c        (y = pair cost cap)
-  // 변수(반대편 사이드 가격 기준):
-  //   d0 = p           = 이 lot 의 방향성 매수가
-  //   a0 = 1 - p       = 기대 반대편가(손익분기: p + a = 1)
-  //   b0               = 매수 시점 반대편 ask (lot.oppAskAtBuy)
-  //   c0 = a           = 현재 반대편 ask
-  //   x = c0 - a0,  b = b0 - a0  → (x - b) = c0 - b0 (a0 상쇄) = 매수 후 반대편가 변화량(delta)
-  //   c = 1            = delta=0(반대편가 그대로) 일 때 cap = 1
-  // 진폭 d(점근선까지 거리):
-  //   delta > 0 (반대편 비싸짐=지는 중): d = (2/π)·p        → 우측 점근선 1 + p (완전손실 한계)
-  //   delta < 0 (반대편 싸짐=이기는 중): d = (2/π)·(1-base)  → 좌측 점근선 base(BEAT_ARB_PAIR_COST_MAX)
-  //   delta = 0:                         cap = 1
-  // 기울기 g(시간 의존, 잔여시간 300s→1, 0s→3 선형):
-  //   g = gainMin + (gainMax - gainMin)·timeFrac,  timeFrac = clamp(1 - secondsLeft/window, 0, 1)
-  // → 시간이 흐를수록 곡선이 가팔라져, 같은 delta 에서도 cap 이 더 빨리 점근선(1±..)에 접근한다.
-  _escalatedPairCap(lot, oppAsk, snapshot) {
+  //   y = arctan(g·delta)·d + 1        (y = pair cost cap, delta = a - b0)
+  //   p  = 이 lot 매수가,  a = 현재 반대편 ask,  b0 = 매수 시점 반대편 ask
+  //   곡선 중심은 b0(거기서 cap=1). delta>0(반대편 비싸짐=지는 중) 우측, delta<0 좌측.
+  //   d_right = (2/π)·p        → 우측 점근선 1 + p (완전손실 한계)
+  //   d_left  = (2/π)·(1-base) → 좌측 점근선 base(BEAT_ARB_PAIR_COST_MAX)
+  // 기울기 g 는 시간이 아니라 두 앵커로 결정한다(ε = ASYMPTOTE_EPS):
+  //   우측 앵커: c0=1 (a=1, x=1-a0) 에서 cap = (1+p) - ε
+  //     → g_right = tan((π/2)(1 - ε/p)) / (1 - b0)
+  //   좌측 앵커: c0=1-p (a=1-p=a0, x=0) 에서 cap = base + ε
+  //     → g_left = tan((π/2)(1 - ε/(1-base))) / |b0 - (1-p)|
+  // 시간 의존 없음. 반대편 ask 가 b0 에서 멀어질수록(특히 1 쪽) cap 이 점근선에 빠르게 접근.
+  _escalatedPairCap(lot, oppAsk) {
     const cfg = this.config;
     const baseCap = Number(cfg.BEAT_ARB_PAIR_COST_MAX);
     if (!cfg.BEAT_ARB_PAIR_LOSS_ESCALATION_ENABLED) return baseCap;
 
     const p = Number(lot?.avgPrice);
     const a = Number(oppAsk);                    // c0 = 현재 반대편 ask
-    const b0 = Number(lot?.oppAskAtBuy);         // 매수 시점 반대편 ask
+    const b0raw = Number(lot?.oppAskAtBuy);      // 매수 시점 반대편 ask
     if (!Number.isFinite(p) || !Number.isFinite(a) || p <= 0) return baseCap;
-    // b0 정보가 없으면(구 lot) 손익분기 기준으로 폴백.
-    const center = Number.isFinite(b0) ? b0 : (1 - p);
 
     const upperCeiling = 1 + p;                  // delta>0 점근선(완전손실 한계)
     const lowerFloor = baseCap;                  // delta<0 점근선
-    const delta = a - center;                    // (x - b) = c0 - b0
+    if (upperCeiling <= lowerFloor) return baseCap;
 
-    // 시간 의존 기울기 g: 300s→gainMin, 0s→gainMax (선형).
-    const gainMin = Number(cfg.BEAT_ARB_PAIR_ARCTAN_GAIN_MIN);
-    const gainMax = Number(cfg.BEAT_ARB_PAIR_ARCTAN_GAIN_MAX);
-    const windowSeconds = Number(cfg.MARKET_WINDOW_SECONDS) || 300;
-    const secondsLeft = Number(snapshot?.secondsLeft);
-    const timeFrac = Number.isFinite(secondsLeft)
-      ? clamp(1 - secondsLeft / windowSeconds, 0, 1)
-      : 1;
-    const g = gainMin + (gainMax - gainMin) * timeFrac;
+    // b0 정보가 없으면(구 lot) 손익분기 기준으로 폴백.
+    const b0 = Number.isFinite(b0raw) ? b0raw : (1 - p);
+    const delta = a - b0;                        // 곡선 중심(b0) 기준 변화량
 
-    // 진폭 d: delta 방향에 따라 점근선까지 거리(2/π 배). arctan∈(-π/2,π/2) 이므로
-    //   arctan(·)·d ∈ (-d·π/2, d·π/2) → cap ∈ (1 - (1-base), 1 + p) = (base, 1+p).
-    const d = delta >= 0
-      ? (2 / Math.PI) * (upperCeiling - 1)       // = (2/π)·p
-      : (2 / Math.PI) * (1 - lowerFloor);        // = (2/π)·(1-base)
-    const cap = Math.atan(g * delta) * d + 1;
+    const eps = Math.max(1e-6, Number(cfg.BEAT_ARB_PAIR_ARCTAN_ASYMPTOTE_EPS) || 0.001);
+    const HALF_PI = Math.PI / 2;
+    const MIN_DIST = 1e-4;                        // 0 나눗셈 방지용 최소 거리
+
+    let cap;
+    if (delta >= 0) {
+      // 우측: c0=1 에서 cap=(1+p)-ε 가 되도록 g_right 결정.
+      const dUp = Math.max(MIN_DIST, 1 - b0);     // 중심 b0 → c0=1 거리
+      const fracUp = clamp(1 - eps / p, 0, 1 - 1e-9);     // 점근선까지 도달 비율
+      const gRight = Math.tan(HALF_PI * fracUp) / dUp;
+      const dRight = (2 / Math.PI) * (upperCeiling - 1);  // = (2/π)·p
+      cap = Math.atan(gRight * delta) * dRight + 1;
+    } else {
+      // 좌측: c0=1-p 에서 cap=base+ε 가 되도록 g_left 결정.
+      const descent = 1 - lowerFloor;                     // 1 - base
+      const dDn = Math.max(MIN_DIST, Math.abs(b0 - (1 - p)));  // 중심 b0 → c0=1-p 거리
+      const fracDn = clamp(1 - eps / descent, 0, 1 - 1e-9);
+      const gLeft = Math.tan(HALF_PI * fracDn) / dDn;
+      const dLeft = (2 / Math.PI) * descent;              // = (2/π)·(1-base)
+      cap = Math.atan(gLeft * delta) * dLeft + 1;         // delta<0 → cap<1
+    }
     return clamp(cap, lowerFloor, upperCeiling);
   }
 

@@ -263,14 +263,13 @@ export const BEAT_EDGE_PERSISTENCE_SNAPSHOTS = parseInt_('BEAT_EDGE_PERSISTENCE_
 //   - delta>0(반대편 비싸짐=지는 중): d=(2/π)·p        → 점근선 1+p (완전손실 한계)
 //   - delta<0(반대편 싸짐=이기는 중): d=(2/π)·(1-base)  → 점근선 base(BEAT_ARB_PAIR_COST_MAX)
 //   - delta=0:                        cap=1
-//   g = gainMin + (gainMax-gainMin)·timeFrac,  timeFrac = clamp(1 - secondsLeft/window, 0, 1)
-// → delta 가 클수록(반대편이 매수 때보다 비싸질수록) cap 이 1+p 로, 시간이 흐를수록(g↑)
-//   같은 delta 에서도 더 빨리 점근선에 접근한다.
+// 기울기 g 는 시간이 아니라 두 앵커로 결정한다(ε = ASYMPTOTE_EPS):
+//   우측: a=1 일 때 cap = (1+p) - ε        → g_right = tan((π/2)(1-ε/p)) / (1-b0)
+//   좌측: a=1-p(기대가) 일 때 cap ≈ base + ε → g_left  = tan((π/2)(1-ε/(1-base))) / |b0-(1-p)|
+//   (좌측 점근선이 base 라 요청한 base-ε 는 도달 불가 → 도달 가능한 base+ε 로 해석)
 export const BEAT_ARB_PAIR_LOSS_ESCALATION_ENABLED = parseBool_('BEAT_ARB_PAIR_LOSS_ESCALATION_ENABLED', true);
-// arctan 기울기 g 의 잔여시간 양 끝값. 잔여 = window(개장)일 때 gainMin, 0(마감)일 때 gainMax.
-// 클수록 곡선이 가팔라(작은 delta 에도 cap 이 점근선에 빨리 근접).
-export const BEAT_ARB_PAIR_ARCTAN_GAIN_MIN = parseFloat_('BEAT_ARB_PAIR_ARCTAN_GAIN_MIN', 1.0);
-export const BEAT_ARB_PAIR_ARCTAN_GAIN_MAX = parseFloat_('BEAT_ARB_PAIR_ARCTAN_GAIN_MAX', 3.0);
+// 앵커 점에서 점근선까지 남겨두는 간격 ε. 작을수록 앵커에서 cap 이 점근선에 더 바짝 붙는다.
+export const BEAT_ARB_PAIR_ARCTAN_ASYMPTOTE_EPS = parseFloat_('BEAT_ARB_PAIR_ARCTAN_ASYMPTOTE_EPS', 0.001);
 
 
 // 라이브 매수 후, API 응답이 불확실할 때 온체인 OrderFilled 확정을 기다리는 최대 시간(ms).
