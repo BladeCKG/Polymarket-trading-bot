@@ -457,6 +457,8 @@ export class BeatTrader {
   }
 
   // ── 무위험 페어 완성(반대편이 싸지면 잠그기) ──────────────────────────────────
+  // 핵심: lot 단위로 "지금 페어 가능한" 만큼 즉시 페어한다(전량 일괄이 아님).
+  // 비싼 lot 때문에 평균비용이 올라가 싼 lot 의 페어 기회를 막던 버그를 제거한다.
   async _maybeCompletePairs(snapshot, model) {
     const cfg = this.config;
     if (!cfg.BEAT_ARB_PAIR_ENABLED) return;
@@ -464,28 +466,44 @@ export class BeatTrader {
     if (!pm) return;
 
     const pairCostMax = Number(cfg.BEAT_ARB_PAIR_COST_MAX);
-    // 보유 미페어 사이드별로, 반대편 ask 로 쌍을 완성했을 때 총비용 < cap 이면 매수.
     for (const heldSide of ['Up', 'Down']) {
-      const oppSide = heldSide === 'Up' ? 'Down' : 'Up';
-      const unpairedShares = this._unpairedShares(heldSide);
-      if (unpairedShares <= 1e-6) continue;
+      const oppSide = this._oppositeSide(heldSide);
+      if (this._unpairedShares(heldSide) <= 1e-6) continue;
 
-      const heldAvgCost = this._unpairedAvgCost(heldSide);
       const oppLeg = oppSide === 'Up' ? pm.up : pm.down;
       const oppAsk = positiveFiniteOrNull(oppLeg?.bestAsk);
       if (oppAsk == null) continue;
       if (Number(oppLeg.ageMs) > Number(cfg.BEAT_BOOK_MAX_AGE_MS)) continue;
 
-      // 수수료 포함 페어 총비용: 보유 다리(가격+수수료) + 반대편(ask+수수료).
-      // 완성 페어는 정산 시 정확히 $1 를 지급하므로, 이 총비용 < cap 이면 잠금 이익.
-      const heldUnitFee = this._unitFeeUsdc(heldSide, heldAvgCost);
       const oppUnitFee = this._unitFeeUsdc(oppSide, oppAsk);
-      const projectedPairCost = heldAvgCost + heldUnitFee + oppAsk + oppUnitFee;
-      if (projectedPairCost > pairCostMax) continue; // 아직 (수수료 포함) 이익 잠금 불가.
+      // lot 별로 (수수료 포함) 페어 총비용이 cap 이하인 lot 만 "지금 페어 가능"으로 본다.
+      //   heldPrice + heldFee(heldPrice) + oppAsk + oppFee <= cap
+      // 싼 lot 은 비싼 lot 과 무관하게 즉시 페어된다(블렌디드 평균 게이트 제거).
+      let pairableShares = 0;
+      let cheapestPairableCost = null;
+      for (const lot of this.openLots[heldSide]) {
+        const lp = Number(lot.avgPrice);
+        const heldUnitFee = this._unitFeeUsdc(heldSide, lp);
+        const totalUnitCost = lp + heldUnitFee + oppAsk + oppUnitFee;
+        if (totalUnitCost <= pairCostMax + 1e-9) {
+          pairableShares += Number(lot.shares ?? 0);
+          if (cheapestPairableCost == null || totalUnitCost < cheapestPairableCost) {
+            cheapestPairableCost = totalUnitCost;
+          }
+        }
+      }
+      if (pairableShares <= 1e-6) continue;
 
-      // 페어 완성은 위험을 줄이는(보유 방향성 다리를 닫는) 거래이므로
-      // MAX_SPEND_PER_MARKET 한도를 무시한다. 한도는 신규 방향성 위험만 제한한다.
-      // 미페어 보유분만큼 반대편 매수 시도.
+      // dust 방지: 지금 페어 가능한 양이 최소 주문 단위 미만이면 주문하지 않는다.
+      // (남은 미세 잔량은 다음 기회/강제 페어/정산으로 처리 → 0.01 micro-order 방지)
+      if (cfg.BEAT_ORDER_MODE === 'SHARES') {
+        if (pairableShares + 1e-9 < Number(cfg.BEAT_MIN_BUY_SHARES)) continue;
+      } else if (pairableShares * oppAsk + 1e-9 < Number(cfg.BEAT_MIN_BUY_USDC)) {
+        continue;
+      }
+
+      // 페어 완성은 위험을 줄이는 거래이므로 MAX_SPEND_PER_MARKET / BEAT_ORDER_SIZE 한도를 무시.
+      // 지금 페어 가능한 만큼(pairableShares)만 반대편을 매수한다. 부분 체결이면 다음 루프에서 이어짐.
       await this._executeBuy({
         side: oppSide,
         leg: oppLeg,
@@ -494,8 +512,8 @@ export class BeatTrader {
         snapshot,
         model,
         reasonTag: 'pair-completion',
-        targetShares: unpairedShares,
-        pairContext: { heldSide, heldAvgCost, heldUnitFee, oppAsk, oppUnitFee, projectedPairCost, pairCostMax },
+        targetShares: pairableShares,
+        pairContext: { heldSide, oppAsk, oppUnitFee, pairableShares, cheapestPairableCost, pairCostMax },
       });
     }
   }
@@ -682,6 +700,9 @@ export class BeatTrader {
   /**
    * 보유한 Up/Down 미페어 로트를 최대한 상계해 완성 페어로 옮긴다.
    * 완성 페어는 정산 시 정확히 $1 를 지급하므로, 비용<$1 이면 그 차이가 잠금 이익.
+   *
+   * lot 소비 순서는 "싼 것부터(cheapest-first)". _maybeCompletePairs 가 싼 lot 만
+   * 골라 페어 가능하다고 판단했으므로, 매칭도 싼 lot 부터 소비해야 일관된다.
    */
   _reconcilePairs() {
     const matchable = Math.min(this._unpairedShares('Up'), this._unpairedShares('Down'));
@@ -689,7 +710,7 @@ export class BeatTrader {
       this._refreshUnpairedSummary();
       return;
     }
-    // FIFO 로 양쪽에서 matchable 만큼 차감하며 페어 비용 누적.
+    // 싼 lot 부터 matchable 만큼 차감하며 페어 비용 누적.
     // 한 번의 페어가 여러 directional 로트를 소비할 수 있으므로, 소비한 모든
     // 로트 id 와 각 로트에서 페어된 수량을 기록한다(UI 가 전부 paired 로 표시하도록).
     const consume = (side, qty) => {
@@ -697,6 +718,8 @@ export class BeatTrader {
       let cost = 0;
       const lotIds = [];
       const lotShares = [];
+      // avgPrice 오름차순으로 정렬해 싼 lot 부터 소비(원본 배열을 재정렬).
+      this.openLots[side].sort((a, b) => Number(a.avgPrice) - Number(b.avgPrice));
       const lots = this.openLots[side];
       while (need > 1e-12 && lots.length) {
         const lot = lots[0];
