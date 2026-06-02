@@ -146,6 +146,7 @@ export class ClobClient {
   static _sdkCreds = null;
   static _signerAddress = null;
   static _takerFeeBpsCache = new Map();
+  static _feeInfoCache = new Map();
   static _heartbeatId = crypto.randomUUID();
 
   static _normalizeWallet(wallet = null) {
@@ -292,6 +293,59 @@ export class ClobClient {
         return 0;
       }
     }
+  }
+
+  /**
+   * 토큰의 "실제" 수수료 파라미터 { rate, exponent } 를 반환한다.
+   *
+   * 주의: getFeeRateBps() 가 돌려주는 base_fee(예: 1000bps)는 주문에 서명되는
+   * "최대 허용" 수수료일 뿐 실제 부과 수수료가 아니다. 실제 부과액은 SDK 의
+   *   platformFeeRate = rate * (price*(1-price))^exponent
+   * 공식을 따르며, rate/exponent 는 fee-details(getFeeExponent 가 캐싱하는
+   * feeInfos[tokenId])에서 온다. (현재 BTC up/down: rate≈0.07, exponent=1)
+   */
+  static async getFeeInfo(tokenId) {
+    const key = String(tokenId ?? '').trim();
+    if (!key) return { rate: 0, exponent: 1 };
+    if (this._feeInfoCache.has(key)) return this._feeInfoCache.get(key);
+
+    const client = this._requireSdkClient();
+    try {
+      // getFeeExponent 는 내부적으로 마켓 정보를 캐싱하며 feeInfos[token]={rate,exponent} 를 채운다.
+      const exponent = Number(await client.getFeeExponent(key));
+      const info = client.feeInfos?.[key] ?? {};
+      const rate = Number(info.rate);
+      const result = {
+        rate: Number.isFinite(rate) && rate >= 0 ? rate : 0,
+        exponent: Number.isFinite(exponent) && exponent >= 0 ? exponent : 1,
+      };
+      this._feeInfoCache.set(key, result);
+      return result;
+    } catch (err) {
+      const fallback = { rate: 0, exponent: 1 };
+      this._feeInfoCache.set(key, fallback);
+      return fallback;
+    }
+  }
+
+  /**
+   * 실제 부과 공식 기반 테이커 수수료(USDC).
+   *   perShareFee = rate * (price*(1-price))^exponent
+   *   totalFee    = shares * perShareFee
+   */
+  static estimateTakerFeeUsdcWithInfo({ shares, price, rate, exponent = 1 }) {
+    const s = Number(shares);
+    const p = Number(price);
+    const r = Number(rate);
+    const e = Number(exponent);
+    if (!Number.isFinite(s) || s <= 0) return 0;
+    if (!Number.isFinite(p) || p <= 0 || p >= 1) return 0;
+    if (!Number.isFinite(r) || r <= 0) return 0;
+    const exp = Number.isFinite(e) && e >= 0 ? e : 1;
+    const perShareFee = r * Math.pow(p * (1 - p), exp);
+    const rawFee = s * perShareFee;
+    if (!Number.isFinite(rawFee) || rawFee <= 0) return 0;
+    return Math.round(rawFee * 1e6) / 1e6;
   }
 
   static estimateTakerFeeUsdc({ shares, price, feeRateBps }) {

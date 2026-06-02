@@ -128,7 +128,7 @@ export class BeatTrader {
 
     this.walletBalanceUp = 0;
     this.walletBalanceDown = 0;
-    this._tokenFeeBps = new Map();
+    this._tokenFeeInfo = new Map();
     this._loopCount = 0;
     // 엣지 지속성(연속 스냅샷 동안 임계 이상 유지된 횟수). 단발 outlier 진입 방지.
     this._edgeStreak = { Up: 0, Down: 0 };
@@ -1076,38 +1076,40 @@ export class BeatTrader {
   }
 
   // ── 수수료 ────────────────────────────────────────────────────────────────────
-  /** 두 토큰의 테이커 수수료(bps)를 1회 조회해 캐싱한다. */
+  /** 두 토큰의 실제 수수료 파라미터({rate,exponent})를 1회 조회해 캐싱한다. */
   async _primeTokenFees() {
     const ids = [this.market.upToken.tokenId, this.market.downToken.tokenId];
     await Promise.all(ids.map(async (id) => {
       const key = String(id);
       try {
-        const bps = Number(await ClobClient.getTakerFeeBps(key));
-        this._tokenFeeBps.set(key, Number.isFinite(bps) && bps > 0 ? bps : 0);
+        const info = await ClobClient.getFeeInfo(key);
+        this._tokenFeeInfo.set(key, info);
       } catch (err) {
-        this._tokenFeeBps.set(key, 0);
+        this._tokenFeeInfo.set(key, { rate: 0, exponent: 1 });
         this._recordAudit('token_fee_lookup_failed', { tokenId: key, err: err.message });
       }
     }));
     this._recordAudit('token_fees_primed', {
-      upTokenFeeBps: this._tokenFeeBps.get(String(this.market.upToken.tokenId)) ?? 0,
-      downTokenFeeBps: this._tokenFeeBps.get(String(this.market.downToken.tokenId)) ?? 0,
+      up: this._tokenFeeInfo.get(String(this.market.upToken.tokenId)) ?? null,
+      down: this._tokenFeeInfo.get(String(this.market.downToken.tokenId)) ?? null,
     });
   }
 
-  _feeBpsForSide(side) {
+  _feeInfoForSide(side) {
     const tokenId = side === 'Up' ? this.market.upToken.tokenId : this.market.downToken.tokenId;
-    return Number(this._tokenFeeBps.get(String(tokenId)) ?? 0) || 0;
+    return this._tokenFeeInfo.get(String(tokenId)) ?? { rate: 0, exponent: 1 };
   }
 
-  /** 단위(1주) 당 테이커 수수료(USDC). fee ≈ feeRate · price · (1-price). */
+  /** 단위(1주) 당 테이커 수수료(USDC). perShare = rate · (price·(1-price))^exponent. */
   _unitFeeUsdc(side, price) {
-    return ClobClient.estimateTakerFeeUsdc({ shares: 1, price, feeRateBps: this._feeBpsForSide(side) });
+    const { rate, exponent } = this._feeInfoForSide(side);
+    return ClobClient.estimateTakerFeeUsdcWithInfo({ shares: 1, price, rate, exponent });
   }
 
   /** shares 만큼 매수 시 총 테이커 수수료(USDC). */
   _feeUsdc(side, price, shares) {
-    return ClobClient.estimateTakerFeeUsdc({ shares, price, feeRateBps: this._feeBpsForSide(side) });
+    const { rate, exponent } = this._feeInfoForSide(side);
+    return ClobClient.estimateTakerFeeUsdcWithInfo({ shares, price, rate, exponent });
   }
 
   /**
