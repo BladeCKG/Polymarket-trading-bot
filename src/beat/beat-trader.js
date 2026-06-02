@@ -313,8 +313,11 @@ export class BeatTrader {
         this._publishSnapshot(snapshot, model);
 
         const allowNewBuys = nowSec < stopBuyingTs;
-        // 우선 무위험 페어 완성(반대편 저가) 시도 → 그 다음 신규 방향성 매수.
+        // 1) 무위험 페어 완성(반대편 저가) 시도.
         await this._maybeCompletePairs(snapshot, model);
+        // 2) 정상 페어가 불가능한 미페어 포지션은 강제 페어로 손실 축소(항상 평가).
+        await this._maybeForcePairExit(snapshot, model);
+        // 3) 신규 방향성 매수.
         if (allowNewBuys) {
           await this._maybeDirectionalBuy(snapshot, model);
         }
@@ -524,6 +527,153 @@ export class BeatTrader {
     }
   }
 
+  // ── 강제 페어 청산(미페어 방향성 손실 축소) ──────────────────────────────────
+  // 정상 무위험 페어가 불가능한 미페어 방향성 포지션을, "질 것 같다"고 볼 때
+  // 반대편을 사서 강제로 페어링한다. 완성 페어는 정산 시 정확히 $1 를 지급하므로
+  // 손실이 확정·상한된다.
+  //
+  // 비교(보유 사이드 A, 1주 기준, 보유비용은 양쪽 모두 매몰):
+  //   보유 → 정산:   기대값 = pA (불확실: 0 또는 1)
+  //   지금 강제 페어: 가치 = 1 - p_opp(ask) - fee (확정)
+  // ⇒ pA + p_opp + fee < 1 이면 강제 페어가 보유보다 유리(+EV 손실 축소).
+  //
+  // "시간이 지나도 이길 수 없는" 판단은 두 경로로 한다:
+  //   (1) 모델이 정상이면 pA 가 시간(secondsLeft) 감소와 불리한 가격으로 0 에 수렴.
+  //   (2) 모델이 평가 불가(가격 정체/히스토리 부족)여도, 엔드게임에서는 정산 규칙
+  //       (합의가 vs 기준가)으로 "지는 중"을 직접 판정해 손실을 상한한다.
+  async _maybeForcePairExit(snapshot, model) {
+    const cfg = this.config;
+    if (!cfg.BEAT_FORCE_PAIR_ENABLED) return;
+    const pm = snapshot?.pm;
+    if (!pm) return;
+
+    const secondsLeft = Number(snapshot.secondsLeft);
+    const endgame = Number.isFinite(secondsLeft) && secondsLeft <= Number(cfg.BEAT_FORCE_PAIR_ENDGAME_SECONDS);
+    const modelOk = Boolean(model?.ok);
+    // 모델이 없고 엔드게임도 아니면(=시간 여유 + 신호 불가) 보수적으로 대기.
+    if (!modelOk && !endgame) {
+      return;
+    }
+
+    const evMargin = Number(cfg.BEAT_FORCE_PAIR_EV_MARGIN);
+    const maxWinProb = Number(cfg.BEAT_FORCE_PAIR_MAX_WIN_PROB);
+    const maxLossPerShare = Number(cfg.BEAT_FORCE_PAIR_MAX_LOSS_PER_SHARE);
+    const pairCostMax = Number(cfg.BEAT_ARB_PAIR_COST_MAX);
+
+    // 모델 부재 시 정산 규칙으로 "지는 중" 판정에 쓸 합의가/기준가.
+    const consensusPrice = Number(snapshot?.hub?.consensusPrice);
+    const beatPrice = Number(this.beatPrice);
+    const losingMargin = beatPrice * (Number(cfg.BEAT_FORCE_PAIR_LOSING_MARGIN_BPS) / 10_000);
+
+    for (const heldSide of ['Up', 'Down']) {
+      const unpairedShares = this._unpairedShares(heldSide);
+      if (unpairedShares <= 1e-6) continue;
+
+      const oppSide = this._oppositeSide(heldSide);
+      const oppLeg = oppSide === 'Up' ? pm.up : pm.down;
+      const oppAsk = positiveFiniteOrNull(oppLeg?.bestAsk);
+      if (oppAsk == null) continue;
+      if (Number(oppLeg.ageMs) > Number(cfg.BEAT_BOOK_MAX_AGE_MS)) continue;
+
+      const heldAvgCost = this._unpairedAvgCost(heldSide);
+      const oppUnitFee = this._unitFeeUsdc(oppSide, oppAsk);
+
+      // 이미 정상(이익) 페어가 가능한 구간이면 _maybeCompletePairs 가 처리하므로 건너뜀.
+      const profitablePairCost = heldAvgCost + this._unitFeeUsdc(heldSide, heldAvgCost) + oppAsk + oppUnitFee;
+      if (profitablePairCost <= pairCostMax) continue;
+
+      // 강제 페어로 확정되는 1주당 손익.
+      const heldUnitFee = this._unitFeeUsdc(heldSide, heldAvgCost);
+      const lockedValuePerShare = 1 - oppAsk - oppUnitFee;        // 페어 완성 시 1주 가치
+      const lockedPnlPerShare = lockedValuePerShare - heldAvgCost - heldUnitFee;
+      const lockedLossPerShare = Math.max(0, -lockedPnlPerShare);
+
+      // 락인 손실이 허용치를 넘으면(반대편이 너무 비쌈) 강제 페어하지 않는다.
+      if (lockedLossPerShare > maxLossPerShare + 1e-9) {
+        this._recordAudit('force_pair_skip', {
+          reason: 'locked-loss-too-large',
+          heldSide, oppSide, heldAvgCost, oppAsk, lockedLossPerShare, maxLossPerShare,
+          secondsLeft, modelOk,
+        });
+        continue;
+      }
+
+      // ── 청산 판단 ──────────────────────────────────────────────────────────
+      let shouldExit = false;
+      let decisionReason = null;
+      let pA = null;
+
+      if (modelOk) {
+        // (1) 모델 경로: +EV 트리거 + 불리(adverse).
+        pA = heldSide === 'Up' ? Number(model.pUp) : Number(model.pDown);
+        if (Number.isFinite(pA)) {
+          const effectiveMargin = endgame ? 0 : evMargin;
+          const evTrigger = (pA + oppAsk + oppUnitFee) <= (1 - effectiveMargin);
+          const adverse = endgame ? (pA < 0.5) : (pA <= maxWinProb);
+          shouldExit = evTrigger && adverse;
+          decisionReason = shouldExit
+            ? (endgame ? 'model-endgame' : 'model-ev')
+            : (!evTrigger ? 'ev-trigger-not-met' : 'held-side-not-adverse');
+        } else {
+          decisionReason = 'model-pA-not-finite';
+        }
+      } else if (endgame) {
+        // (2) 모델 부재 + 엔드게임: 정산 규칙으로 "지는 중"이면 손실 상한.
+        //     Up 은 consensus < beat - margin, Down 은 consensus > beat + margin 이면 패배 중.
+        if (Number.isFinite(consensusPrice) && Number.isFinite(beatPrice)) {
+          const losing = heldSide === 'Up'
+            ? consensusPrice < (beatPrice - losingMargin)
+            : consensusPrice > (beatPrice + losingMargin);
+          shouldExit = losing;
+          decisionReason = losing ? 'price-vs-beat-losing-endgame' : 'price-vs-beat-not-losing';
+        } else {
+          decisionReason = 'no-consensus-or-beat-price';
+        }
+      }
+
+      if (!shouldExit) {
+        this._recordAudit('force_pair_skip', {
+          reason: decisionReason ?? 'no-decision',
+          heldSide, oppSide, pA, oppAsk, oppUnitFee,
+          consensusPrice: Number.isFinite(consensusPrice) ? consensusPrice : null,
+          beatPrice: Number.isFinite(beatPrice) ? beatPrice : null,
+          endgame, modelOk, secondsLeft,
+        });
+        continue;
+      }
+
+      this.log.info('BeatTrader v2: force-pair exit', {
+        heldSide, oppSide, unpairedShares: unpairedShares.toFixed(4),
+        reason: decisionReason, pA: Number.isFinite(pA) ? pA.toFixed(4) : null,
+        oppAsk: oppAsk.toFixed(4), lockedPnlPerShare: lockedPnlPerShare.toFixed(4),
+        endgame, modelOk, secondsLeft: Math.round(secondsLeft),
+      });
+      this._recordAudit('force_pair_trigger', {
+        heldSide, oppSide, unpairedShares, reason: decisionReason, pA,
+        oppAsk, oppUnitFee, heldAvgCost, lockedValuePerShare, lockedPnlPerShare, lockedLossPerShare,
+        consensusPrice: Number.isFinite(consensusPrice) ? consensusPrice : null,
+        beatPrice: Number.isFinite(beatPrice) ? beatPrice : null,
+        endgame, modelOk, secondsLeft,
+      });
+
+      // 미페어 보유 전량을 반대편으로 매수해 강제 페어링(예산/주문크기 한도 무시).
+      await this._executeBuy({
+        side: oppSide,
+        leg: oppLeg,
+        fairProb: modelOk ? (oppSide === 'Up' ? model.pUp : model.pDown) : null,
+        edge: null,
+        snapshot,
+        model,
+        reasonTag: 'force-pair',
+        targetShares: unpairedShares,
+        pairContext: {
+          heldSide, heldAvgCost, oppAsk, oppUnitFee,
+          pA, lockedPnlPerShare, endgame, modelOk, reason: decisionReason, mode: 'force-pair',
+        },
+      });
+    }
+  }
+
   // ── 매수 실행(드라이런=시뮬레이션, 라이브=IOC) ──────────────────────────────────
   async _executeBuy({ side, leg, fairProb, edge, snapshot, model, reasonTag, targetShares = null, pairContext = null }) {
     const cfg = this.config;
@@ -532,9 +682,9 @@ export class BeatTrader {
     if (ask == null) return;
 
     const maxPrice = clamp(ask + Number(cfg.BEAT_MAX_SLIPPAGE), 0.01, 0.999);
-    // 페어 완성은 위험을 줄이는 거래라 MAX_SPEND_PER_MARKET 한도를 무시한다.
+    // 페어 완성/강제 페어는 위험을 줄이는 거래라 MAX_SPEND_PER_MARKET 한도를 무시한다.
     // 신규 방향성 매수만 잔여 예산으로 제한한다.
-    const isPairCompletion = reasonTag === 'pair-completion';
+    const isPairCompletion = reasonTag === 'pair-completion' || reasonTag === 'force-pair';
     const remainingBudget = isPairCompletion
       ? Infinity
       : Number(cfg.MAX_SPEND_PER_MARKET) - this.totalSpent;
@@ -739,7 +889,7 @@ export class BeatTrader {
       ts: Date.now(),
       recordedAt: Date.now(),
       side,
-      intent: reasonTag === 'pair-completion' ? 'pair-buy' : 'directional',
+      intent: (reasonTag === 'pair-completion' || reasonTag === 'force-pair') ? 'pair-buy' : 'directional',
       reasonTag,
       shares,
       price: avgPrice,
@@ -765,7 +915,11 @@ export class BeatTrader {
     // 페어 매칭(반대편 미페어 로트와 즉시 상계 → 잠금 이익 기록).
     this._reconcilePairs();
     this._recordAudit('buy_registered', { event, lotState: this._lotState() });
-    this._publishMarket({ tradeStatus: reasonTag === 'pair-completion' ? 'pair locked' : 'buy placed' });
+    this._publishMarket({
+      tradeStatus: reasonTag === 'force-pair'
+        ? 'force paired'
+        : (reasonTag === 'pair-completion' ? 'pair locked' : 'buy placed'),
+    });
   }
 
   /**

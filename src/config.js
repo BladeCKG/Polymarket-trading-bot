@@ -241,6 +241,29 @@ export const BEAT_MIN_HISTORY_MS = parseInt_('BEAT_MIN_HISTORY_MS', 15_000);
 export const BEAT_SIDE_MAX_ASK = parseFloat_('BEAT_SIDE_MAX_ASK', 0.95);
 export const BEAT_SIDE_MIN_ASK = parseFloat_('BEAT_SIDE_MIN_ASK', 0.02);
 
+// ── 강제 페어 청산(미페어 방향성 손실 축소) ──────────────────────────────────
+// 정상적인 무위험 페어(비용 < pairCostMax)가 더 이상 불가능한 미페어 방향성
+// 포지션을, 모델이 "질 것 같다"고 볼 때 반대편을 사서 강제로 페어링해 손실을
+// 줄인다. 완성 페어는 정산 시 정확히 $1 를 지급하므로 손실이 확정·상한된다.
+//   force-pair 조건(+EV): pA + p_opp(ask) + fee <= 1 - margin
+//     (A 사이드 공정 승률 + 반대편 가격이 1 미만 → 지금 잠그는 게 보유보다 유리)
+export const BEAT_FORCE_PAIR_ENABLED = parseBool_('BEAT_FORCE_PAIR_ENABLED', true);
+// +EV 트리거에 요구하는 최소 마진(클수록 보수적, 더 확실할 때만 강제 페어).
+export const BEAT_FORCE_PAIR_EV_MARGIN = parseFloat_('BEAT_FORCE_PAIR_EV_MARGIN', 0.04);
+// 강제 페어를 고려하기 시작하는, 보유 사이드 공정 승률 상한.
+// (pA 가 이 값보다 낮을 때만 = 충분히 불리할 때만 청산 검토)
+export const BEAT_FORCE_PAIR_MAX_WIN_PROB = parseFloat_('BEAT_FORCE_PAIR_MAX_WIN_PROB', 0.45);
+// 한 주(share)당 감수할 수 있는 최대 확정 손실. 반대편이 너무 비싸(=락인 손실이
+// 이보다 크면) 강제 페어 대신 보유로 둔다(망가진 호가에 손실을 못 박지 않도록).
+export const BEAT_FORCE_PAIR_MAX_LOSS_PER_SHARE = parseFloat_('BEAT_FORCE_PAIR_MAX_LOSS_PER_SHARE', 0.20);
+// 엔드게임 백스톱: 종료 이 시간(초) 전부터는, 보유 사이드가 불리하면(pA<0.5)
+// +EV 마진을 완화해서라도 강제 페어로 손실을 상한한다(설정 손실 한도는 유지).
+export const BEAT_FORCE_PAIR_ENDGAME_SECONDS = parseInt_('BEAT_FORCE_PAIR_ENDGAME_SECONDS', 30);
+// 엔드게임에서 모델이 평가 불가(가격 정체/히스토리 부족)일 때의 대체 판단 기준.
+// 정산 규칙(합의가 vs 기준가)으로 "지는 중"을 판정한다. 기준가 대비 이 bps 이상
+// 불리한 쪽에 있으면 지는 것으로 보고 강제 페어(손실 한도 내에서)한다.
+export const BEAT_FORCE_PAIR_LOSING_MARGIN_BPS = parseFloat_('BEAT_FORCE_PAIR_LOSING_MARGIN_BPS', 2);
+
 // 라이브 매수 후, API 응답이 불확실할 때 온체인 OrderFilled 확정을 기다리는 최대 시간(ms).
 export const BEAT_FILL_CONFIRM_TIMEOUT_MS = parseInt_('BEAT_FILL_CONFIRM_TIMEOUT_MS', 4_000);
 
