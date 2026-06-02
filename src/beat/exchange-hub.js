@@ -365,12 +365,16 @@ export class ExchangeHub extends EventEmitter {
     exchanges = ['binance', 'okx', 'bybit', 'coinbase'],
     tradeWindowMs = 60_000,
     priceHistoryMs = 120_000,
+    outlierBps = 25,
   } = {}) {
     super();
     this.symbol = baseSymbol(symbol);
     this.exchanges = exchanges.filter((ex) => exchangeSpec(ex, this.symbol));
     this.tradeWindowMs = Math.max(5_000, Number(tradeWindowMs) || 60_000);
     this.priceHistoryMs = Math.max(30_000, Number(priceHistoryMs) || 120_000);
+    // 합의 가격 산출 시, 거래소별 미드가가 중앙값 대비 이 bps 이상 벗어나면
+    // 이상치(stale/오류 호가)로 보고 제외한다. 0 이면 비활성.
+    this.outlierBps = Math.max(0, Number(outlierBps) || 0);
 
     // 거래소별 최신 상태.
     this._state = new Map();
@@ -492,16 +496,39 @@ export class ExchangeHub extends EventEmitter {
   }
 
   /**
+   * refMs 기준으로 신선한(5s 이내) 거래소 상태 목록을 반환하되, 미드가가 중앙값
+   * 대비 outlierBps 이상 벗어난 이상치 거래소를 제외한다.
+   * 반환: [{ st, mid }]
+   */
+  _activeVenues(refMs) {
+    const fresh = [];
+    for (const st of this._state.values()) {
+      if (!st.bidPrice || !st.askPrice) continue;
+      if (refMs - st.bboAtMs > 5_000) continue;
+      fresh.push({ st, mid: (st.bidPrice + st.askPrice) / 2 });
+    }
+    if (fresh.length <= 2 || this.outlierBps <= 0) return fresh;
+
+    // 중앙값 기준 편차 필터(stale/오류 단일 호가 제거).
+    const mids = fresh.map((v) => v.mid).sort((a, b) => a - b);
+    const mid = mids.length % 2
+      ? mids[(mids.length - 1) / 2]
+      : (mids[mids.length / 2 - 1] + mids[mids.length / 2]) / 2;
+    if (!(mid > 0)) return fresh;
+    const tol = mid * (this.outlierBps / 10_000);
+    const filtered = fresh.filter((v) => Math.abs(v.mid - mid) <= tol);
+    // 모두 걸러지는 비정상 상황 방지: 최소 1개는 남긴다.
+    return filtered.length ? filtered : fresh;
+  }
+
+  /**
    * 거래소별 미드가를 BBO 잔량 가중으로 합의 가격을 만들고 시계열에 기록한다.
    */
   _recomputeConsensus(refMs) {
     const t = refMs || nowMs();
     let weightedPrice = 0;
     let weight = 0;
-    for (const st of this._state.values()) {
-      if (!st.bidPrice || !st.askPrice) continue;
-      if (t - st.bboAtMs > 5_000) continue;
-      const mid = (st.bidPrice + st.askPrice) / 2;
+    for (const { st, mid } of this._activeVenues(t)) {
       const w = Math.max(1e-9, st.bidSize + st.askSize);
       weightedPrice += mid * w;
       weight += w;
@@ -538,12 +565,9 @@ export class ExchangeHub extends EventEmitter {
     let totalBidDepth = 0;
     let totalAskDepth = 0;
 
-    for (const st of this._state.values()) {
-      if (!st.bidPrice || !st.askPrice) continue;
-      if (ref - st.bboAtMs > 5_000) continue;
+    for (const { st, mid } of this._activeVenues(ref)) {
       bboCount += 1;
       freshestBboAtMs = Math.max(freshestBboAtMs, st.bboAtMs);
-      const mid = (st.bidPrice + st.askPrice) / 2;
       const w = Math.max(1e-9, st.bidSize + st.askSize);
       midWeighted += mid * w;
       midWeight += w;

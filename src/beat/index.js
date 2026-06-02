@@ -111,6 +111,7 @@ export async function main() {
       exchanges: beatConfig.BEAT_EXCHANGES,
       tradeWindowMs: beatConfig.BEAT_HUB_TRADE_WINDOW_MS,
       priceHistoryMs: beatConfig.BEAT_HUB_PRICE_HISTORY_MS,
+      outlierBps: beatConfig.BEAT_HUB_OUTLIER_BPS,
     });
     hub.start();
     hubs.set(symbol, hub);

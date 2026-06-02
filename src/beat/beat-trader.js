@@ -130,6 +130,8 @@ export class BeatTrader {
     this.walletBalanceDown = 0;
     this._tokenFeeBps = new Map();
     this._loopCount = 0;
+    // 엣지 지속성(연속 스냅샷 동안 임계 이상 유지된 횟수). 단발 outlier 진입 방지.
+    this._edgeStreak = { Up: 0, Down: 0 };
   }
 
   // ── 메인 라이프사이클 ────────────────────────────────────────────────────────
@@ -312,6 +314,9 @@ export class BeatTrader {
         this._recordSnapshotAudit(snapshot, model);
         this._publishSnapshot(snapshot, model);
 
+        // 엣지 지속성 갱신(매 스냅샷). 단발 outlier 면 streak 가 리셋된다.
+        this._updateEdgeStreak(snapshot, model);
+
         const allowNewBuys = nowSec < stopBuyingTs;
         // 1) 무위험 페어 완성(반대편 저가) 시도.
         await this._maybeCompletePairs(snapshot, model);
@@ -373,6 +378,36 @@ export class BeatTrader {
     return { ok: true, ...result };
   }
 
+  /**
+   * 매 스냅샷마다 각 사이드의 "방향성 진입 자격 엣지"가 유지되는 연속 횟수를 갱신한다.
+   * 자격 = 모델 정상 + ask 범위 내 + 신선한 북 + edge(fairProb-ask) >= requiredEdge.
+   * 한 번이라도 자격을 잃으면(단발 outlier 포함) 해당 사이드 streak 는 0 으로 리셋.
+   */
+  _updateEdgeStreak(snapshot, model) {
+    const cfg = this.config;
+    const pm = snapshot?.pm;
+    if (!model?.ok || !pm) {
+      this._edgeStreak.Up = 0;
+      this._edgeStreak.Down = 0;
+      return;
+    }
+    const requiredEdge = Number(cfg.BEAT_PROBABILITY_REQUIRED_EDGE);
+    const maxAsk = Number(cfg.BEAT_SIDE_MAX_ASK);
+    const minAsk = Number(cfg.BEAT_SIDE_MIN_ASK);
+    const maxAge = Number(cfg.BEAT_BOOK_MAX_AGE_MS);
+    for (const [side, fairProb, leg] of [['Up', model.pUp, pm.up], ['Down', model.pDown, pm.down]]) {
+      const ask = positiveFiniteOrNull(leg?.bestAsk);
+      const edge = (ask != null && Number.isFinite(fairProb)) ? fairProb - ask : null;
+      const qualifies = ask != null
+        && Number(leg.ageMs) <= maxAge
+        && ask <= maxAsk
+        && ask >= minAsk
+        && edge != null
+        && edge >= requiredEdge;
+      this._edgeStreak[side] = qualifies ? this._edgeStreak[side] + 1 : 0;
+    }
+  }
+
   // ── 방향성 매수 ────────────────────────────────────────────────────────────────
   async _maybeDirectionalBuy(snapshot, model) {
     const cfg = this.config;
@@ -432,6 +467,21 @@ export class BeatTrader {
     const ofi = best.side === 'Up' ? pm.up?.ofi : pm.down?.ofi;
     if (ofi?.isToxic && ofi?.saturated) {
       this._recordAudit('decision_skip', { reason: 'ofi-toxic-saturated', side: best.side, ofi });
+      return;
+    }
+
+    // 엣지 지속성 가드: 선택된 사이드의 엣지가 연속 N 스냅샷 동안 유지됐을 때만 매수.
+    // 단발성 가격 outlier 로 스파이크한 엣지(예: 한 거래소 stale 호가)는 차단된다.
+    const requiredStreak = Math.max(1, Number(cfg.BEAT_EDGE_PERSISTENCE_SNAPSHOTS) || 1);
+    const streak = Number(this._edgeStreak[best.side] ?? 0);
+    if (streak < requiredStreak) {
+      this._recordAudit('decision_skip', {
+        reason: 'edge-not-persistent',
+        side: best.side,
+        edge: best.edge,
+        streak,
+        requiredStreak,
+      });
       return;
     }
 

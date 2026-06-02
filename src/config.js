@@ -218,6 +218,8 @@ export const BEAT_HUB_TRADE_WINDOW_MS = parseInt_('BEAT_HUB_TRADE_WINDOW_MS', 60
 export const BEAT_HUB_PRICE_HISTORY_MS = parseInt_('BEAT_HUB_PRICE_HISTORY_MS', 120_000);
 // 통합 가격 틱이 이보다 오래되면 매매 판단에서 제외.
 export const BEAT_HUB_MAX_TICK_AGE_MS = parseInt_('BEAT_HUB_MAX_TICK_AGE_MS', 2_500);
+// 합의 가격 산출 시, 거래소 미드가가 중앙값 대비 이 bps 이상 벗어나면 이상치로 제외.
+export const BEAT_HUB_OUTLIER_BPS = parseFloat_('BEAT_HUB_OUTLIER_BPS', 25);
 
 // ── 확률 모델 가중치(드리프트 방향 신호) ────────────────────────────────────
 // 모든 신호는 [-1, 1] 로 정규화되어 가중 평균된 뒤 z-score 를 이동시킨다.
@@ -240,6 +242,9 @@ export const BEAT_MIN_HISTORY_MS = parseInt_('BEAT_MIN_HISTORY_MS', 15_000);
 // 방향성 매수를 허용하는 ask 가격 범위.
 export const BEAT_SIDE_MAX_ASK = parseFloat_('BEAT_SIDE_MAX_ASK', 0.95);
 export const BEAT_SIDE_MIN_ASK = parseFloat_('BEAT_SIDE_MIN_ASK', 0.02);
+// 단발성 가격 outlier 로 인한 오진입 방지: 같은 사이드의 엣지가 연속 N 스냅샷
+// 동안 임계 이상 유지될 때만 방향성 매수. 1 이면 즉시(과거 동작).
+export const BEAT_EDGE_PERSISTENCE_SNAPSHOTS = parseInt_('BEAT_EDGE_PERSISTENCE_SNAPSHOTS', 3);
 
 // ── 강제 페어 청산(미페어 방향성 손실 축소) ──────────────────────────────────
 // 정상적인 무위험 페어(비용 < pairCostMax)가 더 이상 불가능한 미페어 방향성
