@@ -37,13 +37,6 @@ import {
   BEAT_SIDE_MAX_ASK,
   BEAT_SIDE_MIN_ASK,
   BEAT_FILL_CONFIRM_TIMEOUT_MS,
-  BEAT_MOMENTS_BNB,
-  BEAT_MOMENTS_BTC,
-  BEAT_MOMENTS_DOGE,
-  BEAT_MOMENTS_ETH,
-  BEAT_MOMENTS_HYPE,
-  BEAT_MOMENTS_SOL,
-  BEAT_MOMENTS_XRP,
   BEAT_SYMBOLS,
   BEAT_MAX_SLIPPAGE,
   BEAT_MAX_INVENTORY_IMBALANCE_SHARES,
@@ -119,13 +112,6 @@ const DEFAULTS = Object.freeze({
   BEAT_OFI_RATIO_ENTER,
   BEAT_OFI_RATIO_EXIT,
   BEAT_OFI_EXIT_RATIO,
-  BEAT_MOMENTS_BTC,
-  BEAT_MOMENTS_ETH,
-  BEAT_MOMENTS_SOL,
-  BEAT_MOMENTS_XRP,
-  BEAT_MOMENTS_BNB,
-  BEAT_MOMENTS_DOGE,
-  BEAT_MOMENTS_HYPE,
   MAX_SPEND_PER_MARKET,
   BEAT_DASHBOARD_ENABLED,
   BEAT_DASHBOARD_HOST,
@@ -152,56 +138,12 @@ function normalizeBeatSymbols(value, fallback) {
   return normalized.length ? [...new Set(normalized)] : fallback;
 }
 
-function normalizeMoments(value, fallback) {
-  if (!Array.isArray(value)) return fallback;
-  const next = [];
-  for (const item of value) {
-    let candidate = null;
-    if (Array.isArray(item)) {
-      if (item.length < 4) return fallback;
-      const [start, end, btcmoveMax, buyMax] = item;
-      candidate = { start, end, btcmoveMax, buyMax };
-    } else if (item && typeof item === 'object') {
-      candidate = item;
-    } else {
-      return fallback;
-    }
-    const normalized = {
-      start: Number(candidate.start ?? 0),
-      end: Number(candidate.end ?? DEFAULTS.MARKET_WINDOW_SECONDS),
-      btcmoveMax: Number(candidate.btcmoveMax),
-      buyMax: Number(candidate.buyMax),
-    };
-    if (
-      !Number.isFinite(normalized.start) ||
-      !Number.isFinite(normalized.end) ||
-      !Number.isFinite(normalized.btcmoveMax) ||
-      !Number.isFinite(normalized.buyMax)
-    ) return fallback;
-    next.push(normalized);
-  }
-  return next.length ? next : fallback;
-}
-
 function coerceValue(key, value) {
   const fallback = DEFAULTS[key];
   if (fallback === undefined) return undefined;
 
   if (key === 'BEAT_SYMBOLS') {
     return normalizeBeatSymbols(value, fallback);
-  }
-
-  if (key.startsWith('BEAT_MOMENTS')) {
-    const parsed = Array.isArray(value)
-      ? value
-      : (typeof value === 'string' ? (() => {
-        try {
-          return JSON.parse(value);
-        } catch {
-          return null;
-        }
-      })() : null);
-    return normalizeMoments(parsed, fallback);
   }
 
   if (typeof fallback === 'boolean') {

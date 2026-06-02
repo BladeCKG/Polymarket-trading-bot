@@ -62,78 +62,10 @@ function normalizeBeatSymbol(value, fallback) {
   return SUPPORTED_BEAT_SYMBOLS.includes(raw) ? raw : fallback;
 }
 
-function parseSymbol_(key, fallback) {
-  const raw = String(optional(key, '')).trim().toUpperCase();
-  return SUPPORTED_BEAT_SYMBOLS.includes(raw) ? raw : fallback;
-}
-
 function parseSymbolList_(key, fallback) {
   const values = parseArray_(key, fallback);
   const symbols = values.map((value) => normalizeBeatSymbol(value, null)).filter(Boolean);
   return symbols.length ? [...new Set(symbols)] : fallback;
-}
-
-function normalizeMoments_(value, fallback) {
-  if (!Array.isArray(value)) return fallback;
-  const next = [];
-  for (const item of value) {
-    if (Array.isArray(item)) {
-      if (item.length < 4) return fallback;
-      const [s, e, bm, bk] = item;
-      const normalized = {
-        start: Number(s ?? 0),
-        end: Number(e ?? MARKET_WINDOW_SECONDS),
-        btcmoveMax: Number(bm),
-        buyMax: Number(bk),
-      };
-      if (
-        !Number.isFinite(normalized.start) ||
-        !Number.isFinite(normalized.end) ||
-        !Number.isFinite(normalized.btcmoveMax) ||
-        !Number.isFinite(normalized.buyMax)
-      ) {
-        return fallback;
-      }
-      next.push(normalized);
-      continue;
-    }
-    if (item && typeof item === 'object') {
-      const normalized = {
-        start: Number(item.start ?? 0),
-        end: Number(item.end ?? MARKET_WINDOW_SECONDS),
-        btcmoveMax: Number(item.btcmoveMax),
-        buyMax: Number(item.buyMax),
-      };
-      if (
-        !Number.isFinite(normalized.start) ||
-        !Number.isFinite(normalized.end) ||
-        !Number.isFinite(normalized.btcmoveMax) ||
-        !Number.isFinite(normalized.buyMax)
-      ) {
-        return fallback;
-      }
-      next.push(normalized);
-      continue;
-    }
-    return fallback;
-  }
-  return next.length ? next : fallback;
-}
-
-function parseMoments_(key, fallback) {
-  const normalizedFallback = normalizeMoments_(fallback, []);
-  const v = process.env[key];
-  if (v === undefined) return normalizedFallback;
-  try {
-    const parsed = JSON.parse(v);
-    return normalizeMoments_(parsed, normalizedFallback);
-  } catch (err) {
-    return normalizedFallback;
-  }
-}
-
-function parseSymbolMoments_(symbol, fallback) {
-  return parseMoments_(`BEAT_MOMENTS_${String(symbol ?? '').toUpperCase()}`, fallback);
 }
 
 // ── Wallet ───────────────────────────────────────────────────────────────────
@@ -226,7 +158,7 @@ export const BEAT_SYMBOLS = parseSymbolList_('BEAT_SYMBOLS', ['BTC']);
 export const BTC_PRICE_MAX_AGE_MS        = parseInt_('BTC_PRICE_MAX_AGE_MS', 2_000);
 export const BTC_PRICE_STALL_RECONNECT_MS = parseInt_('BTC_PRICE_STALL_RECONNECT_MS', 12_000);
 export const BEAT_DRY_RUN                = parseBool_('BEAT_DRY_RUN', true);
-// Entry delay is controlled by per-symbol `BEAT_MOMENTS_<SYMBOL>` settings.
+// Entry delay is controlled by `BEAT_ENTRY_DELAY_SECONDS`.
 export const BEAT_BOOK_POLL_MS           = parseInt_('BEAT_BOOK_POLL_MS', 1_000);
 export const BEAT_BOOK_MAX_AGE_MS        = parseInt_('BEAT_BOOK_MAX_AGE_MS', 1_500);
 export const BEAT_BUY_COOLDOWN_MS        = parseInt_('BEAT_BUY_COOLDOWN_MS', 5_000);
@@ -311,27 +243,6 @@ export const BEAT_SIDE_MIN_ASK = parseFloat_('BEAT_SIDE_MIN_ASK', 0.02);
 
 // 라이브 매수 후, API 응답이 불확실할 때 온체인 OrderFilled 확정을 기다리는 최대 시간(ms).
 export const BEAT_FILL_CONFIRM_TIMEOUT_MS = parseInt_('BEAT_FILL_CONFIRM_TIMEOUT_MS', 4_000);
-
-// Per-market time-segment configuration for directional buys.
-// Env vars `BEAT_MOMENTS_<SYMBOL>` should be JSON arrays of objects like:
-// [{"start":0,"end":15,"btcmoveMax":100,"buyMax":0.1}, ...]
-// Values are seconds after market open (0-300 for 5m markets).
-// `buyMax` now means the minimum absolute distance from 0.5 that the side ask
-// must have to qualify: abs(0.5 - askPrice) >= buyMax.
-// `BEAT_MOMENTS_<SYMBOL>` accepts a compact double-array or array-of-objects JSON.
-// Compact form: [[start,end,btcmoveMax,buyMax], ...]
-const DEFAULT_BEAT_MOMENTS = Object.freeze(parseMoments_('__DEFAULT_BEAT_MOMENTS__', [
-  // Default: allow reasonable moves and require asks to be at least 0.46 away from 0.5.
-  { start: 0, end: MARKET_WINDOW_SECONDS, btcmoveMax: 120, buyMax: 0.46 },
-]));
-
-export const BEAT_MOMENTS_BTC = parseSymbolMoments_('BTC', DEFAULT_BEAT_MOMENTS);
-export const BEAT_MOMENTS_ETH = parseSymbolMoments_('ETH', DEFAULT_BEAT_MOMENTS);
-export const BEAT_MOMENTS_SOL = parseSymbolMoments_('SOL', DEFAULT_BEAT_MOMENTS);
-export const BEAT_MOMENTS_XRP = parseSymbolMoments_('XRP', DEFAULT_BEAT_MOMENTS);
-export const BEAT_MOMENTS_BNB = parseSymbolMoments_('BNB', DEFAULT_BEAT_MOMENTS);
-export const BEAT_MOMENTS_DOGE = parseSymbolMoments_('DOGE', DEFAULT_BEAT_MOMENTS);
-export const BEAT_MOMENTS_HYPE = parseSymbolMoments_('HYPE', DEFAULT_BEAT_MOMENTS);
 
 // ── EIP-712 domains for CLOB order signing ───────────────────────────────────
 // Polymarket has TWO exchange contracts. Orders MUST be signed against the
