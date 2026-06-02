@@ -939,7 +939,9 @@ export class BeatTrader {
       ts: Date.now(),
       recordedAt: Date.now(),
       side,
-      intent: (reasonTag === 'pair-completion' || reasonTag === 'force-pair') ? 'pair-buy' : 'directional',
+      intent: reasonTag === 'force-pair'
+        ? 'force-pair'
+        : (reasonTag === 'pair-completion' ? 'pair-buy' : 'directional'),
       reasonTag,
       shares,
       price: avgPrice,

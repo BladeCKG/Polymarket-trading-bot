@@ -57,11 +57,17 @@ function logReturn(curr, prev) {
 }
 
 /**
+/**
  * 합의 가격 시계열에서 EWMA per-√second 변동성을 추정한다.
  * history: [{ timeMs, price }] (오름차순)
+ *
+ * σ-스파이크 완화: 단발성 큰 수익률(예: 한 거래소 stale 틱)이 분산 추정을 순간적으로
+ * 부풀려 확률을 왜곡하는 것을 막기 위해, 각 틱의 관측 분산을 현재 EWMA 분산의
+ * maxJumpRatio 배로 winsorize(상한 클램프)한다. maxJumpRatio<=0 이면 비활성.
  */
-export function ewmaSigmaPerSqrtSecond(history = [], lambda = 0.97) {
+export function ewmaSigmaPerSqrtSecond(history = [], lambda = 0.97, maxJumpRatio = 0) {
   const lam = clamp(Number(lambda) || 0.97, 0.5, 0.9999);
+  const jumpCap = Number(maxJumpRatio) > 0 ? Number(maxJumpRatio) : 0;
   let variance = null;
   for (let i = 1; i < history.length; i += 1) {
     const prev = history[i - 1];
@@ -70,7 +76,12 @@ export function ewmaSigmaPerSqrtSecond(history = [], lambda = 0.97) {
     if (!Number.isFinite(dtSeconds) || dtSeconds <= 0) continue;
     const r = logReturn(next?.price, prev?.price);
     if (!Number.isFinite(r)) continue;
-    const perSecondVar = (r * r) / dtSeconds;
+    let perSecondVar = (r * r) / dtSeconds;
+    // 현재 EWMA 분산 대비 과도한 단발 스파이크를 상한 클램프.
+    if (jumpCap > 0 && variance != null && variance > 0) {
+      const cap = jumpCap * variance;
+      if (perSecondVar > cap) perSecondVar = cap;
+    }
     variance = variance == null
       ? perSecondVar
       : (lam * variance) + ((1 - lam) * perSecondVar);
@@ -143,7 +154,8 @@ export function computeFairProbability({
 
   const ref = Number(hub?.timeMs) || Date.now();
   const lambda = Number(config.BEAT_PROBABILITY_VOL_LAMBDA) || 0.97;
-  const sigmaPerSqrtSecond = ewmaSigmaPerSqrtSecond(priceHistory, lambda);
+  const volJumpCap = Number(config.BEAT_PROBABILITY_VOL_MAX_JUMP_RATIO) || 0;
+  const sigmaPerSqrtSecond = ewmaSigmaPerSqrtSecond(priceHistory, lambda, volJumpCap);
   if (!Number.isFinite(sigmaPerSqrtSecond) || sigmaPerSqrtSecond <= 0) return null;
 
   // 종료에 매우 근접하면 사실상 확정.

@@ -167,6 +167,10 @@ export const BEAT_PROBABILITY_HISTORY_MS = parseInt_('BEAT_PROBABILITY_HISTORY_M
 export const BEAT_PROBABILITY_REQUIRED_EDGE = parseFloat_('BEAT_PROBABILITY_REQUIRED_EDGE', 0.03);
 export const BEAT_PROBABILITY_PAIR_COST_MAX = parseFloat_('BEAT_PROBABILITY_PAIR_COST_MAX', 1.0);
 export const BEAT_PROBABILITY_VOL_LAMBDA = parseFloat_('BEAT_PROBABILITY_VOL_LAMBDA', 0.97);
+// σ-스파이크 완화: 각 틱 관측 분산을 현재 EWMA 분산의 이 배수로 상한 클램프(0=비활성).
+// 단발성 큰 수익률(거래소 stale 틱 등)이 변동성 추정을 순간적으로 부풀려 확률을
+// 왜곡하는 것을 방지한다. 예) 4 이면 한 틱이 현재 분산의 4배를 넘지 못함.
+export const BEAT_PROBABILITY_VOL_MAX_JUMP_RATIO = parseFloat_('BEAT_PROBABILITY_VOL_MAX_JUMP_RATIO', 4);
 export const BEAT_PROBABILITY_DRIFT_SHRINK = parseFloat_('BEAT_PROBABILITY_DRIFT_SHRINK', 0.35);
 export const BEAT_PROBABILITY_OFI_WEIGHT = parseFloat_('BEAT_PROBABILITY_OFI_WEIGHT', 0.20);
 export const BEAT_PROBABILITY_CONFIDENCE = parseFloat_('BEAT_PROBABILITY_CONFIDENCE', 0.80);

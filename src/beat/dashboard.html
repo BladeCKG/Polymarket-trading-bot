@@ -464,6 +464,12 @@
       stroke-dasharray: 2 3;
     }
 
+    .graph-trade-line-force {
+      stroke: rgba(217, 119, 6, 0.75);
+      stroke-width: 1.5;
+      stroke-dasharray: 1 2;
+    }
+
     .graph-trade-label {
       font-size: 9px;
       fill: var(--ink);
@@ -478,6 +484,17 @@
     .graph-trade-badge-pair {
       fill: rgba(180, 35, 24, 0.12);
       stroke: rgba(180, 35, 24, 0.35);
+    }
+
+    .graph-trade-badge-force {
+      fill: rgba(217, 119, 6, 0.14);
+      stroke: rgba(217, 119, 6, 0.4);
+    }
+
+    .trade-chip.force {
+      background: rgba(217, 119, 6, 0.10);
+      color: #b45309;
+      border-color: rgba(217, 119, 6, 0.3);
     }
 
     .settlement {
@@ -1091,6 +1108,20 @@
       return map;
     }
 
+    function tradeIntentClass(buy) {
+      const intent = String(buy?.intent ?? '').toLowerCase();
+      const reason = String(buy?.reasonTag ?? '').toLowerCase();
+      if (intent === 'force-pair' || reason === 'force-pair') return 'force';
+      if (intent === 'pair-buy' || reason === 'pair-completion') return 'pair';
+      return 'directional';
+    }
+
+    function tradeIntentLabel(cls) {
+      if (cls === 'force') return 'Force Pair';
+      if (cls === 'pair') return 'Arb Pair';
+      return 'Directional Buy';
+    }
+
     function tradeAnnotations(market) {
       const buyEvents = Array.isArray(market.buyEvents) ? market.buyEvents : [];
       return buyEvents.map((buy, index) => {
@@ -1100,7 +1131,7 @@
         return {
           second,
           label: `${id.replace(/^buy-/, 'T')} ${Math.round(second)}s`,
-          intent: String(buy?.intent ?? '').toLowerCase() === 'pair-buy' ? 'pair' : 'directional',
+          intent: tradeIntentClass(buy),
         };
       }).filter(Boolean);
     }
@@ -1406,8 +1437,8 @@
         .map((annotation, index) => {
           const second = Math.max(0, Math.min(300, Number(annotation.second)));
           const x = paddingX + (second / 300) * usableWidth;
-          const lineClass = annotation.intent === 'pair' ? 'graph-trade-line-pair' : 'graph-trade-line-directional';
-          const badgeClass = annotation.intent === 'pair' ? 'graph-trade-badge-pair' : 'graph-trade-badge-directional';
+          const lineClass = `graph-trade-line-${annotation.intent}`;
+          const badgeClass = `graph-trade-badge-${annotation.intent}`;
           const y = paddingY + 4 + ((index % 4) * 14);
           const label = escapeHtml(annotation.label ?? `${Math.round(second)}s`);
           const badgeWidth = Math.max(34, (String(annotation.label ?? '').length * 5.9) + 8);
@@ -1453,7 +1484,7 @@
           const mapping = pairMap.get(buyId);
           const pairIds = Array.isArray(mapping?.pairIds) ? mapping.pairIds : [];
           const paired = pairIds.length > 0;
-          const tradeIntent = String(buy?.intent ?? '').toLowerCase() === 'pair-buy' ? 'pair' : 'directional';
+          const tradeIntent = tradeIntentClass(buy);
           return `
             <div class="buy-item ${paired ? 'paired' : 'unpaired'}">
               <div class="head">
@@ -1461,7 +1492,7 @@
                 <span>${money(buy?.usdc)}</span>
               </div>
               <div class="trade-chip-row">
-                <span class="trade-chip ${tradeIntent === 'pair' ? 'pair' : 'directional'}">${tradeIntent === 'pair' ? 'Pair Buy' : 'Directional Buy'}</span>
+                <span class="trade-chip ${tradeIntent}">${tradeIntentLabel(tradeIntent)}</span>
                 <span class="trade-chip ${paired ? 'good' : 'warn'}">${paired ? 'Paired' : 'Unpaired'}</span>
                 ${paired ? `<span class="trade-chip good">Pair IDs: ${escapeHtml(pairIds.join(', '))}</span>` : ''}
               </div>
@@ -1551,7 +1582,8 @@
             <div class="graph-legend">
               <span class="legend-item"><span class="legend-swatch" style="background:#0f766e;"></span>Now ${signedMoney(move)}</span>
               <span class="legend-item"><span class="legend-swatch" style="background:rgba(15,118,110,0.55);"></span>Directional buy</span>
-              <span class="legend-item"><span class="legend-swatch" style="background:rgba(180,35,24,0.55);"></span>Pair buy</span>
+              <span class="legend-item"><span class="legend-swatch" style="background:rgba(180,35,24,0.55);"></span>Arb pair</span>
+              <span class="legend-item"><span class="legend-swatch" style="background:rgba(217,119,6,0.7);"></span>Force pair</span>
             </div>
             <div class="graph-shell">${moveChart}</div>
           </section>
@@ -1564,7 +1596,8 @@
               <span class="legend-item"><span class="legend-swatch" style="background:#166534;"></span>Up Ask ${price(market.upBestAsk)}</span>
               <span class="legend-item"><span class="legend-swatch" style="background:#b42318;"></span>Down Ask ${price(market.downBestAsk)}</span>
               <span class="legend-item"><span class="legend-swatch" style="background:rgba(15,118,110,0.55);"></span>Directional buy</span>
-              <span class="legend-item"><span class="legend-swatch" style="background:rgba(180,35,24,0.55);"></span>Pair buy</span>
+              <span class="legend-item"><span class="legend-swatch" style="background:rgba(180,35,24,0.55);"></span>Arb pair</span>
+              <span class="legend-item"><span class="legend-swatch" style="background:rgba(217,119,6,0.7);"></span>Force pair</span>
             </div>
             <div class="graph-shell">${askChart}</div>
           </section>
