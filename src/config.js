@@ -171,6 +171,10 @@ export const BEAT_PROBABILITY_VOL_LAMBDA = parseFloat_('BEAT_PROBABILITY_VOL_LAM
 // 단발성 큰 수익률(거래소 stale 틱 등)이 변동성 추정을 순간적으로 부풀려 확률을
 // 왜곡하는 것을 방지한다. 예) 4 이면 한 틱이 현재 분산의 4배를 넘지 못함.
 export const BEAT_PROBABILITY_VOL_MAX_JUMP_RATIO = parseFloat_('BEAT_PROBABILITY_VOL_MAX_JUMP_RATIO', 4);
+// σ 하한(bps, per-√second). 실현 변동성이 비정상적으로 작을 때(가격 정체) 작은
+// 가격 출렁임에도 확률이 급변(whipsaw)하는 것을 막기 위해 σ 의 최소값을 둔다.
+// 예) 1.5 → per-√second σ 하한 0.00015. 0 이면 비활성.
+export const BEAT_PROBABILITY_VOL_MIN_BPS = parseFloat_('BEAT_PROBABILITY_VOL_MIN_BPS', 1.5);
 export const BEAT_PROBABILITY_DRIFT_SHRINK = parseFloat_('BEAT_PROBABILITY_DRIFT_SHRINK', 0.35);
 export const BEAT_PROBABILITY_OFI_WEIGHT = parseFloat_('BEAT_PROBABILITY_OFI_WEIGHT', 0.20);
 export const BEAT_PROBABILITY_CONFIDENCE = parseFloat_('BEAT_PROBABILITY_CONFIDENCE', 0.80);
@@ -262,9 +266,19 @@ export const BEAT_FORCE_PAIR_EV_MARGIN = parseFloat_('BEAT_FORCE_PAIR_EV_MARGIN'
 // 강제 페어를 고려하기 시작하는, 보유 사이드 공정 승률 상한.
 // (pA 가 이 값보다 낮을 때만 = 충분히 불리할 때만 청산 검토)
 export const BEAT_FORCE_PAIR_MAX_WIN_PROB = parseFloat_('BEAT_FORCE_PAIR_MAX_WIN_PROB', 0.45);
-// 한 주(share)당 감수할 수 있는 최대 확정 손실. 반대편이 너무 비싸(=락인 손실이
-// 이보다 크면) 강제 페어 대신 보유로 둔다(망가진 호가에 손실을 못 박지 않도록).
+// 한 주(share)당 "편하게" 감수하는 기본 확정 손실(동적 손실 상한의 하단).
+// 락인 손실이 이 값 이하면 항상 강제 페어를 허용한다.
 export const BEAT_FORCE_PAIR_MAX_LOSS_PER_SHARE = parseFloat_('BEAT_FORCE_PAIR_MAX_LOSS_PER_SHARE', 0.20);
+// 한 주(share)당 절대 넘지 않는 파국적 손실 상한(동적 손실 상한의 상단).
+// 강제 페어의 목적은 "완전 손실(complete loss)을 피하고 감내 가능한 손실만 확정"하는 것이라,
+// 보유 사이드가 질 가능성(1-pA)과 남은 시간 압박이 커질수록 허용 손실을
+// MAX_LOSS_PER_SHARE → 이 값까지 동적으로 키운다. 단 이 값은 넘지 않는다
+// (망가진/정체된 호가에 무의미하게 큰 손실을 못 박도록 하는 안전 천장).
+export const BEAT_FORCE_PAIR_CATASTROPHIC_LOSS_PER_SHARE = parseFloat_('BEAT_FORCE_PAIR_CATASTROPHIC_LOSS_PER_SHARE', 0.50);
+// 최소 보유 시간(초): 방향성 진입 후 이 시간이 지나야 강제 페어를 고려한다.
+// 진입 직후 모델이 1~2틱 뒤집힌 것만으로 손실을 확정(패닉 락인)하는 것을 막는다.
+// 엔드게임(마감 임박)에서는 손실 상한이 우선이므로 이 가드를 무시한다.
+export const BEAT_FORCE_PAIR_MIN_HOLD_SECONDS = parseInt_('BEAT_FORCE_PAIR_MIN_HOLD_SECONDS', 20);
 // 엔드게임 백스톱: 종료 이 시간(초) 전부터는, 보유 사이드가 불리하면(pA<0.5)
 // +EV 마진을 완화해서라도 강제 페어로 손실을 상한한다(설정 손실 한도는 유지).
 export const BEAT_FORCE_PAIR_ENDGAME_SECONDS = parseInt_('BEAT_FORCE_PAIR_ENDGAME_SECONDS', 30);

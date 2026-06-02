@@ -132,6 +132,8 @@ export class BeatTrader {
     this._loopCount = 0;
     // 엣지 지속성(연속 스냅샷 동안 임계 이상 유지된 횟수). 단발 outlier 진입 방지.
     this._edgeStreak = { Up: 0, Down: 0 };
+    // 사이드별 가장 최근 "방향성" 매수 시각(ms). 강제 페어 최소 보유 시간 가드용.
+    this._lastDirectionalBuyAt = { Up: 0, Down: 0 };
   }
 
   // ── 메인 라이프사이클 ────────────────────────────────────────────────────────
@@ -608,7 +610,12 @@ export class BeatTrader {
     const evMargin = Number(cfg.BEAT_FORCE_PAIR_EV_MARGIN);
     const maxWinProb = Number(cfg.BEAT_FORCE_PAIR_MAX_WIN_PROB);
     const maxLossPerShare = Number(cfg.BEAT_FORCE_PAIR_MAX_LOSS_PER_SHARE);
+    const catastrophicLossPerShare = Math.max(
+      maxLossPerShare,
+      Number(cfg.BEAT_FORCE_PAIR_CATASTROPHIC_LOSS_PER_SHARE),
+    );
     const pairCostMax = Number(cfg.BEAT_ARB_PAIR_COST_MAX);
+    const windowSeconds = Number(cfg.MARKET_WINDOW_SECONDS) || 300;
 
     // 모델 부재 시 정산 규칙으로 "지는 중" 판정에 쓸 합의가/기준가.
     const consensusPrice = Number(snapshot?.hub?.consensusPrice);
@@ -618,6 +625,24 @@ export class BeatTrader {
     for (const heldSide of ['Up', 'Down']) {
       const unpairedShares = this._unpairedShares(heldSide);
       if (unpairedShares <= 1e-6) continue;
+
+      // 최소 보유 시간 가드: 방금 진입한 포지션을 모델이 1~2틱 뒤집혔다는 이유로
+      // 즉시 손실 확정하지 않는다. 진입 후 N초가 지나야 강제 페어를 고려한다.
+      // 단, 엔드게임(마감 임박)에서는 손실 상한이 우선이므로 이 가드를 무시한다.
+      const minHoldMs = Math.max(0, Number(cfg.BEAT_FORCE_PAIR_MIN_HOLD_SECONDS) || 0) * 1000;
+      if (!endgame && minHoldMs > 0) {
+        const heldSinceMs = Date.now() - Number(this._lastDirectionalBuyAt[heldSide] ?? 0);
+        if (heldSinceMs < minHoldMs) {
+          this._recordAudit('force_pair_skip', {
+            reason: 'min-hold-not-elapsed',
+            heldSide,
+            heldSinceMs: Math.round(heldSinceMs),
+            minHoldMs,
+            secondsLeft,
+          });
+          continue;
+        }
+      }
 
       const oppSide = this._oppositeSide(heldSide);
       const oppLeg = oppSide === 'Up' ? pm.up : pm.down;
@@ -637,16 +662,6 @@ export class BeatTrader {
       const lockedValuePerShare = 1 - oppAsk - oppUnitFee;        // 페어 완성 시 1주 가치
       const lockedPnlPerShare = lockedValuePerShare - heldAvgCost - heldUnitFee;
       const lockedLossPerShare = Math.max(0, -lockedPnlPerShare);
-
-      // 락인 손실이 허용치를 넘으면(반대편이 너무 비쌈) 강제 페어하지 않는다.
-      if (lockedLossPerShare > maxLossPerShare + 1e-9) {
-        this._recordAudit('force_pair_skip', {
-          reason: 'locked-loss-too-large',
-          heldSide, oppSide, heldAvgCost, oppAsk, lockedLossPerShare, maxLossPerShare,
-          secondsLeft, modelOk,
-        });
-        continue;
-      }
 
       // ── 청산 판단 ──────────────────────────────────────────────────────────
       let shouldExit = false;
@@ -692,6 +707,41 @@ export class BeatTrader {
         continue;
       }
 
+      // ── 동적 손실 상한 가드 ───────────────────────────────────────────────
+      // 강제 페어의 목적은 "완전 손실(보유→정산 패배 시 매몰비용 c 전액 손실)"을 피하고
+      // "감내 가능한 손실"만 확정하는 것이다. 완성 페어의 락인 손실(c+a+fee-1)은 항상
+      // 완전 손실 c 보다 작으므로(반대편 a<1), 원칙적으로 잠그는 게 보유보다 낫다.
+      //
+      // 따라서 고정 손실 한도로 "깊게 질수록 강제 페어를 막는" 역설을 없애고,
+      // 허용 손실을 동적으로 키운다:
+      //   - 보유 사이드가 불리할수록(pA 가 낮을수록 → severity↑)
+      //   - 마감이 가까울수록(timeFrac↑)
+      // 허용치를 base(MAX_LOSS_PER_SHARE) → catastrophic(CATASTROPHIC_LOSS_PER_SHARE) 로 확장.
+      // catastrophic 천장만은 절대 넘지 않는다(반대편 ask 가 1 에 근접한 망가진/정체 호가일 때,
+      // 락인 이득이 미미하면서 자본만 소진하는 무의미한 락인을 막는 안전장치).
+      let severity;
+      if (Number.isFinite(pA)) {
+        // pA=0.5 → 0(불리하지 않음), pA=0 → 1(완전 불리).
+        severity = clamp((0.5 - pA) / 0.5, 0, 1);
+      } else {
+        // 모델 부재 + 엔드게임에서 "지는 중"으로 판정된 경로 → 완전 불리로 간주.
+        severity = 1;
+      }
+      const timeLeft = Number.isFinite(secondsLeft) ? secondsLeft : windowSeconds;
+      const timeFrac = clamp(1 - timeLeft / windowSeconds, 0, 1);
+      const escalation = Math.max(severity, timeFrac);
+      const dynamicLossCap = maxLossPerShare + (catastrophicLossPerShare - maxLossPerShare) * escalation;
+
+      if (lockedLossPerShare > dynamicLossCap + 1e-9) {
+        this._recordAudit('force_pair_skip', {
+          reason: 'locked-loss-exceeds-dynamic-cap',
+          heldSide, oppSide, heldAvgCost, oppAsk, lockedLossPerShare,
+          dynamicLossCap, maxLossPerShare, catastrophicLossPerShare,
+          severity, timeFrac, pA, secondsLeft, modelOk,
+        });
+        continue;
+      }
+
       this.log.info('BeatTrader v2: force-pair exit', {
         heldSide, oppSide, unpairedShares: unpairedShares.toFixed(4),
         reason: decisionReason, pA: Number.isFinite(pA) ? pA.toFixed(4) : null,
@@ -701,6 +751,7 @@ export class BeatTrader {
       this._recordAudit('force_pair_trigger', {
         heldSide, oppSide, unpairedShares, reason: decisionReason, pA,
         oppAsk, oppUnitFee, heldAvgCost, lockedValuePerShare, lockedPnlPerShare, lockedLossPerShare,
+        dynamicLossCap, severity, timeFrac,
         consensusPrice: Number.isFinite(consensusPrice) ? consensusPrice : null,
         beatPrice: Number.isFinite(beatPrice) ? beatPrice : null,
         endgame, modelOk, secondsLeft,
@@ -963,6 +1014,12 @@ export class BeatTrader {
     this.tradeSummary.moveAtBuyUsd = move;
     this.tradeSummary.moveAtBuyPct = movePct;
     this.tradeSummary.btcPriceAtBuy = Number.isFinite(consensus) ? consensus : null;
+
+    // 강제 페어 최소 보유 시간 가드용: 방향성 매수 시각 기록.
+    // (force-pair / pair-completion 같은 청산성 매수는 보유 시계를 리셋하지 않는다.)
+    if (reasonTag === 'directional') {
+      this._lastDirectionalBuyAt[side] = Date.now();
+    }
 
     // 페어 매칭(반대편 미페어 로트와 즉시 상계 → 잠금 이익 기록).
     this._reconcilePairs();

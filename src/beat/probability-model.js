@@ -155,8 +155,17 @@ export function computeFairProbability({
   const ref = Number(hub?.timeMs) || Date.now();
   const lambda = Number(config.BEAT_PROBABILITY_VOL_LAMBDA) || 0.97;
   const volJumpCap = Number(config.BEAT_PROBABILITY_VOL_MAX_JUMP_RATIO) || 0;
-  const sigmaPerSqrtSecond = ewmaSigmaPerSqrtSecond(priceHistory, lambda, volJumpCap);
+  let sigmaPerSqrtSecond = ewmaSigmaPerSqrtSecond(priceHistory, lambda, volJumpCap);
   if (!Number.isFinite(sigmaPerSqrtSecond) || sigmaPerSqrtSecond <= 0) return null;
+
+  // σ 하한: 실현 변동성이 비정상적으로 작을 때(가격 정체) z = x/(σ√τ) 가 과도하게
+  // 커져 작은 가격 출렁임에도 확률이 급변(whipsaw)하는 것을 막는다. 하한은 가격 대비
+  // bps(연간/절대 아님, per-√second 로그수익률 스케일)로 정의해 심볼 무관하게 적용.
+  const volMinBps = Number(config.BEAT_PROBABILITY_VOL_MIN_BPS);
+  if (Number.isFinite(volMinBps) && volMinBps > 0) {
+    const sigmaFloor = volMinBps / 10_000; // 로그수익률 근사: bps 그대로 per-√second
+    if (sigmaPerSqrtSecond < sigmaFloor) sigmaPerSqrtSecond = sigmaFloor;
+  }
 
   // 종료에 매우 근접하면 사실상 확정.
   if (!Number.isFinite(tau) || tau <= 0) {
