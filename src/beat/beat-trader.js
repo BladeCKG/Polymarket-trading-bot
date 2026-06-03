@@ -95,6 +95,7 @@ export class BeatTrader {
     this.halted = false;
     this.beatPrice = null;
     this.totalSpent = 0;
+    this.totalFeesUsdc = 0;   // 누적 매수 테이커 수수료(USDC). PnL 에서 차감한다.
     this.settledPayoutUsdc = 0;
     this.lastBuyAt = 0;
     this.lastOutcome = null;
@@ -110,6 +111,7 @@ export class BeatTrader {
       chosenSide: null,
       buyShares: 0,
       buyUsdc: 0,
+      buyFeesUsdc: 0,
       buyPrice: null,
       buyCount: 0,
       buyEvents: [],
@@ -261,14 +263,16 @@ export class BeatTrader {
     this.log.info('BeatTrader v2: complete', {
       beatPrice: this.beatPrice,
       totalSpent: this.totalSpent.toFixed(4),
+      totalFeesUsdc: this.totalFeesUsdc.toFixed(4),
       settledPayoutUsdc: this.settledPayoutUsdc.toFixed(4),
-      netPnl: (this.settledPayoutUsdc - this.totalSpent).toFixed(4),
+      netPnl: (this.settledPayoutUsdc - this.totalSpent - this.totalFeesUsdc).toFixed(4),
     });
     this._recordAudit('market_complete', {
       beatPrice: this.beatPrice,
       totalSpent: this.totalSpent,
+      totalFeesUsdc: this.totalFeesUsdc,
       settledPayoutUsdc: this.settledPayoutUsdc,
-      netPnl: this.settledPayoutUsdc - this.totalSpent,
+      netPnl: this.settledPayoutUsdc - this.totalSpent - this.totalFeesUsdc,
       tradeSummary: this.tradeSummary,
       outcome: this.lastOutcome,
     });
@@ -397,19 +401,19 @@ export class BeatTrader {
       this._edgeStreak.Down = 0;
       return;
     }
-    const requiredEdge = Number(cfg.BEAT_PROBABILITY_REQUIRED_EDGE);
     const maxAsk = Number(cfg.BEAT_SIDE_MAX_ASK);
     const minAsk = Number(cfg.BEAT_SIDE_MIN_ASK);
     const maxAge = Number(cfg.BEAT_BOOK_MAX_AGE_MS);
     for (const [side, fairProb, leg] of [['Up', model.pUp, pm.up], ['Down', model.pDown, pm.down]]) {
       const ask = positiveFiniteOrNull(leg?.bestAsk);
       const edge = (ask != null && Number.isFinite(fairProb)) ? fairProb - ask : null;
+      const reqEdge = this._requiredEdgeForAsk(side, ask);
       const qualifies = ask != null
         && Number(leg.ageMs) <= maxAge
         && ask <= maxAsk
         && ask >= minAsk
         && edge != null
-        && edge >= requiredEdge;
+        && edge >= reqEdge;
       this._edgeStreak[side] = qualifies ? this._edgeStreak[side] + 1 : 0;
     }
   }
@@ -443,16 +447,18 @@ export class BeatTrader {
     ];
 
     // 각 사이드의 엣지 = fairProb - ask. 양수면 저평가(ask 가 공정확률보다 쌈).
+    // 진입 임계는 수수료를 가산한다(왕복): requiredEdge(ask) = base + mult * unitFee(ask).
     const candidates = sides.map(({ side, fairProb, leg }) => {
       const ask = positiveFiniteOrNull(leg?.bestAsk);
       const edge = (ask != null && Number.isFinite(fairProb)) ? fairProb - ask : null;
+      const reqEdge = this._requiredEdgeForAsk(side, ask);
       let reason = null;
       if (ask == null) reason = 'no-ask';
       else if (Number(leg.ageMs) > Number(cfg.BEAT_BOOK_MAX_AGE_MS)) reason = 'stale-book';
       else if (ask > Number(cfg.BEAT_SIDE_MAX_ASK)) reason = 'ask-too-high';
       else if (ask < Number(cfg.BEAT_SIDE_MIN_ASK)) reason = 'ask-too-low';
-      else if (edge == null || edge < requiredEdge) reason = 'edge-too-small';
-      return { side, fairProb, ask, edge, leg, eligible: reason == null, reason };
+      else if (edge == null || edge < reqEdge) reason = 'edge-too-small';
+      return { side, fairProb, ask, edge, reqEdge, leg, eligible: reason == null, reason };
     });
 
     const eligible = candidates.filter((c) => c.eligible).sort((a, b) => b.edge - a.edge);
@@ -463,7 +469,7 @@ export class BeatTrader {
         fairUp: model.pUp,
         fairDown: model.pDown,
         requiredEdge,
-        candidates: candidates.map((c) => ({ side: c.side, ask: c.ask, edge: c.edge, reason: c.reason })),
+        candidates: candidates.map((c) => ({ side: c.side, ask: c.ask, edge: c.edge, reqEdge: c.reqEdge, reason: c.reason })),
       });
       return;
     }
@@ -593,58 +599,45 @@ export class BeatTrader {
     }
   }
 
-  // 미페어 lot 의 동적 페어 허용 비용 상한(cap)을 arctan 곡선으로 계산한다.
-  //   y = arctan(g·delta)·d + 1        (y = pair cost cap, delta = a - b0)
-  //   p  = 이 lot 매수가,  a = 현재 반대편 ask,  b0 = 매수 시점 반대편 ask
-  //   곡선 중심은 b0(거기서 cap=1). delta>0(반대편 비싸짐=지는 중) 우측, delta<0 좌측.
-  //   d_right = (2/π)·p        → 우측 점근선 1 + p (완전손실 한계)
-  //   d_left  = (2/π)·(1-base) → 좌측 점근선 base(BEAT_ARB_PAIR_COST_MAX)
-  // 기울기 g 는 시간이 아니라 두 앵커로 결정한다(ε = ASYMPTOTE_EPS):
-  //   우측 앵커: c0=1 (a=1, x=1-a0) 에서 cap = (1+p) - ε
-  //     → g_right = tan((π/2)(1 - ε/p)) / (1 - b0)
-  //   좌측 앵커: c0=1-p (a=1-p=a0, x=0) 에서 cap = base + ε
-  //     → g_left = tan((π/2)(1 - ε/(1-base))) / |b0 - (1-p)|
-  // 시간 의존 없음. 반대편 ask 가 b0 에서 멀어질수록(특히 1 쪽) cap 이 점근선에 빠르게 접근.
+  // 미페어 lot 의 동적 페어 허용 비용 상한(cap)을 piecewise-linear 로 계산한다.
+  //   p  = 이 lot 매수가,  a = 현재 반대편 ask,  b0 = 매수 시점 반대편 ask,  heldFee = 보유측 1주 수수료
+  //   ceiling = 1 + p + heldFee   (락인 손실 = pairCost-1 ≤ p+heldFee = 완전손실, 이 이상은 무의미)
+  //   floor   = base(BEAT_ARB_PAIR_COST_MAX)
+  // 곡선 중심은 b0(거기서 cap=1). 반대편이 b0 보다 비싸질수록(delta>0=지는 중) cap 을
+  // 1 → ceiling 으로 선형 증가, 싸질수록(delta<0=이기는 중) cap 을 1 → floor 로 선형 감소.
+  //   delta = a - b0
+  //   delta>=0: cap = 1 + (ceiling-1) * clamp(delta / (1 - b0), 0, 1)     // a=1 에서 ceiling
+  //   delta<0 : cap = 1 + (1-floor)  * clamp(delta / (b0 - (1-p)), -1, 0) // a=1-p 에서 floor
+  // 단순·견고·단조. 시간 의존 없음(필요 시 진입 임계/엔드게임 가드에서 별도 처리).
   _escalatedPairCap(lot, oppAsk) {
     const cfg = this.config;
     const baseCap = Number(cfg.BEAT_ARB_PAIR_COST_MAX);
     if (!cfg.BEAT_ARB_PAIR_LOSS_ESCALATION_ENABLED) return baseCap;
 
     const p = Number(lot?.avgPrice);
-    const a = Number(oppAsk);                    // c0 = 현재 반대편 ask
+    const a = Number(oppAsk);                    // 현재 반대편 ask
     const b0raw = Number(lot?.oppAskAtBuy);      // 매수 시점 반대편 ask
     if (!Number.isFinite(p) || !Number.isFinite(a) || p <= 0) return baseCap;
 
-    const upperCeiling = 1 + p;                  // delta>0 점근선(완전손실 한계)
-    const lowerFloor = baseCap;                  // delta<0 점근선
-    if (upperCeiling <= lowerFloor) return baseCap;
+    const heldFee = this._unitFeeUsdc(lot?.side ?? 'Up', p);
+    const ceiling = 1 + p + heldFee;             // 완전손실 한계(락인 손실 ≤ 완전손실)
+    const floor = baseCap;
+    if (ceiling <= floor) return baseCap;
 
     // b0 정보가 없으면(구 lot) 손익분기 기준으로 폴백.
     const b0 = Number.isFinite(b0raw) ? b0raw : (1 - p);
-    const delta = a - b0;                        // 곡선 중심(b0) 기준 변화량
+    const delta = a - b0;
 
-    const eps = Math.max(1e-6, Number(cfg.BEAT_ARB_PAIR_ARCTAN_ASYMPTOTE_EPS) || 0.001);
-    const HALF_PI = Math.PI / 2;
-    const MIN_DIST = 1e-4;                        // 0 나눗셈 방지용 최소 거리
-
-    let cap;
     if (delta >= 0) {
-      // 우측: c0=1 에서 cap=(1+p)-ε 가 되도록 g_right 결정.
-      const dUp = Math.max(MIN_DIST, 1 - b0);     // 중심 b0 → c0=1 거리
-      const fracUp = clamp(1 - eps / p, 0, 1 - 1e-9);     // 점근선까지 도달 비율
-      const gRight = Math.tan(HALF_PI * fracUp) / dUp;
-      const dRight = (2 / Math.PI) * (upperCeiling - 1);  // = (2/π)·p
-      cap = Math.atan(gRight * delta) * dRight + 1;
-    } else {
-      // 좌측: c0=1-p 에서 cap=base+ε 가 되도록 g_left 결정.
-      const descent = 1 - lowerFloor;                     // 1 - base
-      const dDn = Math.max(MIN_DIST, Math.abs(b0 - (1 - p)));  // 중심 b0 → c0=1-p 거리
-      const fracDn = clamp(1 - eps / descent, 0, 1 - 1e-9);
-      const gLeft = Math.tan(HALF_PI * fracDn) / dDn;
-      const dLeft = (2 / Math.PI) * descent;              // = (2/π)·(1-base)
-      cap = Math.atan(gLeft * delta) * dLeft + 1;         // delta<0 → cap<1
+      // 우측(지는 중): a=b0 → 1, a=1 → ceiling. 선형.
+      const span = Math.max(1e-6, 1 - b0);
+      const frac = clamp(delta / span, 0, 1);
+      return clamp(1 + (ceiling - 1) * frac, floor, ceiling);
     }
-    return clamp(cap, lowerFloor, upperCeiling);
+    // 좌측(이기는 중): a=b0 → 1, a=1-p → floor. 선형.
+    const spanDn = Math.max(1e-6, b0 - (1 - p));
+    const fracDn = clamp(-delta / spanDn, 0, 1);
+    return clamp(1 - (1 - floor) * fracDn, floor, ceiling);
   }
 
   // ── 매수 실행(드라이런=시뮬레이션, 라이브=IOC) ──────────────────────────────────
@@ -850,8 +843,12 @@ export class BeatTrader {
 
   _registerFill({ side, shares, avgPrice, spentUsdc, reasonTag, fairProb, edge, snapshot }) {
     this.totalSpent += spentUsdc;
+    // 이 체결의 실제 테이커 수수료(USDC). PnL 에서 차감하기 위해 누적한다.
+    const feeUsdc = this._feeUsdc(side, avgPrice, shares);
+    this.totalFeesUsdc += feeUsdc;
+    this.tradeSummary.buyFeesUsdc = (this.tradeSummary.buyFeesUsdc ?? 0) + feeUsdc;
     const lotId = `buy-${this._nextLotId++}`;
-    // oppAskAtBuy(b0): 매수 시점 반대편 best ask. arctan 페어 cap 곡선의 중심점.
+    // oppAskAtBuy(b0): 매수 시점 반대편 best ask. 페어 cap 곡선의 중심점(거기서 cap=1).
     const oppSide = this._oppositeSide(side);
     const oppLegAtBuy = oppSide === 'Up' ? snapshot?.pm?.up : snapshot?.pm?.down;
     const oppAskAtBuy = positiveFiniteOrNull(oppLegAtBuy?.bestAsk);
@@ -877,6 +874,7 @@ export class BeatTrader {
       avgPrice,
       usdc: spentUsdc,
       spentUsdc,
+      feeUsdc,
       fairProb: Number.isFinite(fairProb) ? fairProb : null,
       edge: Number.isFinite(edge) ? edge : null,
       moveAtBuyUsd: move,
@@ -1055,6 +1053,18 @@ export class BeatTrader {
   _unitFeeUsdc(side, price) {
     const { rate, exponent } = this._feeInfoForSide(side);
     return ClobClient.estimateTakerFeeUsdcWithInfo({ shares: 1, price, rate, exponent });
+  }
+
+  /**
+   * ask 가격에서의 진입 자격 엣지 임계. base + 이 다리(directional) 1주 수수료.
+   * 정산까지 보유 시 1주 EV = fairProb - ask - fee 이므로 진입은 이 다리 수수료만
+   * 책임진다. 페어 완성의 반대편 수수료는 _maybeCompletePairs 의 cap 판정(양다리
+   * 수수료 포함)에서 따로 거르므로, 진입에서 또 요구하면 이중 계산이 된다.
+   */
+  _requiredEdgeForAsk(side, ask) {
+    const base = Number(this.config.BEAT_PROBABILITY_REQUIRED_EDGE);
+    if (ask == null) return base;
+    return base + this._unitFeeUsdc(side, ask);
   }
 
   /** shares 만큼 매수 시 총 테이커 수수료(USDC). */
@@ -1267,11 +1277,13 @@ export class BeatTrader {
 
     this.lastSettledAt = Date.now();
     this.settledPayoutUsdc += estimatedPayout;
-    const marketPnl = this.settledPayoutUsdc - this.totalSpent;
+    // PnL 은 매수 수수료를 차감한 순손익이다(payout - 매수원금 - 누적 테이커 수수료).
+    const grossPnl = this.settledPayoutUsdc - this.totalSpent;
+    const marketPnl = grossPnl - this.totalFeesUsdc;
     this.pnl.recordRedeem(this.market.slug, estimatedPayout, 'external-auto-redeem');
 
     this._recordAudit('settlement_evaluated', {
-      outcome, estimatedPayout, marketPnl,
+      outcome, estimatedPayout, marketPnl, grossPnl, totalFeesUsdc: this.totalFeesUsdc,
       resolvedPayouts: resolvedMarket?.resolvedPayouts ?? null,
       tradeSummary: this.tradeSummary, lotState: this._lotState(),
     });
@@ -1330,6 +1342,7 @@ export class BeatTrader {
       marketSymbol: traderSymbol(this.market, this.config),
       lifecycle: this.lifecycle,
       totalSpent: this.totalSpent,
+      totalFeesUsdc: this.totalFeesUsdc,
       settledPayoutUsdc: this.settledPayoutUsdc,
       beatPrice: this.beatPrice,
       ...payload,
@@ -1425,6 +1438,8 @@ export class BeatTrader {
       chosenSide: patch.chosenSide ?? this.tradeSummary.chosenSide,
       buyShares: patch.buyShares ?? this.tradeSummary.buyShares,
       buyUsdc: patch.buyUsdc ?? this.tradeSummary.buyUsdc,
+      buyFeesUsdc: patch.buyFeesUsdc ?? this.tradeSummary.buyFeesUsdc,
+      totalFeesUsdc: patch.totalFeesUsdc ?? this.totalFeesUsdc,
       buyPrice: patch.buyPrice ?? this.tradeSummary.buyPrice,
       buyCount: patch.buyCount ?? this.tradeSummary.buyCount,
       buyEvents: patch.buyEvents ?? this.tradeSummary.buyEvents,
@@ -1440,7 +1455,7 @@ export class BeatTrader {
       btcPriceAtBuy: patch.btcPriceAtBuy ?? this.tradeSummary.btcPriceAtBuy,
       tradeOccurred: patch.tradeOccurred ?? Boolean(this.tradeSummary.buyShares > 0),
       outcome: patch.outcome ?? this.lastOutcome,
-      pnl: patch.pnl ?? (this.settledPayoutUsdc - this.totalSpent),
+      pnl: patch.pnl ?? (this.settledPayoutUsdc - this.totalSpent - this.totalFeesUsdc),
       settledPayoutUsdc: patch.settledPayoutUsdc ?? this.settledPayoutUsdc,
       settledAt: patch.settledAt ?? null,
       updatedAt: Date.now(),

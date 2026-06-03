@@ -180,6 +180,17 @@ export const BEAT_PROBABILITY_OFI_WEIGHT = parseFloat_('BEAT_PROBABILITY_OFI_WEI
 export const BEAT_PROBABILITY_CONFIDENCE = parseFloat_('BEAT_PROBABILITY_CONFIDENCE', 0.80);
 export const BEAT_PROBABILITY_MIN = parseFloat_('BEAT_PROBABILITY_MIN', 0.05);
 export const BEAT_PROBABILITY_MAX = parseFloat_('BEAT_PROBABILITY_MAX', 0.95);
+// ── 보정(calibration) sharpen ────────────────────────────────────────────────
+// 실측 보정 결과 모델은 과소신(underconfident): "0.13" 이라 한 사건이 실제 0.058,
+// "0.89" 가 실제 0.999(특히 엔드게임). 즉 확률이 0.5 쪽으로 너무 미지근하다.
+// logit 공간에서 gain γ 로 확률을 극단으로 밀어(sharpen) 보정한다:
+//   p_adj = sigmoid( logit(p) · γ ),  γ>1 이면 0/1 쪽으로 더 극단.
+// γ 는 잔여 시간에 따라 base→endgame 으로 키운다(마감 임박일수록 거의 결정적).
+//   γ_eff = γ_base + (γ_endgame - γ_base) · (1 - min(τ, refSec)/refSec)
+// 1.0 이면 보정 없음(과거 동작).
+export const BEAT_PROBABILITY_CALIB_GAIN_BASE = parseFloat_('BEAT_PROBABILITY_CALIB_GAIN_BASE', 1.6);
+export const BEAT_PROBABILITY_CALIB_GAIN_ENDGAME = parseFloat_('BEAT_PROBABILITY_CALIB_GAIN_ENDGAME', 3.0);
+export const BEAT_PROBABILITY_CALIB_REF_SECONDS = parseInt_('BEAT_PROBABILITY_CALIB_REF_SECONDS', 300);
 export const BEAT_PAIR_COMPLETION_ENABLED = parseBool_('BEAT_PAIR_COMPLETION_ENABLED', true);
 export const BEAT_PAIR_COMPLETION_MIN_PROBABILITY = parseFloat_('BEAT_PAIR_COMPLETION_MIN_PROBABILITY', 0.55);
 export const BEAT_PAIR_COMPLETION_DRIFT_SHRINK = parseFloat_('BEAT_PAIR_COMPLETION_DRIFT_SHRINK', 0.25);
@@ -255,21 +266,16 @@ export const BEAT_SIDE_MIN_ASK = parseFloat_('BEAT_SIDE_MIN_ASK', 0.02);
 export const BEAT_EDGE_PERSISTENCE_SNAPSHOTS = parseInt_('BEAT_EDGE_PERSISTENCE_SNAPSHOTS', 3);
 
 // ── 미페어 방향성 lot 의 동적 페어 비용 상향(손실 축소 청산) ───────────────────
-// 미페어로 남은 방향성 lot 의 "페어 허용 비용 상한(pairCostMax)"을 arctan 곡선으로
+// 미페어로 남은 방향성 lot 의 "페어 허용 비용 상한(pairCostMax)"을 piecewise-linear 로
 // 계산한다. 곡선의 중심은 "매수 시점 반대편 ask(b0)"이며, 거기서 cap=1 이다.
-//   p     = 이 lot 매수가,  a = 현재 반대편 ask,  b0 = 매수 시점 반대편 ask
-//   delta = a - b0          (매수 후 반대편가 변화량)
-//   cap   = arctan(g·delta)·d + 1
-//   - delta>0(반대편 비싸짐=지는 중): d=(2/π)·p        → 점근선 1+p (완전손실 한계)
-//   - delta<0(반대편 싸짐=이기는 중): d=(2/π)·(1-base)  → 점근선 base(BEAT_ARB_PAIR_COST_MAX)
-//   - delta=0:                        cap=1
-// 기울기 g 는 시간이 아니라 두 앵커로 결정한다(ε = ASYMPTOTE_EPS):
-//   우측: a=1 일 때 cap = (1+p) - ε        → g_right = tan((π/2)(1-ε/p)) / (1-b0)
-//   좌측: a=1-p(기대가) 일 때 cap ≈ base + ε → g_left  = tan((π/2)(1-ε/(1-base))) / |b0-(1-p)|
-//   (좌측 점근선이 base 라 요청한 base-ε 는 도달 불가 → 도달 가능한 base+ε 로 해석)
+//   p = 이 lot 매수가,  a = 현재 반대편 ask,  b0 = 매수 시점 반대편 ask,  heldFee = 보유측 수수료
+//   ceiling = 1 + p + heldFee  (락인 손실 = pairCost-1 ≤ p+heldFee = 완전손실, 그 이상 무의미)
+//   floor   = base(BEAT_ARB_PAIR_COST_MAX)
+//   delta = a - b0
+//   delta>=0(반대편 비싸짐=지는 중): cap = 1→ceiling 선형(a=1 에서 ceiling). 손실 감수 페어 허용.
+//   delta<0 (반대편 싸짐=이기는 중): cap = 1→floor   선형(a=1-p 에서 floor). 무위험 페어만.
+// 시간 의존 없음. _escalatedPairCap 참조.
 export const BEAT_ARB_PAIR_LOSS_ESCALATION_ENABLED = parseBool_('BEAT_ARB_PAIR_LOSS_ESCALATION_ENABLED', true);
-// 앵커 점에서 점근선까지 남겨두는 간격 ε. 작을수록 앵커에서 cap 이 점근선에 더 바짝 붙는다.
-export const BEAT_ARB_PAIR_ARCTAN_ASYMPTOTE_EPS = parseFloat_('BEAT_ARB_PAIR_ARCTAN_ASYMPTOTE_EPS', 0.001);
 
 
 // 라이브 매수 후, API 응답이 불확실할 때 온체인 OrderFilled 확정을 기다리는 최대 시간(ms).

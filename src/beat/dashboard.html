@@ -1570,6 +1570,7 @@
               </div>
               <div class="meta">
                 ${buy?.shares != null ? `${Number(buy.shares).toFixed(4)} shares` : '-'} at ${price(buy?.price)}
+                ${Number.isFinite(Number(buy?.feeUsdc)) ? ` • fee ${money(buy.feeUsdc)}` : ''}
                 ${buyMovePct != null ? ` • move ${signedMoney(buyMove)} (${buyMovePct >= 0 ? '+' : ''}${Number(buyMovePct).toFixed(2)}%)` : ''}
                 ${buy?.recordedAt ? ` • ${secondsAfterMarketOpen(buy, market)}` : ''}
               </div>
@@ -1604,6 +1605,7 @@
             <div class="summary-box"><div class="label">Chosen Side</div><div class="value">${market.chosenSide || '-'}</div></div>
             <div class="summary-box"><div class="label">Buy Shares</div><div class="value">${market.buyShares != null ? Number(market.buyShares).toFixed(4) : '-'}</div></div>
             <div class="summary-box"><div class="label">Total Buy USDC</div><div class="value">${money(market.buyUsdc)}</div></div>
+            <div class="summary-box"><div class="label">Fees Paid</div><div class="value">${money(market.totalFeesUsdc ?? market.buyFeesUsdc)}</div></div>
             <div class="summary-box"><div class="label">Buy Price</div><div class="value">${price(market.buyPrice)}</div></div>
             <div class="summary-box"><div class="label">Buy Count</div><div class="value">${market.buyCount != null ? Number(market.buyCount) : '-'}</div></div>
             <div class="summary-box"><div class="label">Paired Shares</div><div class="value">${Number(market.pairedShares ?? 0).toFixed(4)}</div></div>

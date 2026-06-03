@@ -209,7 +209,24 @@ export function computeFairProbability({
   const confidence = clamp(Number(config.BEAT_PROBABILITY_CONFIDENCE) || 0.80, 0, 1);
   const minP = clamp(Number(config.BEAT_PROBABILITY_MIN) || 0.02, 0, 0.5);
   const maxP = clamp(Number(config.BEAT_PROBABILITY_MAX) || 0.98, 0.5, 1);
-  let pUp = clamp(0.5 + (confidence * (pRaw - 0.5)), minP, maxP);
+  let pUp = clamp(0.5 + (confidence * (pRaw - 0.5)), 1e-6, 1 - 1e-6);
+
+  // 보정(calibration) sharpen: 실측상 모델은 과소신이라 확률을 logit 공간에서 gain γ 로
+  // 극단으로 민다. γ 는 마감 임박일수록 키운다(엔드게임은 거의 결정적).
+  const gBase = Number(config.BEAT_PROBABILITY_CALIB_GAIN_BASE);
+  const gEnd = Number(config.BEAT_PROBABILITY_CALIB_GAIN_ENDGAME);
+  const refSec = Number(config.BEAT_PROBABILITY_CALIB_REF_SECONDS) || 300;
+  if (Number.isFinite(gBase) && gBase > 0) {
+    const endFrac = clamp(1 - Math.min(tau, refSec) / refSec, 0, 1);
+    const gEndOk = Number.isFinite(gEnd) && gEnd > 0 ? gEnd : gBase;
+    const gamma = gBase + (gEndOk - gBase) * endFrac;
+    if (Math.abs(gamma - 1) > 1e-9) {
+      const logit = Math.log(pUp / (1 - pUp));
+      pUp = 1 / (1 + Math.exp(-gamma * logit));
+    }
+  }
+
+  pUp = clamp(pUp, minP, maxP);
 
   // 옵션: Polymarket 내재확률을 사전분포로 섞기.
   const priorWeight = clamp(Number(config.BEAT_MODEL_MARKET_PRIOR_WEIGHT) || 0, 0, 1);
