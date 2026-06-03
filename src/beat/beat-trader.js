@@ -19,7 +19,7 @@
  */
 import { BEAT_LIFECYCLE } from './lifecycle.js';
 import { createBeatRuntimeConfig } from './runtime-config.js';
-import { computeFairProbability } from './probability-model.js';
+import { computeFairProbability, escalatedPairCapFromParams } from './probability-model.js';
 import { ClobClient } from '../clob.js';
 import { getTokenBalances, sleep } from '../onchain.js';
 import { msUntil, waitForResolution } from '../market.js';
@@ -75,7 +75,7 @@ export class BeatTrader {
     market,
     wallet,
     pnl,
-    { dashboard = null, hub = null, beatPriceFeed = null, pmFeed = null, fillFeed = null, config = null, onSettled = null } = {},
+    { dashboard = null, hub = null, beatPriceFeed = null, pmFeed = null, fillFeed = null, config = null, onSettled = null, decisionLog = null } = {},
   ) {
     this.market = market;
     this.wallet = wallet;
@@ -87,6 +87,7 @@ export class BeatTrader {
     this._ownsPmFeed = !pmFeed;
     this._fillFeed = fillFeed;
     this.onSettled = typeof onSettled === 'function' ? onSettled : null;
+    this.decisionLog = decisionLog;
     this.config = config ?? createBeatRuntimeConfig();
     this.log = marketLogger(market.slug);
     this.auditLog = marketFileLogger(market.slug);
@@ -323,6 +324,7 @@ export class BeatTrader {
         const model = this._evaluateModel(snapshot);
         this._recordSnapshotAudit(snapshot, model);
         this._publishSnapshot(snapshot, model);
+        this._recordReplaySnapshot(snapshot, model);
 
         // 엣지 지속성 갱신(매 스냅샷). 단발 outlier 면 streak 가 리셋된다.
         this._updateEdgeStreak(snapshot, model);
@@ -609,35 +611,20 @@ export class BeatTrader {
   //   delta>=0: cap = 1 + (ceiling-1) * clamp(delta / (1 - b0), 0, 1)     // a=1 에서 ceiling
   //   delta<0 : cap = 1 + (1-floor)  * clamp(delta / (b0 - (1-p)), -1, 0) // a=1-p 에서 floor
   // 단순·견고·단조. 시간 의존 없음(필요 시 진입 임계/엔드게임 가드에서 별도 처리).
-  _escalatedPairCap(lot, oppAsk) {
+  _escalatedPairCap(lot, oppAsk, snapshot = null) {
     const cfg = this.config;
     const baseCap = Number(cfg.BEAT_ARB_PAIR_COST_MAX);
     if (!cfg.BEAT_ARB_PAIR_LOSS_ESCALATION_ENABLED) return baseCap;
-
     const p = Number(lot?.avgPrice);
-    const a = Number(oppAsk);                    // 현재 반대편 ask
-    const b0raw = Number(lot?.oppAskAtBuy);      // 매수 시점 반대편 ask
-    if (!Number.isFinite(p) || !Number.isFinite(a) || p <= 0) return baseCap;
-
+    if (!Number.isFinite(p) || p <= 0) return baseCap;
     const heldFee = this._unitFeeUsdc(lot?.side ?? 'Up', p);
-    const ceiling = 1 + p + heldFee;             // 완전손실 한계(락인 손실 ≤ 완전손실)
-    const floor = baseCap;
-    if (ceiling <= floor) return baseCap;
-
-    // b0 정보가 없으면(구 lot) 손익분기 기준으로 폴백.
-    const b0 = Number.isFinite(b0raw) ? b0raw : (1 - p);
-    const delta = a - b0;
-
-    if (delta >= 0) {
-      // 우측(지는 중): a=b0 → 1, a=1 → ceiling. 선형.
-      const span = Math.max(1e-6, 1 - b0);
-      const frac = clamp(delta / span, 0, 1);
-      return clamp(1 + (ceiling - 1) * frac, floor, ceiling);
-    }
-    // 좌측(이기는 중): a=b0 → 1, a=1-p → floor. 선형.
-    const spanDn = Math.max(1e-6, b0 - (1 - p));
-    const fracDn = clamp(-delta / spanDn, 0, 1);
-    return clamp(1 - (1 - floor) * fracDn, floor, ceiling);
+    return escalatedPairCapFromParams({
+      p, a: oppAsk, b0: lot?.oppAskAtBuy, heldFee, baseCap, enabled: true,
+      tau: snapshot ? Number(snapshot.secondsLeft) : null,
+      windowSeconds: Number(cfg.MARKET_WINDOW_SECONDS) || 300,
+      timeFloor: Number(cfg.BEAT_ARB_PAIR_TIME_FLOOR),
+      timeExp: Number(cfg.BEAT_ARB_PAIR_TIME_EXPONENT),
+    });
   }
 
   // ── 매수 실행(드라이런=시뮬레이션, 라이브=IOC) ──────────────────────────────────
@@ -1282,6 +1269,9 @@ export class BeatTrader {
     const marketPnl = grossPnl - this.totalFeesUsdc;
     this.pnl.recordRedeem(this.market.slug, estimatedPayout, 'external-auto-redeem');
 
+    // 결정 로그 라벨링·flush(이 마켓의 prob/pair 샘플에 outcome 라벨 부여 후 한 파일에 append).
+    this.decisionLog?.finalizeMarket(this.market.slug, { outcome, beatPrice: this.beatPrice });
+
     this._recordAudit('settlement_evaluated', {
       outcome, estimatedPayout, marketPnl, grossPnl, totalFeesUsdc: this.totalFeesUsdc,
       resolvedPayouts: resolvedMarket?.resolvedPayouts ?? null,
@@ -1347,6 +1337,71 @@ export class BeatTrader {
       beatPrice: this.beatPrice,
       ...payload,
     });
+  }
+
+  // 매 루프 틱의 시장 상태(replay tape)를 적재. 결과 라벨은 정산 시 부여.
+  // 이 tape 로 임의 파라미터의 진입·페어 로직을 처음부터 재시뮬레이션해 net PnL 계산.
+  _recordReplaySnapshot(snapshot, model) {
+    if (!this.decisionLog) return;
+    const pm = snapshot?.pm;
+    if (!pm) return;
+    const f = model?.ok ? (model.features ?? {}) : {};
+    const fee = this._feeInfoForSide('Up');
+
+    // 첫 스냅샷에 한해 개장 전 워밍업 가격 히스토리를 시드로 적재한다.
+    // 라이브 hub 는 윈도우 경계를 넘어 히스토리를 유지하므로 개장 직후(t<MIN_HISTORY)에도
+    // 모델을 평가하지만, replay 는 이 마켓 tape 만 봐서 초반엔 σ/모멘텀 재구성이 불가
+    // (cold-start)했다. 시드를 깔아 replay 도 개장 직후부터 라이브와 동일하게 평가한다.
+    let priceSeed = null;
+    if (!this._replaySeeded) {
+      this._replaySeeded = true;
+      priceSeed = this._buildPriceSeed();
+    }
+
+    this.decisionLog.recordSnapshot(this.market.slug, {
+      t: snapshot.secondsAfterOpen,
+      secondsLeft: snapshot.secondsLeft,
+      consensusPrice: snapshot?.hub?.consensusPrice,
+      beatPrice: this.beatPrice,
+      zBase: model?.ok ? model.zBase : null,
+      momentum: f.momentum ?? null,
+      obi: f.obi ?? null,
+      cvd: f.cvd ?? null,
+      microBias: f.microBias ?? null,
+      upAsk: pm.up?.bestAsk ?? null,
+      downAsk: pm.down?.bestAsk ?? null,
+      upBid: pm.up?.bestBid ?? null,
+      downBid: pm.down?.bestBid ?? null,
+      upAgeMs: pm.up?.ageMs ?? null,
+      downAgeMs: pm.down?.ageMs ?? null,
+      feeRate: fee?.rate ?? null,
+      feeExp: fee?.exponent ?? null,
+      ...(priceSeed && priceSeed.length ? { priceSeed } : {}),
+    });
+  }
+
+  // 개장 전 워밍업 합의가격 시계열을 replay 시드용으로 다운샘플해 반환.
+  // [[tRel(개장후 초, 음수 가능), price], ...]. ~1초 간격, 최근 ~90초로 제한(용량/충분성).
+  _buildPriceSeed() {
+    if (!this.hub || typeof this.hub.priceHistory !== 'function') return null;
+    const hist = this.hub.priceHistory();
+    if (!Array.isArray(hist) || hist.length < 2) return null;
+    const windowOpenMs = Number(this.market.windowTs) * 1000;
+    const newestMs = Number(hist[hist.length - 1]?.timeMs);
+    if (!Number.isFinite(newestMs)) return null;
+    const minMs = newestMs - 90_000; // 최근 90초만(15s min-history + 30s 모멘텀 + 여유)
+    const out = [];
+    let lastKeptMs = -Infinity;
+    for (const pt of hist) {
+      const tMs = Number(pt?.timeMs);
+      const price = Number(pt?.price);
+      if (!Number.isFinite(tMs) || !Number.isFinite(price) || price <= 0) continue;
+      if (tMs < minMs) continue;
+      if (tMs - lastKeptMs < 1_000) continue; // ~1초 간격 다운샘플
+      lastKeptMs = tMs;
+      out.push([Math.round(((tMs - windowOpenMs) / 1000) * 100) / 100, price]);
+    }
+    return out.length >= 2 ? out : null;
   }
 
   _recordSnapshotAudit(snapshot, model) {

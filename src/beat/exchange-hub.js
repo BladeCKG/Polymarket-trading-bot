@@ -26,6 +26,11 @@ import axios from 'axios';
 import logger from '../logger.js';
 
 const PING_INTERVAL_MS = 12_000;
+// 무메시지(stall) 감시: 이 시간 동안 메시지가 전혀 안 오면 소켓이 "조용히 죽은" 것으로
+// 보고 강제 재연결한다. WS 가 close/error 없이 half-open 으로 멈추는 경우(피드 정지)
+// TCP 타임아웃(수십 초)까지 기다리지 않고 빠르게 복구하기 위함이다.
+const STALL_TIMEOUT_MS = 15_000;
+const WATCHDOG_INTERVAL_MS = 5_000;
 const DEPTH_BAND_BPS = 15; // 마이드 대비 ±0.15% 밴드 안의 깊이만 OBI 에 반영
 
 function nowMs() {
@@ -103,6 +108,7 @@ export class ExchangeFeed extends EventEmitter {
     this._closed = false;
     this._reconnectMs = 1_000;
     this._pingTimer = null;
+    this._watchdogTimer = null;
     this._lastMsgAtMs = 0;
   }
 
@@ -114,6 +120,7 @@ export class ExchangeFeed extends EventEmitter {
   stop() {
     this._closed = true;
     this._stopPing();
+    this._stopWatchdog();
     try {
       this._ws?.close();
     } catch {
@@ -131,6 +138,7 @@ export class ExchangeFeed extends EventEmitter {
       this._lastMsgAtMs = nowMs();
       this._subscribe();
       this._startPing();
+      this._startWatchdog();
     });
 
     ws.on('message', (raw) => {
@@ -152,6 +160,7 @@ export class ExchangeFeed extends EventEmitter {
 
     ws.on('close', () => {
       this._stopPing();
+      this._stopWatchdog();
       if (this._closed) return;
       const delay = this._reconnectMs;
       this._reconnectMs = Math.min(this._reconnectMs * 2, 30_000);
@@ -222,6 +231,34 @@ export class ExchangeFeed extends EventEmitter {
     if (this._pingTimer) {
       clearInterval(this._pingTimer);
       this._pingTimer = null;
+    }
+  }
+
+  // 무메시지(stall) 감시기. 소켓이 close/error 없이 조용히 죽는 경우를 감지해
+  // STALL_TIMEOUT_MS 초과 시 강제 terminate → close 이벤트 → 자동 재연결.
+  // 예) 47초 피드 정지 사례: 기존엔 TCP 타임아웃까지 기다렸으나
+  //     이제 15초 내 감지해 즉시 재연결한다.
+  _startWatchdog() {
+    this._stopWatchdog();
+    this._watchdogTimer = setInterval(() => {
+      if (this._closed || !this._ws) return;
+      if (this._ws.readyState !== WebSocket.OPEN) return;
+      const silenceMs = nowMs() - this._lastMsgAtMs;
+      if (silenceMs > STALL_TIMEOUT_MS) {
+        logger.warn('ExchangeFeed: stall detected, force-reconnecting', {
+          exchange: this.exchange, symbol: this.symbol, silenceMs: Math.round(silenceMs),
+        });
+        try { this._ws.terminate(); } catch { /* ignore */ }
+        // terminate() 는 즉시 close 이벤트를 발생시켜 재연결 로직을 트리거한다.
+      }
+    }, WATCHDOG_INTERVAL_MS);
+    this._watchdogTimer.unref?.();
+  }
+
+  _stopWatchdog() {
+    if (this._watchdogTimer) {
+      clearInterval(this._watchdogTimer);
+      this._watchdogTimer = null;
     }
   }
 

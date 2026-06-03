@@ -49,6 +49,52 @@ export function normalCDF(x) {
   return 0.5 * (1 + erf(x / Math.sqrt(2)));
 }
 
+/**
+ * 순수 함수: 미페어 lot 의 페어 허용 비용 상한(cap)을 piecewise-linear 로 계산.
+ * beat-trader._escalatedPairCap 과 동일 수식 — replay/학습에서 재사용한다.
+ *   p=매수가, a=현재 반대편 ask, b0=매수 시점 반대편 ask, heldFee=보유측 1주 수수료
+ *   ceiling = 1 + p + heldFee, floor = baseCap
+ *   delta=a-b0
+ *   delta>=0(지는 중): cap = 1 + (ceiling-1)*frac*timeWeight,  frac=clamp(delta/(1-b0),0,1)
+ *       timeFrac = clamp(1 - tau/window, 0, 1),  timeWeight = timeFloor + (1-timeFloor)*timeFrac^timeExp
+ *       → 잔여 시간이 적을수록(마감 임박) 손실 락인을 더 적극적으로(cap↑). 많이 남으면 보수적.
+ *   delta<0(이기는 중): cap = 1 → floor 선형(a=1-p 에서 floor). 무위험 페어만, 시간 무관.
+ */
+export function escalatedPairCapFromParams({
+  p, a, b0, heldFee = 0, baseCap = 0.97, enabled = true,
+  tau = null, windowSeconds = 300, timeFloor = 0.5, timeExp = 1.0,
+} = {}) {
+  const P = Number(p);
+  const A = Number(a);
+  if (!enabled) return baseCap;
+  if (!Number.isFinite(P) || !Number.isFinite(A) || P <= 0) return baseCap;
+  const hf = Number.isFinite(Number(heldFee)) ? Number(heldFee) : 0;
+  const ceiling = 1 + P + hf;
+  const floor = baseCap;
+  if (ceiling <= floor) return baseCap;
+  const center = Number.isFinite(Number(b0)) ? Number(b0) : (1 - P);
+  const delta = A - center;
+  if (delta >= 0) {
+    const span = Math.max(1e-6, 1 - center);
+    const frac = clamp(delta / span, 0, 1);
+    // 시간 가중: 마감 임박일수록 escalation 강화.
+    const win = Number(windowSeconds) > 0 ? Number(windowSeconds) : 300;
+    const tf = Number.isFinite(Number(tau)) ? clamp(1 - Number(tau) / win, 0, 1) : 1;
+    const tFloor = clamp(Number(timeFloor), 0, 1);
+    const tExp = Math.max(0, Number(timeExp) || 1);
+    const timeWeight = tFloor + (1 - tFloor) * Math.pow(tf, tExp);
+    return clamp(1 + (ceiling - 1) * frac * timeWeight, floor, ceiling);
+  }
+  const spanDn = Math.max(1e-6, center - (1 - P));
+  const fracDn = clamp(-delta / spanDn, 0, 1);
+  return clamp(1 - (1 - floor) * fracDn, floor, ceiling);
+}
+
+function num(v, fallback) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : fallback;
+}
+
 function logReturn(curr, prev) {
   const c = Number(curr);
   const p = Number(prev);
@@ -102,12 +148,18 @@ function sampleAgo(history, msAgo, ref) {
 
 /**
  * 여러 시간대 로그수익률을 σ 로 표준화해 [-1,1] 모멘텀 신호로 만든다.
+ * 시간대별 가중치는 config 로 조정 가능(학습 대상). H1=1s, H2=3s, H3=10s, H4=30s.
  */
-function momentumSignal(history, ref, sigmaPerSqrtSecond) {
+function momentumSignal(history, ref, sigmaPerSqrtSecond, config = {}) {
   if (history.length < 2) return { signal: 0, parts: {} };
   const latest = history[history.length - 1];
   const horizons = [1_000, 3_000, 10_000, 30_000];
-  const weights = { 1000: 0.40, 3000: 0.30, 10000: 0.20, 30000: 0.10 };
+  const weights = {
+    1000: Math.max(0, num(config.BEAT_MODEL_MOMENTUM_H1_WEIGHT, 0.40)),
+    3000: Math.max(0, num(config.BEAT_MODEL_MOMENTUM_H2_WEIGHT, 0.30)),
+    10000: Math.max(0, num(config.BEAT_MODEL_MOMENTUM_H3_WEIGHT, 0.20)),
+    30000: Math.max(0, num(config.BEAT_MODEL_MOMENTUM_H4_WEIGHT, 0.10)),
+  };
   let acc = 0;
   let wAcc = 0;
   const parts = {};
@@ -182,7 +234,7 @@ export function computeFairProbability({
   const zBase = denom > 0 ? x / denom : 0;
 
   // ── 방향 신호 융합 ─────────────────────────────────────────────────────────
-  const { signal: momentum, parts: momentumParts } = momentumSignal(priceHistory, ref, sigmaPerSqrtSecond);
+  const { signal: momentum, parts: momentumParts } = momentumSignal(priceHistory, ref, sigmaPerSqrtSecond, config);
   const obi = clamp(Number(hub?.obi) || 0, -1, 1);
   const cvd = clamp(Number(hub?.cvdRatio) || 0, -1, 1);
   const microBias = clamp(Number(hub?.micropriceBias) || 0, -1, 1);

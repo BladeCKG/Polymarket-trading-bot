@@ -658,6 +658,8 @@ export class BookFeed extends EventEmitter {
     this._ws = null;
     this._pollTimer = null;
     this._heartbeatTimer = null;
+    this._watchdogTimer = null;
+    this._lastWsMsgAtMs = 0;
     this._lastBooks = new Map();
     this._stopped = true;
   }
@@ -702,6 +704,10 @@ export class BookFeed extends EventEmitter {
       clearInterval(this._heartbeatTimer);
       this._heartbeatTimer = null;
     }
+    if (this._watchdogTimer) {
+      clearInterval(this._watchdogTimer);
+      this._watchdogTimer = null;
+    }
   }
 
   _connectWs() {
@@ -710,6 +716,7 @@ export class BookFeed extends EventEmitter {
     this._ws = ws;
 
     ws.on('open', () => {
+      this._lastWsMsgAtMs = Date.now();
       ws.send(JSON.stringify({
         assets_ids: this.tokenIds,
         type: 'market',
@@ -720,9 +727,20 @@ export class BookFeed extends EventEmitter {
           ws.send('PING');
         }
       }, BOOK_HEARTBEAT_MS);
+      // stall watchdog: 소켓이 조용히 죽으면 15초 내 감지해 강제 재연결.
+      this._watchdogTimer = setInterval(() => {
+        if (this._stopped || !this._ws || this._ws.readyState !== WebSocket.OPEN) return;
+        const silenceMs = Date.now() - this._lastWsMsgAtMs;
+        if (silenceMs > 15_000) {
+          logger.warn('BookFeed: WS stall detected, force-reconnecting', { silenceMs: Math.round(silenceMs) });
+          try { this._ws.terminate(); } catch { /* ignore */ }
+        }
+      }, 5_000);
+      this._watchdogTimer.unref?.();
     });
 
     ws.on('message', (buf) => {
+      this._lastWsMsgAtMs = Date.now();
       try {
         const rawText = buf.toString();
         if (!rawText || rawText === 'PONG' || rawText === 'PING') return;

@@ -246,6 +246,11 @@ export const BEAT_MODEL_MOMENTUM_WEIGHT   = parseFloat_('BEAT_MODEL_MOMENTUM_WEI
 export const BEAT_MODEL_OBI_WEIGHT        = parseFloat_('BEAT_MODEL_OBI_WEIGHT', 0.20);
 export const BEAT_MODEL_CVD_WEIGHT        = parseFloat_('BEAT_MODEL_CVD_WEIGHT', 0.25);
 export const BEAT_MODEL_MICROPRICE_WEIGHT = parseFloat_('BEAT_MODEL_MICROPRICE_WEIGHT', 0.15);
+// 모멘텀 신호 내부의 시간대별 가중치(1s/3s/10s/30s 로그수익률 융합). 학습 대상.
+export const BEAT_MODEL_MOMENTUM_H1_WEIGHT = parseFloat_('BEAT_MODEL_MOMENTUM_H1_WEIGHT', 0.40);
+export const BEAT_MODEL_MOMENTUM_H2_WEIGHT = parseFloat_('BEAT_MODEL_MOMENTUM_H2_WEIGHT', 0.30);
+export const BEAT_MODEL_MOMENTUM_H3_WEIGHT = parseFloat_('BEAT_MODEL_MOMENTUM_H3_WEIGHT', 0.20);
+export const BEAT_MODEL_MOMENTUM_H4_WEIGHT = parseFloat_('BEAT_MODEL_MOMENTUM_H4_WEIGHT', 0.10);
 // 방향 신호가 z-score 를 최대 얼마나 이동시킬지 스케일.
 export const BEAT_MODEL_DRIFT_Z_SCALE     = parseFloat_('BEAT_MODEL_DRIFT_Z_SCALE', 1.0);
 // Polymarket 시장 내재확률을 사전분포로 얼마나 섞을지(0=섞지 않음, edge 보존).
@@ -258,6 +263,10 @@ export const BEAT_ENTRY_DELAY_SECONDS = parseInt_('BEAT_ENTRY_DELAY_SECONDS', 5)
 export const BEAT_STOP_BUYING_BEFORE_CLOSE_SECONDS = parseInt_('BEAT_STOP_BUYING_BEFORE_CLOSE_SECONDS', 20);
 // 변동성/모멘텀 추정을 신뢰하기 위한 최소 데이터 누적 시간.
 export const BEAT_MIN_HISTORY_MS = parseInt_('BEAT_MIN_HISTORY_MS', 15_000);
+// replay tape 기록 최소 간격(ms). 루프(~100ms)보다 낮게 설정해 tape 해상도를 제어한다.
+// 낮을수록 replay 정확도↑(파이밍 오차 감소), 높을수록 tape 용량↓ · learn 속도↑.
+// 500: 1s 대비 오차 절반, 용량 2배. 0=제한 없음(루프 속도 그대로, ~100ms).
+export const BEAT_TAPE_RESOLUTION_MS = parseInt_('BEAT_TAPE_RESOLUTION_MS', 500);
 // 방향성 매수를 허용하는 ask 가격 범위.
 export const BEAT_SIDE_MAX_ASK = parseFloat_('BEAT_SIDE_MAX_ASK', 0.95);
 export const BEAT_SIDE_MIN_ASK = parseFloat_('BEAT_SIDE_MIN_ASK', 0.02);
@@ -272,10 +281,28 @@ export const BEAT_EDGE_PERSISTENCE_SNAPSHOTS = parseInt_('BEAT_EDGE_PERSISTENCE_
 //   ceiling = 1 + p + heldFee  (락인 손실 = pairCost-1 ≤ p+heldFee = 완전손실, 그 이상 무의미)
 //   floor   = base(BEAT_ARB_PAIR_COST_MAX)
 //   delta = a - b0
-//   delta>=0(반대편 비싸짐=지는 중): cap = 1→ceiling 선형(a=1 에서 ceiling). 손실 감수 페어 허용.
-//   delta<0 (반대편 싸짐=이기는 중): cap = 1→floor   선형(a=1-p 에서 floor). 무위험 페어만.
-// 시간 의존 없음. _escalatedPairCap 참조.
+//   delta>=0(반대편 비싸짐=지는 중): cap = 1→ceiling 선형 × 시간가중. 손실 감수 페어 허용.
+//       시간가중 = timeFloor + (1-timeFloor)·timeFrac^timeExp,  timeFrac=1-tau/window
+//       → 잔여 시간 적을수록(마감 임박) 손실 락인 적극(cap↑), 많이 남으면 보수적.
+//   delta<0 (반대편 싸짐=이기는 중): cap = 1→floor   선형(a=1-p 에서 floor). 무위험 페어만(시간 무관).
+// 시간 가중은 손실 감수 측(우측)에만 적용. _escalatedPairCap 참조.
 export const BEAT_ARB_PAIR_LOSS_ESCALATION_ENABLED = parseBool_('BEAT_ARB_PAIR_LOSS_ESCALATION_ENABLED', true);
+// 손실 감수(우측) 시간 가중: 개장 시점 가중 하한(0~1). 1 이면 시간 무관(항상 full escalation),
+// 0 이면 개장 시점엔 손실 락인 없음. 잔여=0(마감)에선 항상 1(full).
+export const BEAT_ARB_PAIR_TIME_FLOOR = parseFloat_('BEAT_ARB_PAIR_TIME_FLOOR', 0.5);
+// 시간 가중 곡선 지수(>1 이면 마감 임박에서만 급격히↑, <1 이면 더 일찍부터↑).
+export const BEAT_ARB_PAIR_TIME_EXPONENT = parseFloat_('BEAT_ARB_PAIR_TIME_EXPONENT', 1.5);
+
+// ── 자기학습(walk-forward 검증) ───────────────────────────────────────────────
+// 모델 개선은 in-sample(과거 tape 전체) PnL 증가만으로 판단하면 과최적화된다.
+// 그래서 마켓을 시간순으로 train/validation 으로 나눠, train 으로 최적화한 파라미터가
+// "검증(validation, 미래 구간)"에서도 현재 모델보다 PnL 이 높을 때만 채택한다.
+// 학습에 필요한 최소 마켓 수(파라미터 22개 대비 충분한 표본 확보). 미만이면 학습 보류.
+export const BEAT_LEARN_MIN_MARKETS = parseInt_('BEAT_LEARN_MIN_MARKETS', 120);
+// 전체 마켓 중 검증(validation)에 쓸 최신 구간 비율(0~1). 예) 0.3 → 뒤 30% 가 검증.
+export const BEAT_LEARN_VALIDATION_FRACTION = parseFloat_('BEAT_LEARN_VALIDATION_FRACTION', 0.3);
+// 검증 구간 PnL 이 현재 모델 대비 이 값 이상 증가해야 "개선"으로 채택(0/근사0 은 개선 아님).
+export const BEAT_LEARN_MIN_VALIDATION_GAIN = parseFloat_('BEAT_LEARN_MIN_VALIDATION_GAIN', 0.01);
 
 
 // 라이브 매수 후, API 응답이 불확실할 때 온체인 OrderFilled 확정을 기다리는 최대 시간(ms).

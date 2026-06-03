@@ -56,6 +56,7 @@ export class BeatDashboardServer {
       },
       config,
       stats: {},
+      learning: null,
       logs: [],
       prices: {},
       markets: [],
@@ -129,6 +130,11 @@ export class BeatDashboardServer {
   setStats(stats) {
     this.state.stats = { ...stats };
     this.broadcast('stats', this.state.stats);
+  }
+
+  setLearning(info) {
+    this.state.learning = { ...info };
+    this.broadcast('learning', this.state.learning);
   }
 
   setConfig(config) {

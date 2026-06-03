@@ -12,6 +12,7 @@ import {
   API_PASSPHRASE,
   IS_DEPOSIT_WALLET_FLOW,
   MAX_LOSS_PER_HOUR_USDC,
+  BEAT_TAPE_RESOLUTION_MS,
 } from '../config.js';
 import { BeatDashboardServer } from './dashboard.js';
 import logger from '../logger.js';
@@ -25,6 +26,8 @@ import { ExchangeHub } from './exchange-hub.js';
 import { BeatFillFeed } from './fill-feed.js';
 import { BEAT_LIFECYCLE } from './lifecycle.js';
 import { applyBeatRuntimeConfigPatch, createBeatRuntimeConfig } from './runtime-config.js';
+import { getDecisionLog } from './decision-log.js';
+import { AutoLearner } from './auto-learn.js';
 
 let beatConfig = createBeatRuntimeConfig();
 
@@ -63,6 +66,7 @@ export async function main() {
     : ['BTC'];
 
   let dashboard = null;
+  let autoLearner = null;
   const beatSessionStats = { settledMarkets: 0, tradedMarkets: 0, realizedPnl: 0 };
   const settledMarketSlugs = new Set();
   const tradedSettledMarketSlugs = new Set();
@@ -78,6 +82,8 @@ export async function main() {
       beatSessionStats.tradedMarkets += 1;
     }
     publishStats();
+    // 정산할 때마다 자동 학습 트리거(개선 시 모델 핫 적용).
+    autoLearner?.notifySettled();
   };
 
   if (beatConfig.BEAT_DASHBOARD_ENABLED) {
@@ -156,6 +162,9 @@ export async function main() {
   }
 
   const pnl = new PnlTracker();
+  const decisionLog = getDecisionLog(undefined, { minIntervalMs: BEAT_TAPE_RESOLUTION_MS });
+  // 매 정산마다 자동 학습 → 개선 시 모델 핫 적용. 학습은 백그라운드 직렬 실행이라 매매 비차단.
+  autoLearner = new AutoLearner(beatConfig, { dashboard });
   const runningTasks = new Set();
   const latestStagedSlug = new Map();
   // 같은 윈도우(slug)에 대해 트레이더가 중복 생성되는 것을 막는다.
@@ -212,6 +221,10 @@ export async function main() {
     }
 
     const wts = currentWindowTs(beatConfig.MARKET_WINDOW_SECONDS);
+    // 새 윈도우 시작 시점에만 보류된 개선 모델을 살아있는 config 에 반영한다.
+    // (진행 중 마켓은 시작 때 스냅샷한 config 로 끝까지 동작 → 모델이 중간에 안 바뀜)
+    autoLearner?.applyPending();
+    const windowConfig = { ...beatConfig };  // 이 윈도우 동안 고정될 config 스냅샷.
     const symbolTasks = symbols.map(async (symbol) => {
       const slug = slugFor(wts, symbol);
       // 동일 slug 중복 처리 방지(윈도우 경계 조기 기상으로 인한 재진입 차단).
@@ -234,8 +247,9 @@ export async function main() {
         hub: hubs.get(symbol),
         beatPriceFeed: beatPriceFeeds.get(symbol),
         fillFeed,
-        config: beatConfig,
+        config: windowConfig,
         onSettled: recordSettledMarketStats,
+        decisionLog,
       });
       const task = trader.run()
         .then(() => {

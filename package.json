@@ -33,6 +33,7 @@
     "arb": "node scripts/ensure-deps.mjs && cross-env TRADING_MODE=arb  node src/index.js",
     "copy": "node scripts/ensure-deps.mjs && cross-env TRADING_MODE=copy node src/index.js",
     "beat": "node scripts/ensure-deps.mjs && cross-env TRADING_MODE=beat node src/index.js",
+    "beat:learn": "node src/beat/learn.js",
     "value": "node scripts/ensure-deps.mjs && cross-env TRADING_MODE=value node src/index.js",
     "arb:dev": "node scripts/ensure-deps.mjs && cross-env TRADING_MODE=arb  node --watch src/index.js",
     "copy:dev": "node scripts/ensure-deps.mjs && cross-env TRADING_MODE=copy node --watch src/index.js",

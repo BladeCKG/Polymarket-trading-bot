@@ -1353,14 +1353,71 @@
         { label: 'Settled Markets', value: String(settledMarkets), hint: state.runtime.mode ? `Mode: ${state.runtime.mode}` : '' },
         { label: 'Traded Markets', value: String(tradedMarkets), hint: state.runtime.mode ? `Mode: ${state.runtime.mode}` : '' },
         { label: 'Realized PnL', value: money(realizedPnl), hint: state.runtime.mode ? `Mode: ${state.runtime.mode}` : '' },
+        modelLearningStat(state.learning),
       ];
 
-      topStatsEl.innerHTML = stats.map(({ label, value, hint, html, isTable }) => {
+      topStatsEl.innerHTML = stats.map(({ label, value, hint, html, isTable, rawHtml }) => {
+        if (rawHtml) return rawHtml;
         if (isTable) {
           return `<article class="stat" style="grid-column:1/-1;"><div class="label">${label}</div><div style="overflow-x:auto;">${html}</div></article>`;
         }
         return `<article class="stat"><div class="label">${label}</div><div class="value">${value}</div><div class="hint">${hint}</div></article>`;
       }).join('');
+    }
+
+    // 모델 학습 결과 카드: 매 학습 종료마다 개선 여부 + PnL 증감 + 미페어 건수 등 표시.
+    function modelLearningStat(learning) {
+      if (!learning || typeof learning !== 'object') {
+        return { rawHtml: `<article class="stat"><div class="label">Model Learning</div><div class="value" style="font-size:1rem;">—</div><div class="hint">awaiting first learn</div></article>` };
+      }
+      const improved = Boolean(learning.improved);
+      const before = Number(learning.netBefore);
+      const after = Number(learning.netAfter);
+      const gain = Number.isFinite(Number(learning.netGain)) ? Number(learning.netGain)
+        : (Number.isFinite(before) && Number.isFinite(after) ? after - before : null);
+      const color = improved ? 'var(--good)' : 'var(--muted)';
+      const verdict = improved ? 'IMPROVED' : 'NOT IMPROVED';
+      const reasonText = !improved
+        ? ({ 'no-validation-gain': 'no validation gain', 'val-complete-loss-worsened': 'val complete-loss worsened', 'val-early-loss-worsened': 'val early-loss worsened', 'no-pnl-gain': 'no PnL gain', 'complete-loss-worsened': 'complete-loss worsened', 'early-loss-worsened': 'early-loss worsened', 'insufficient-markets': 'too few markets' }[learning.reason] || (learning.reason || ''))
+        : (learning.status === 'applied' ? 'applied to new market' : 'staged (applies next market)');
+      const deltaText = gain != null ? `${gain >= 0 ? '+' : ''}${money(gain)}` : '-';
+      const ver = learning.version != null ? `v${learning.version} · ` : '';
+      // 전체 마켓 PnL(이전 모델 → 개선 모델).
+      const pnlLine = (Number.isFinite(before) && Number.isFinite(after))
+        ? `PnL (all): ${money(before)} → ${money(after)} (Δ ${deltaText})` : '';
+      // 검증(validation, 미래 구간) PnL — 실제 채택 근거. walk-forward.
+      const vb = Number(learning.valBefore), va = Number(learning.valAfter);
+      const vgain = Number.isFinite(Number(learning.valGain)) ? Number(learning.valGain)
+        : (Number.isFinite(vb) && Number.isFinite(va) ? va - vb : null);
+      const vDeltaText = vgain != null ? `${vgain >= 0 ? '+' : ''}${money(vgain)}` : '-';
+      const valLine = (Number.isFinite(vb) && Number.isFinite(va))
+        ? `Validation PnL: ${money(vb)} → ${money(va)} (Δ ${vDeltaText})` : '';
+      const ub = learning.unpairedBefore, ua = learning.unpairedAfter;
+      const unpairedLine = (ub != null && ua != null)
+        ? `Unpaired buys (val): ${ub} → ${ua}` : '';
+      // 학습/검증 분할 표시.
+      const tm = learning.trainMarkets, vm = learning.valMarkets;
+      const marketsLine = learning.markets != null
+        ? `Replayed markets: ${learning.markets}${(tm != null && vm != null) ? ` (train ${tm} / val ${vm})` : ''}`
+        : '';
+      // 마지막으로 "실제 개선된" 시각(시도 시각 아님).
+      const improvedAt = learning.lastImprovedAt;
+      const improvedAtLine = improvedAt
+        ? `Last improved: ${ts(improvedAt)} (${ago(improvedAt)})`
+        : 'Last improved: never';
+      const evaluatedAt = learning.appliedAt || learning.evaluatedAt;
+      return { rawHtml: `
+        <article class="stat" style="grid-column:1/-1;border:1px solid ${improved ? 'rgba(22,101,52,0.35)' : 'rgba(100,116,139,0.25)'};">
+          <div class="label">Model Learning</div>
+          <div class="value" style="font-size:1.05rem;color:${color};">${verdict}<span style="font-size:0.78rem;color:var(--muted);font-weight:600;"> &nbsp;${ver}${reasonText}</span></div>
+          <div class="hint" style="margin-top:4px;">${improvedAtLine}</div>
+          ${marketsLine ? `<div class="hint">${marketsLine}</div>` : ''}
+          ${valLine ? `<div class="hint" style="font-weight:600;">${valLine}</div>` : ''}
+          ${pnlLine ? `<div class="hint">${pnlLine}</div>` : ''}
+          ${unpairedLine ? `<div class="hint">${unpairedLine}</div>` : ''}
+          ${evaluatedAt ? `<div class="hint" style="color:var(--muted);">last attempt: ${ago(evaluatedAt)}</div>` : ''}
+        </article>
+      ` };
     }
 
     function seriesPoints(market, key) {
@@ -1628,7 +1685,6 @@
         [{ points: movePoints, className: 'graph-line-move' }],
         {
           centerValue: 0,
-          minRadius: 10,
           yFormatter: (value) => signedMoney(value, 0),
           annotations,
         },
@@ -2041,6 +2097,9 @@
         scheduleRender('config');
       } else if (type === 'stats') {
         state.stats = { ...state.stats, ...data };
+        scheduleRender('topStats');
+      } else if (type === 'learning') {
+        state.learning = { ...data };
         scheduleRender('topStats');
       } else if (type === 'log') {
         state.logs = [data, ...state.logs].slice(0, 250);

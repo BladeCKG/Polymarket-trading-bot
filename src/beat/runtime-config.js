@@ -35,6 +35,10 @@ import {
   BEAT_MODEL_OBI_WEIGHT,
   BEAT_MODEL_CVD_WEIGHT,
   BEAT_MODEL_MICROPRICE_WEIGHT,
+  BEAT_MODEL_MOMENTUM_H1_WEIGHT,
+  BEAT_MODEL_MOMENTUM_H2_WEIGHT,
+  BEAT_MODEL_MOMENTUM_H3_WEIGHT,
+  BEAT_MODEL_MOMENTUM_H4_WEIGHT,
   BEAT_MODEL_DRIFT_Z_SCALE,
   BEAT_MODEL_MARKET_PRIOR_WEIGHT,
   BEAT_ENTRY_DELAY_SECONDS,
@@ -44,6 +48,8 @@ import {
   BEAT_SIDE_MIN_ASK,
   BEAT_EDGE_PERSISTENCE_SNAPSHOTS,
   BEAT_ARB_PAIR_LOSS_ESCALATION_ENABLED,
+  BEAT_ARB_PAIR_TIME_FLOOR,
+  BEAT_ARB_PAIR_TIME_EXPONENT,
   BEAT_FILL_CONFIRM_TIMEOUT_MS,
   BEAT_SYMBOLS,
   BEAT_MAX_SLIPPAGE,
@@ -65,6 +71,7 @@ import {
   MARKET_WINDOW_SECONDS,
   REDEEM_DELAY_AFTER_CLOSE,
 } from '../config.js';
+import { learnedConfigOverrides } from './model-store.js';
 
 const DEFAULTS = Object.freeze({
   BEAT_SYMBOLS,
@@ -105,6 +112,10 @@ const DEFAULTS = Object.freeze({
   BEAT_MODEL_OBI_WEIGHT,
   BEAT_MODEL_CVD_WEIGHT,
   BEAT_MODEL_MICROPRICE_WEIGHT,
+  BEAT_MODEL_MOMENTUM_H1_WEIGHT,
+  BEAT_MODEL_MOMENTUM_H2_WEIGHT,
+  BEAT_MODEL_MOMENTUM_H3_WEIGHT,
+  BEAT_MODEL_MOMENTUM_H4_WEIGHT,
   BEAT_MODEL_DRIFT_Z_SCALE,
   BEAT_MODEL_MARKET_PRIOR_WEIGHT,
   BEAT_ENTRY_DELAY_SECONDS,
@@ -113,6 +124,8 @@ const DEFAULTS = Object.freeze({
   BEAT_SIDE_MAX_ASK,
   BEAT_SIDE_MIN_ASK,
   BEAT_ARB_PAIR_LOSS_ESCALATION_ENABLED,
+  BEAT_ARB_PAIR_TIME_FLOOR,
+  BEAT_ARB_PAIR_TIME_EXPONENT,
   BEAT_FILL_CONFIRM_TIMEOUT_MS,
   BEAT_EDGE_PERSISTENCE_SNAPSHOTS,
   BEAT_ORDER_MODE,
@@ -198,10 +211,14 @@ function coerceValue(key, value) {
 }
 
 export function createBeatRuntimeConfig(overrides = {}) {
+  // 권위 순서(나중이 우선): DEFAULTS(env) < 학습된 모델 파일 < 명시적 overrides 인자.
+  // 학습으로 개선된 파라미터가 .env 설정을 오버라이드한다.
+  const learned = learnedConfigOverrides();
+  const merged = { ...learned, ...overrides };
   return {
     ...DEFAULTS,
     ...Object.fromEntries(
-      Object.entries(overrides)
+      Object.entries(merged)
         .filter(([key]) => key in DEFAULTS)
         .map(([key, value]) => [key, coerceValue(key, value)]),
     ),
