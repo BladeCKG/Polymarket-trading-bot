@@ -147,6 +147,7 @@ export class ClobClient {
   static _signerAddress = null;
   static _takerFeeBpsCache = new Map();
   static _feeInfoCache = new Map();
+  static _marketMetaCache = new Map();
   static _heartbeatId = crypto.randomUUID();
 
   static _normalizeWallet(wallet = null) {
@@ -329,6 +330,37 @@ export class ClobClient {
   }
 
   /**
+   * 주문 서명에 필요한 마켓 메타(negRisk, tickSize)를 토큰ID로 조회·캐싱한다.
+   * negRisk 는 주문 EIP-712 의 verifyingContract(NegRisk Exchange vs 일반 CTF Exchange)를
+   * 결정하므로, 잘못된 값으로 서명하면 CLOB 이 "invalid signature" 로 거부한다.
+   * 따라서 매수 전 실제 마켓의 negRisk 를 반드시 사용해야 한다.
+   */
+  static async getMarketMeta(tokenId) {
+    const key = String(tokenId ?? '').trim();
+    if (!key) return { negRisk: false, tickSize: Number(DEFAULT_TICK_SIZE) };
+    if (this._marketMetaCache.has(key)) return this._marketMetaCache.get(key);
+
+    const client = this._requireSdkClient();
+    let negRisk = false;
+    let tickSize = Number(DEFAULT_TICK_SIZE);
+    try {
+      negRisk = Boolean(await client.getNegRisk(key));
+    } catch (err) {
+      logger.warn('CLOB.getMarketMeta: getNegRisk failed, defaulting to false', { tokenId: key, err: err.message });
+      negRisk = false;
+    }
+    try {
+      const ts = Number(await client.getTickSize(key));
+      if (Number.isFinite(ts) && ts > 0) tickSize = ts;
+    } catch (err) {
+      logger.warn('CLOB.getMarketMeta: getTickSize failed, using default', { tokenId: key, err: err.message });
+    }
+    const result = { negRisk, tickSize };
+    this._marketMetaCache.set(key, result);
+    return result;
+  }
+
+  /**
    * 실제 부과 공식 기반 테이커 수수료(USDC).
    *   perShareFee = rate * (price*(1-price))^exponent
    *   totalFee    = shares * perShareFee
@@ -477,7 +509,7 @@ export class ClobClient {
     return extractOrderId(response);
   }
 
-  static async postFOKLimitBuy(_wallet, tokenId, price, shares, negRisk = true) {
+  static async postFOKLimitBuy(_wallet, tokenId, price, shares, negRisk = true, tickSize = DEFAULT_TICK_SIZE) {
     const client = this._requireSdkClient();
     const order = await client.createOrder(
       {
@@ -487,7 +519,7 @@ export class ClobClient {
         side: Side.BUY,
       },
       {
-        tickSize: DEFAULT_TICK_SIZE,
+        tickSize: String(tickSize),
         negRisk,
       },
     );
@@ -511,7 +543,7 @@ export class ClobClient {
     return response;
   }
 
-  static async postIOCBuy(_wallet, tokenId, maxPrice, amountUsdc, negRisk = true) {
+  static async postIOCBuy(_wallet, tokenId, maxPrice, amountUsdc, negRisk = true, tickSize = DEFAULT_TICK_SIZE) {
     return this._requireSdkClient().createAndPostMarketOrder(
       {
         tokenID: String(tokenId),
@@ -521,7 +553,7 @@ export class ClobClient {
         orderType: OrderType.FAK,
       },
       {
-        tickSize: DEFAULT_TICK_SIZE,
+        tickSize: String(tickSize),
         negRisk,
       },
       OrderType.FAK,

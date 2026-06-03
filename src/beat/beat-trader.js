@@ -129,6 +129,8 @@ export class BeatTrader {
     this.walletBalanceUp = 0;
     this.walletBalanceDown = 0;
     this._tokenFeeInfo = new Map();
+    // 주문 서명용 마켓 메타(side -> { negRisk, tickSize }). init 에서 1회 prime.
+    this._marketMeta = new Map();
     this._loopCount = 0;
     // 엣지 지속성(연속 스냅샷 동안 임계 이상 유지된 횟수). 단발 outlier 진입 방지.
     this._edgeStreak = { Up: 0, Down: 0 };
@@ -192,6 +194,10 @@ export class BeatTrader {
 
     // 토큰별 테이커 수수료(bps)를 1회 조회해 캐싱(윈도우 내 변동 거의 없음).
     await this._primeTokenFees();
+
+    // 주문 서명에 필요한 마켓 메타(negRisk, tickSize)를 1회 조회해 캐싱.
+    // negRisk 가 틀리면 CLOB 이 주문을 "invalid signature" 로 거부한다.
+    await this._primeMarketMeta();
 
     // 온체인 체결 피드에 이 마켓의 토큰을 등록(라이브 모드에서 실제 체결 확정용).
     if (this._fillFeed) {
@@ -761,9 +767,10 @@ export class BeatTrader {
 
       let resp;
       try {
+        const { negRisk, tickSize } = this._marketMetaForSide(side);
         resp = cfg.BEAT_ORDER_MODE === 'SHARES'
-          ? await ClobClient.postFOKLimitBuy(this.wallet, tokenId, maxPrice, filledShares, true)
-          : await ClobClient.postIOCBuy(this.wallet, tokenId, maxPrice, amountUsdc, true);
+          ? await ClobClient.postFOKLimitBuy(this.wallet, tokenId, maxPrice, filledShares, negRisk, tickSize)
+          : await ClobClient.postIOCBuy(this.wallet, tokenId, maxPrice, amountUsdc, negRisk, tickSize);
       } catch (err) {
         this.log.warn('BeatTrader v2: order failed', { side, reasonTag, err: err.message });
         this._recordAudit('order_failed', { side, reasonTag, err: err.message });
@@ -1015,6 +1022,28 @@ export class BeatTrader {
       up: this._tokenFeeInfo.get(String(this.market.upToken.tokenId)) ?? null,
       down: this._tokenFeeInfo.get(String(this.market.downToken.tokenId)) ?? null,
     });
+  }
+
+  /** 주문 서명용 마켓 메타(negRisk, tickSize)를 두 토큰에 대해 1회 조회·캐싱한다. */
+  async _primeMarketMeta() {
+    const sides = [['Up', this.market.upToken.tokenId], ['Down', this.market.downToken.tokenId]];
+    await Promise.all(sides.map(async ([side, id]) => {
+      try {
+        const meta = await ClobClient.getMarketMeta(id);
+        this._marketMeta.set(side, meta);
+      } catch (err) {
+        this._marketMeta.set(side, { negRisk: false, tickSize: 0.01 });
+        this._recordAudit('market_meta_lookup_failed', { side, tokenId: String(id), err: err.message });
+      }
+    }));
+    this._recordAudit('market_meta_primed', {
+      up: this._marketMeta.get('Up') ?? null,
+      down: this._marketMeta.get('Down') ?? null,
+    });
+  }
+
+  _marketMetaForSide(side) {
+    return this._marketMeta.get(side) ?? { negRisk: false, tickSize: 0.01 };
   }
 
   _feeInfoForSide(side) {
